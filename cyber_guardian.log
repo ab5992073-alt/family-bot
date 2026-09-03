@@ -1,0 +1,30 @@
+2026-09-03 17:12:14,912 - CyberGuard - WARNING - Initializing new data. Reason: [Errno 2] No such file or directory: 'cyber_squad_prod.json'
+2026-09-03 17:12:14,913 - CyberGuard - INFO - New centurions commander: 6166697485
+2026-09-03 17:12:35,956 - CyberGuard - CRITICAL - Critical error: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [Превышен таймаут семафора]
+2026-09-03 17:12:36,374 - asyncio - ERROR - Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x00000195D8D54440>
+2026-09-03 17:16:16,230 - CyberGuard - WARNING - Initializing new data. Reason: [Errno 2] No such file or directory: 'cyber_squad_prod.json'
+2026-09-03 17:16:16,231 - CyberGuard - INFO - New centurions commander: 6166697485
+2026-09-03 17:16:19,715 - CyberGuard - INFO - Bot is ready to work
+2026-09-03 17:16:19,716 - CyberGuard - INFO - Starting Cyber Guard system
+2026-09-03 17:16:19,912 - aiogram.dispatcher - INFO - Start polling
+2026-09-03 17:16:20,011 - aiogram.dispatcher - INFO - Run polling for bot @Staff_Grand_Bot id=8768874617 - 'Staff_Grand_bot'
+2026-09-03 17:17:24,849 - CyberGuard - INFO - Data saved successfully
+2026-09-03 17:17:24,850 - CyberGuard - INFO - Data saved successfully
+2026-09-03 17:17:25,169 - aiogram.event - INFO - Update id=455478202 is handled. Duration 322 ms by bot id=8768874617
+2026-09-03 17:21:19,719 - CyberGuard - INFO - Data saved successfully
+2026-09-03 17:26:19,722 - CyberGuard - INFO - Data saved successfully
+2026-09-03 17:41:29,302 - aiogram.dispatcher - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - Request timeout error
+2026-09-03 17:41:29,302 - aiogram.dispatcher - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8768874617)
+2026-09-03 17:41:29,303 - asyncio - ERROR - Exception in callback _ProactorBasePipeTransport._call_connection_lost()
+handle: <Handle _ProactorBasePipeTransport._call_connection_lost()>
+Traceback (most recent call last):
+  File "C:\Users\ПК\AppData\Local\Python\pythoncore-3.14-64\Lib\asyncio\events.py", line 94, in _run
+    self._context.run(self._callback, *self._args)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ПК\AppData\Local\Python\pythoncore-3.14-64\Lib\asyncio\proactor_events.py", line 166, in _call_connection_lost
+    self._sock.shutdown(socket.SHUT_RDWR)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+ConnectionResetError: [WinError 10054] Удаленный хост принудительно разорвал существующее подключение
+2026-09-03 17:41:40,596 - aiogram.dispatcher - INFO - Connection established (tryings = 1, bot id = 8768874617)
+2026-09-03 17:46:29,379 - CyberGuard - INFO - Data saved successfully

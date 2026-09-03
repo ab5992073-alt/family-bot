@@ -1,0 +1,130 @@
+{
+  "users": {
+    "7674981800": {
+      "nickname": "Sergey_Darknes",
+      "tag": "@dark",
+      "rank_fam": "Вор",
+      "organization": "Нету",
+      "rank_org": "Нету",
+      "inviter": "—"
+    },
+    "7782102798": {
+      "nickname": ".",
+      "tag": ".",
+      "rank_fam": ".",
+      "organization": ".",
+      "rank_org": ".",
+      "inviter": "—"
+    }
+  },
+  "applications": {
+    "app_7674981800_1788447703": {
+      "user_id": 7674981800,
+      "data": {
+        "nickname": "Sergey_Darknes",
+        "tag": "@dark",
+        "rank_fam": "Вор",
+        "organization": "Нету",
+        "rank_org": "Нету",
+        "inviter": "—"
+      },
+      "status": "accepted",
+      "created": "2026-09-03T18:01:43.442009",
+      "accepted_by": 6166697485,
+      "accepted_at": "2026-09-03T18:02:02.554480",
+      "last_changed_by": 6166697485,
+      "last_changed_at": "2026-09-03T18:38:34.063862",
+      "history": [
+        {
+          "action": "rejected",
+          "by": 6166697485,
+          "by_name": "Darkness",
+          "at": "2026-09-03T18:13:37.231203"
+        },
+        {
+          "action": "accepted",
+          "by": 6166697485,
+          "by_name": "Darkness",
+          "at": "2026-09-03T18:13:59.702493"
+        },
+        {
+          "action": "accepted",
+          "by": 6166697485,
+          "by_name": "Darkness",
+          "at": "2026-09-03T18:38:34.063869"
+        }
+      ]
+    },
+    "app_7782102798_1788448501": {
+      "user_id": 7782102798,
+      "data": {
+        "nickname": ".",
+        "tag": ".",
+        "rank_fam": ".",
+        "organization": ".",
+        "rank_org": ".",
+        "inviter": "—"
+      },
+      "status": "accepted",
+      "created": "2026-09-03T18:15:01.692011",
+      "history": [
+        {
+          "action": "accepted",
+          "by": 6166697485,
+          "by_name": "Darkness",
+          "at": "2026-09-03T18:15:19.261514"
+        },
+        {
+          "action": "rejected",
+          "by": 6166697485,
+          "by_name": "Darkness",
+          "at": "2026-09-03T18:21:05.210385"
+        },
+        {
+          "action": "accepted",
+          "by": 6166697485,
+          "by_name": "Darkness",
+          "at": "2026-09-03T18:36:41.401142"
+        },
+        {
+          "action": "rejected",
+          "by": 6166697485,
+          "by_name": "Darkness",
+          "at": "2026-09-03T18:38:30.059842"
+        },
+        {
+          "action": "accepted",
+          "by": 6166697485,
+          "by_name": "Darkness",
+          "at": "2026-09-03T18:47:09.973923"
+        },
+        {
+          "action": "rejected",
+          "by": 6166697485,
+          "by_name": "Darkness",
+          "at": "2026-09-03T18:47:26.571103"
+        },
+        {
+          "action": "accepted",
+          "by": 6166697485,
+          "by_name": "Darkness",
+          "at": "2026-09-03T18:47:36.684144"
+        },
+        {
+          "action": "rejected",
+          "by": 6166697485,
+          "by_name": "Darkness",
+          "at": "2026-09-03T18:52:08.233589"
+        },
+        {
+          "action": "accepted",
+          "by": 6166697485,
+          "by_name": "Darkness",
+          "at": "2026-09-03T18:52:20.174004"
+        }
+      ],
+      "last_changed_by": 6166697485,
+      "last_changed_at": "2026-09-03T18:52:20.173995"
+    }
+  }
+}

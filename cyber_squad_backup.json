@@ -1,0 +1,36 @@
+{
+  "units": {
+    "centurions": [
+      6166697485
+    ],
+    "decurions": [],
+    "privates": [
+      7674981800
+    ]
+  },
+  "missions": {
+    "active": [],
+    "archive": {},
+    "approvals": {}
+  },
+  "command": {
+    "call_signs": {},
+    "tickets": {},
+    "activity": {
+      "6166697485": "2026-09-03T17:16:16.231202",
+      "7674981800": "2026-09-03T17:17:24.847371"
+    },
+    "temp_actions": {},
+    "temp_missions": {},
+    "user_active_tickets": {},
+    "ticket_responses": {}
+  },
+  "subscribers": [
+    7674981800,
+    6166697485
+  ],
+  "combat_ready": [],
+  "usernames": {
+    "7674981800": "GTStafff"
+  }
+}
