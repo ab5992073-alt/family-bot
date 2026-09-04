@@ -13,7 +13,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramError
 
 # ===== ВЕБ-СЕРВЕР ДЛЯ RENDER =====
 app = Flask(__name__)
@@ -134,7 +133,7 @@ async def handle_application(message: Message):
                 "✅ Заявка успешно отправлена! Мы свяжемся с вами.",
                 reply_markup=main_kb
             )
-        except Exception as e:
+        except Exception:
             await message.answer(
                 "❌ Ошибка при отправке заявки. Попробуйте позже.",
                 reply_markup=main_kb
