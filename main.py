@@ -31,8 +31,8 @@ threading.Thread(target=run_web, daemon=True).start()
 
 # ===== КОНФИГУРАЦИЯ =====
 TOKEN = "8768874617:AAGXy_Jk5x4hv583or1tGeJy__YJlpoU7vA"
-SUPER_ADMIN = 6166697485  # ТВОЙ ID — только ты можешь добавлять админов
-ADMIN_IDS = {6166697485, 123456789, 6863392923, 1980341141}  # Начальные админы
+SUPER_ADMIN = 6166697485
+ADMIN_IDS = {6166697485, 123456789, 6863392923, 1980341141}
 GROUP_ID = -1002409536359
 GROUP_LINK = "https://t.me/+f_eKIP4gwcs0YTcy"
 BOT_NAME = "@Staff_Grand_Bot"
@@ -47,7 +47,7 @@ def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"users": {}, "applications": {}, "admins": list(ADMIN_IDS)}  # Сохраняем админов в JSON
+    return {"users": {}, "applications": {}, "admins": list(ADMIN_IDS)}
 
 def save_data():
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -55,7 +55,6 @@ def save_data():
 
 data = load_data()
 
-# Загружаем админов из JSON или используем ADMIN_IDS
 def get_admins():
     if "admins" in data:
         return set(data["admins"])
@@ -67,6 +66,9 @@ def save_admins(admins_set):
 
 def is_admin(user_id: int) -> bool:
     return user_id in get_admins()
+
+def is_super_admin(user_id: int) -> bool:
+    return user_id == SUPER_ADMIN
 
 # ===== КНОПКИ =====
 def main_keyboard():
@@ -80,12 +82,9 @@ def admin_keyboard():
     builder.row(KeyboardButton(text="📋 Все заявки"), KeyboardButton(text="⏳ Активные"))
     builder.row(KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🔄 История"))
     builder.row(KeyboardButton(text="🟢 Статус бота"), KeyboardButton(text="🔄 Обновить"))
-    if is_super_admin():
+    if is_super_admin(user_id):
         builder.row(KeyboardButton(text="👑 Управление админами"))
     return builder.as_markup(resize_keyboard=True)
-
-def is_super_admin(user_id: int) -> bool:
-    return user_id == SUPER_ADMIN
 
 # ===== ДОБАВЛЕНИЕ ЧЕРЕЗ ССЫЛКУ =====
 async def add_user_to_group(user_id: int) -> bool:
@@ -121,7 +120,6 @@ async def remove_user_from_group(user_id: int) -> bool:
     except:
         return False
 
-# ===== УСТАНОВКА НИКА В ГРУППЕ =====
 async def set_user_nickname(user_id: int, nickname: str):
     try:
         await bot.set_chat_member_custom_title(
@@ -538,81 +536,4 @@ async def add_admin_command(message: Message):
         return
     
     try:
-        new_admin_id = int(args[1])
-    except ValueError:
-        await message.answer("❌ ID должен быть числом!")
-        return
-    
-    current_admins = get_admins()
-    if new_admin_id in current_admins:
-        await message.answer(f"❌ Пользователь {new_admin_id} уже является админом.")
-        return
-    
-    current_admins.add(new_admin_id)
-    save_admins(current_admins)
-    
-    await message.answer(f"✅ Пользователь {new_admin_id} добавлен в список админов!")
-    
-    # Уведомляем нового админа
-    try:
-        await bot.send_message(
-            new_admin_id,
-            f"👑 <b>Вы назначены администратором!</b>\n\n"
-            f"Теперь вам доступна админ-панель бота."
-        )
-    except:
-        pass
-
-@dp.message(Command("remove_admin"))
-async def remove_admin_command(message: Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("❌ Только владелец может удалять админов!")
-        return
-    
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("❌ Использование: /remove_admin 123456789")
-        return
-    
-    try:
-        admin_id_to_remove = int(args[1])
-    except ValueError:
-        await message.answer("❌ ID должен быть числом!")
-        return
-    
-    if admin_id_to_remove == SUPER_ADMIN:
-        await message.answer("❌ Нельзя удалить владельца!")
-        return
-    
-    current_admins = get_admins()
-    if admin_id_to_remove not in current_admins:
-        await message.answer(f"❌ Пользователь {admin_id_to_remove} не является админом.")
-        return
-    
-    current_admins.remove(admin_id_to_remove)
-    save_admins(current_admins)
-    
-    await message.answer(f"✅ Пользователь {admin_id_to_remove} удалён из списка админов.")
-    
-    # Уведомляем бывшего админа
-    try:
-        await bot.send_message(
-            admin_id_to_remove,
-            f"❌ <b>Вы больше не администратор.</b>"
-        )
-    except:
-        pass
-
-# ===== /START =====
-@dp.message(CommandStart())
-async def start_command(message: Message):
-    await show_main_menu(message)
-
-# ===== ЗАПУСК =====
-async def main():
-    print("🤖 Бот запущен!")
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        new_admin_id
