@@ -31,7 +31,8 @@ threading.Thread(target=run_web, daemon=True).start()
 
 # ===== КОНФИГУРАЦИЯ =====
 TOKEN = "8768874617:AAGXy_Jk5x4hv583or1tGeJy__YJlpoU7vA"
-ADMIN_IDS = {6166697485, 123456789, 6863392923, 1980341141}
+SUPER_ADMIN = 6166697485  # ТВОЙ ID — только ты можешь добавлять админов
+ADMIN_IDS = {6166697485, 123456789, 6863392923, 1980341141}  # Начальные админы
 GROUP_ID = -1002409536359
 GROUP_LINK = "https://t.me/+f_eKIP4gwcs0YTcy"
 BOT_NAME = "@Staff_Grand_Bot"
@@ -46,13 +47,26 @@ def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"users": {}, "applications": {}}
+    return {"users": {}, "applications": {}, "admins": list(ADMIN_IDS)}  # Сохраняем админов в JSON
 
 def save_data():
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 data = load_data()
+
+# Загружаем админов из JSON или используем ADMIN_IDS
+def get_admins():
+    if "admins" in data:
+        return set(data["admins"])
+    return ADMIN_IDS
+
+def save_admins(admins_set):
+    data["admins"] = list(admins_set)
+    save_data()
+
+def is_admin(user_id: int) -> bool:
+    return user_id in get_admins()
 
 # ===== КНОПКИ =====
 def main_keyboard():
@@ -66,10 +80,12 @@ def admin_keyboard():
     builder.row(KeyboardButton(text="📋 Все заявки"), KeyboardButton(text="⏳ Активные"))
     builder.row(KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🔄 История"))
     builder.row(KeyboardButton(text="🟢 Статус бота"), KeyboardButton(text="🔄 Обновить"))
+    if is_super_admin():
+        builder.row(KeyboardButton(text="👑 Управление админами"))
     return builder.as_markup(resize_keyboard=True)
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+def is_super_admin(user_id: int) -> bool:
+    return user_id == SUPER_ADMIN
 
 # ===== ДОБАВЛЕНИЕ ЧЕРЕЗ ССЫЛКУ =====
 async def add_user_to_group(user_id: int) -> bool:
@@ -121,6 +137,9 @@ async def set_user_nickname(user_id: int, nickname: str):
 # ===== КОМАНДА /кто =====
 @dp.message(Command("кто"))
 async def who_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Нет прав!")
+        return
     if not message.reply_to_message:
         await message.answer("❌ Ответьте на сообщение участника командой /кто")
         return
@@ -216,7 +235,7 @@ async def survey_handler(message: Message):
                 [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{app_id}")]
             ])
             user_name = message.from_user.full_name or message.from_user.username or "Пользователь"
-            for admin_id in ADMIN_IDS:
+            for admin_id in get_admins():
                 try:
                     await bot.send_message(
                         admin_id,
@@ -282,7 +301,7 @@ async def accept_application(callback: CallbackQuery):
     await callback.answer(f"✅ Заявка принята! Ник '{nickname}' установлен.")
     await callback.message.edit_reply_markup(reply_markup=None)
 
-    for admin in ADMIN_IDS:
+    for admin in get_admins():
         try:
             await bot.send_message(
                 admin,
@@ -335,7 +354,7 @@ async def reject_application(callback: CallbackQuery):
     await callback.answer("❌ Заявка отклонена!")
     await callback.message.edit_reply_markup(reply_markup=None)
 
-    for admin in ADMIN_IDS:
+    for admin in get_admins():
         try:
             await bot.send_message(
                 admin,
@@ -458,13 +477,16 @@ async def status_button(message: Message):
     pending = sum(1 for app in data["applications"].values() if app["status"] == "pending")
     rejected = sum(1 for app in data["applications"].values() if app["status"] == "rejected")
     accepted = sum(1 for app in data["applications"].values() if app["status"] == "accepted")
+    admins_list = ", ".join([str(a) for a in get_admins()])
     await message.answer(
         f"🟢 <b>Бот работает!</b>\n\n"
         f"📊 <b>Статистика:</b>\n"
         f"👥 Всего пользователей: {total}\n"
         f"📩 Ожидают заявки: {pending}\n"
         f"✅ Принято: {accepted}\n"
-        f"❌ Отклонено: {rejected}"
+        f"❌ Отклонено: {rejected}\n\n"
+        f"👑 <b>Админы:</b>\n"
+        f"{admins_list}"
     )
 
 # ===== МОЙ ПРОФИЛЬ =====
@@ -484,6 +506,102 @@ async def my_profile(message: Message):
         )
     else:
         await message.answer("ℹ️ Вы ещё не заполнили анкету. Нажмите «📝 Заполнить анкету».")
+
+# ===== УПРАВЛЕНИЕ АДМИНАМИ =====
+@dp.message(F.text == "👑 Управление админами")
+async def manage_admins(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец может управлять админами!")
+        return
+    
+    current_admins = get_admins()
+    text = "👑 <b>Управление админами</b>\n\n"
+    text += "📋 <b>Текущие админы (ID):</b>\n"
+    for admin_id in current_admins:
+        text += f"• {admin_id}\n"
+    
+    text += "\n<b>Команды:</b>\n"
+    text += "/add_admin 123456789 — добавить админа\n"
+    text += "/remove_admin 123456789 — удалить админа\n"
+    
+    await message.answer(text)
+
+@dp.message(Command("add_admin"))
+async def add_admin_command(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец может добавлять админов!")
+        return
+    
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("❌ Использование: /add_admin 123456789")
+        return
+    
+    try:
+        new_admin_id = int(args[1])
+    except ValueError:
+        await message.answer("❌ ID должен быть числом!")
+        return
+    
+    current_admins = get_admins()
+    if new_admin_id in current_admins:
+        await message.answer(f"❌ Пользователь {new_admin_id} уже является админом.")
+        return
+    
+    current_admins.add(new_admin_id)
+    save_admins(current_admins)
+    
+    await message.answer(f"✅ Пользователь {new_admin_id} добавлен в список админов!")
+    
+    # Уведомляем нового админа
+    try:
+        await bot.send_message(
+            new_admin_id,
+            f"👑 <b>Вы назначены администратором!</b>\n\n"
+            f"Теперь вам доступна админ-панель бота."
+        )
+    except:
+        pass
+
+@dp.message(Command("remove_admin"))
+async def remove_admin_command(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец может удалять админов!")
+        return
+    
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("❌ Использование: /remove_admin 123456789")
+        return
+    
+    try:
+        admin_id_to_remove = int(args[1])
+    except ValueError:
+        await message.answer("❌ ID должен быть числом!")
+        return
+    
+    if admin_id_to_remove == SUPER_ADMIN:
+        await message.answer("❌ Нельзя удалить владельца!")
+        return
+    
+    current_admins = get_admins()
+    if admin_id_to_remove not in current_admins:
+        await message.answer(f"❌ Пользователь {admin_id_to_remove} не является админом.")
+        return
+    
+    current_admins.remove(admin_id_to_remove)
+    save_admins(current_admins)
+    
+    await message.answer(f"✅ Пользователь {admin_id_to_remove} удалён из списка админов.")
+    
+    # Уведомляем бывшего админа
+    try:
+        await bot.send_message(
+            admin_id_to_remove,
+            f"❌ <b>Вы больше не администратор.</b>"
+        )
+    except:
+        pass
 
 # ===== /START =====
 @dp.message(CommandStart())
