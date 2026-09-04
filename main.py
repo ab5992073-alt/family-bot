@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import sys
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
@@ -511,17 +510,17 @@ async def manage_admins(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только владелец может управлять админами!")
         return
-    
+
     current_admins = get_admins()
     text = "👑 <b>Управление админами</b>\n\n"
     text += "📋 <b>Текущие админы (ID):</b>\n"
     for admin_id in current_admins:
         text += f"• {admin_id}\n"
-    
+
     text += "\n<b>Команды:</b>\n"
     text += "/add_admin 123456789 — добавить админа\n"
     text += "/remove_admin 123456789 — удалить админа\n"
-    
+
     await message.answer(text)
 
 @dp.message(Command("add_admin"))
@@ -529,28 +528,28 @@ async def add_admin_command(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только владелец может добавлять админов!")
         return
-    
+
     args = message.text.split()
     if len(args) != 2:
         await message.answer("❌ Использование: /add_admin 123456789")
         return
-    
+
     try:
         new_admin_id = int(args[1])
     except ValueError:
         await message.answer("❌ ID должен быть числом!")
         return
-    
+
     current_admins = get_admins()
     if new_admin_id in current_admins:
         await message.answer(f"❌ Пользователь {new_admin_id} уже является админом.")
         return
-    
+
     current_admins.add(new_admin_id)
     save_admins(current_admins)
-    
+
     await message.answer(f"✅ Пользователь {new_admin_id} добавлен в список админов!")
-    
+
     try:
         await bot.send_message(
             new_admin_id,
@@ -565,32 +564,32 @@ async def remove_admin_command(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только владелец может удалять админов!")
         return
-    
+
     args = message.text.split()
     if len(args) != 2:
         await message.answer("❌ Использование: /remove_admin 123456789")
         return
-    
+
     try:
         admin_id_to_remove = int(args[1])
     except ValueError:
         await message.answer("❌ ID должен быть числом!")
         return
-    
+
     if admin_id_to_remove == SUPER_ADMIN:
         await message.answer("❌ Нельзя удалить владельца!")
         return
-    
+
     current_admins = get_admins()
     if admin_id_to_remove not in current_admins:
         await message.answer(f"❌ Пользователь {admin_id_to_remove} не является админом.")
         return
-    
+
     current_admins.remove(admin_id_to_remove)
     save_admins(current_admins)
-    
+
     await message.answer(f"✅ Пользователь {admin_id_to_remove} удалён из списка админов.")
-    
+
     try:
         await bot.send_message(
             admin_id_to_remove,
