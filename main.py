@@ -83,11 +83,9 @@ async def log_action(user_id, action, details=""):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = f"[{timestamp}] {username} ({user_id}) -> {action} {details}\n"
     
-    # Пишем в файл
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(log_entry)
     
-    # Отправляем уведомление владельцу
     try:
         await bot.send_message(
             SUPER_ADMIN,
@@ -103,15 +101,14 @@ async def log_action(user_id, action, details=""):
 def main_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.row(KeyboardButton(text="📝 Заполнить анкету"))
-    builder.row(KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="🔄 Обновить"))
+    builder.row(KeyboardButton(text="👤 Мой профиль"))
     return builder.as_markup(resize_keyboard=True)
 
 def admin_keyboard(user_id):
     builder = ReplyKeyboardBuilder()
     builder.row(KeyboardButton(text="📋 Все заявки"), KeyboardButton(text="⏳ Активные"))
     builder.row(KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🔄 История"))
-    builder.row(KeyboardButton(text="🟢 Статус бота"), KeyboardButton(text="🔄 Обновить"))
-    builder.row(KeyboardButton(text="📋 Чат семьи"), KeyboardButton(text="🔍 Найти игрока"))
+    builder.row(KeyboardButton(text="🟢 Статус бота"))
     if is_super_admin(user_id):
         builder.row(KeyboardButton(text="👑 Управление админами"))
         builder.row(KeyboardButton(text="📜 Логи"))
@@ -189,12 +186,6 @@ async def who_command(message: Message):
         f"Ранг в организации: {user_data['rank_org']}\n"
         f"Пригласитель: {user_data['inviter']}"
     )
-
-# ===== КНОПКА "ОБНОВИТЬ" =====
-@dp.message(F.text == "🔄 Обновить")
-async def refresh_button(message: Message):
-    await log_action(message.from_user.id, "кнопка Обновить", "нажал Обновить")
-    await show_main_menu(message)
 
 async def show_main_menu(message: Message):
     user_id = message.from_user.id
