@@ -77,7 +77,7 @@ def main_keyboard():
     builder.row(KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="🔄 Обновить"))
     return builder.as_markup(resize_keyboard=True)
 
-def admin_keyboard():
+def admin_keyboard(user_id):
     builder = ReplyKeyboardBuilder()
     builder.row(KeyboardButton(text="📋 Все заявки"), KeyboardButton(text="⏳ Активные"))
     builder.row(KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🔄 История"))
@@ -166,7 +166,7 @@ async def refresh_button(message: Message):
 async def show_main_menu(message: Message):
     user_id = message.from_user.id
     if is_admin(user_id):
-        await message.answer("🛡️ <b>Панель администратора</b>", reply_markup=admin_keyboard())
+        await message.answer("🛡️ <b>Панель администратора</b>", reply_markup=admin_keyboard(user_id))
     else:
         await message.answer(
             "👋 <b>Добро пожаловать!</b>\n"
@@ -536,4 +536,79 @@ async def add_admin_command(message: Message):
         return
     
     try:
-        new_admin_id
+        new_admin_id = int(args[1])
+    except ValueError:
+        await message.answer("❌ ID должен быть числом!")
+        return
+    
+    current_admins = get_admins()
+    if new_admin_id in current_admins:
+        await message.answer(f"❌ Пользователь {new_admin_id} уже является админом.")
+        return
+    
+    current_admins.add(new_admin_id)
+    save_admins(current_admins)
+    
+    await message.answer(f"✅ Пользователь {new_admin_id} добавлен в список админов!")
+    
+    try:
+        await bot.send_message(
+            new_admin_id,
+            f"👑 <b>Вы назначены администратором!</b>\n\n"
+            f"Теперь вам доступна админ-панель бота."
+        )
+    except:
+        pass
+
+@dp.message(Command("remove_admin"))
+async def remove_admin_command(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец может удалять админов!")
+        return
+    
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("❌ Использование: /remove_admin 123456789")
+        return
+    
+    try:
+        admin_id_to_remove = int(args[1])
+    except ValueError:
+        await message.answer("❌ ID должен быть числом!")
+        return
+    
+    if admin_id_to_remove == SUPER_ADMIN:
+        await message.answer("❌ Нельзя удалить владельца!")
+        return
+    
+    current_admins = get_admins()
+    if admin_id_to_remove not in current_admins:
+        await message.answer(f"❌ Пользователь {admin_id_to_remove} не является админом.")
+        return
+    
+    current_admins.remove(admin_id_to_remove)
+    save_admins(current_admins)
+    
+    await message.answer(f"✅ Пользователь {admin_id_to_remove} удалён из списка админов.")
+    
+    try:
+        await bot.send_message(
+            admin_id_to_remove,
+            f"❌ <b>Вы больше не администратор.</b>"
+        )
+    except:
+        pass
+
+# ===== /START =====
+@dp.message(CommandStart())
+async def start_command(message: Message):
+    await show_main_menu(message)
+
+# ===== ЗАПУСК =====
+async def main():
+    print("🤖 Бот запущен!")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
