@@ -69,6 +69,36 @@ def is_admin(user_id: int) -> bool:
 def is_super_admin(user_id: int) -> bool:
     return user_id == SUPER_ADMIN
 
+# ===== ЛОГИРОВАНИЕ ДЕЙСТВИЙ =====
+LOG_FILE = "bot_activity.log"
+
+async def log_action(user_id, action, details=""):
+    """Записывает действие в лог и отправляет уведомление владельцу"""
+    try:
+        user = await bot.get_user(user_id)
+        username = f"@{user.username}" if user.username else user.full_name
+    except:
+        username = str(user_id)
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}] {username} ({user_id}) -> {action} {details}\n"
+    
+    # Пишем в файл
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(log_entry)
+    
+    # Отправляем уведомление владельцу
+    try:
+        await bot.send_message(
+            SUPER_ADMIN,
+            f"👤 <b>{username}</b> ({user_id})\n"
+            f"⚡ {action}\n"
+            f"📝 {details}\n"
+            f"🕐 {timestamp}"
+        )
+    except:
+        pass
+
 # ===== КНОПКИ =====
 def main_keyboard():
     builder = ReplyKeyboardBuilder()
@@ -81,8 +111,10 @@ def admin_keyboard(user_id):
     builder.row(KeyboardButton(text="📋 Все заявки"), KeyboardButton(text="⏳ Активные"))
     builder.row(KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🔄 История"))
     builder.row(KeyboardButton(text="🟢 Статус бота"), KeyboardButton(text="🔄 Обновить"))
+    builder.row(KeyboardButton(text="📋 Чат семьи"), KeyboardButton(text="🔍 Найти игрока"))
     if is_super_admin(user_id):
         builder.row(KeyboardButton(text="👑 Управление админами"))
+        builder.row(KeyboardButton(text="📜 Логи"))
     return builder.as_markup(resize_keyboard=True)
 
 # ===== ДОБАВЛЕНИЕ ЧЕРЕЗ ССЫЛКУ =====
@@ -137,6 +169,7 @@ async def who_command(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌ Нет прав!")
         return
+    await log_action(message.from_user.id, "команда /кто", f"запросил анкету у {message.reply_to_message.from_user.id if message.reply_to_message else 'никого'}")
     if not message.reply_to_message:
         await message.answer("❌ Ответьте на сообщение участника командой /кто")
         return
@@ -160,6 +193,7 @@ async def who_command(message: Message):
 # ===== КНОПКА "ОБНОВИТЬ" =====
 @dp.message(F.text == "🔄 Обновить")
 async def refresh_button(message: Message):
+    await log_action(message.from_user.id, "кнопка Обновить", "нажал Обновить")
     await show_main_menu(message)
 
 async def show_main_menu(message: Message):
@@ -180,6 +214,7 @@ user_surveys = {}
 async def start_survey(message: Message):
     user_id = message.from_user.id
     user_surveys[user_id] = {"step": 0, "answers": {}}
+    await log_action(user_id, "анкета", "начал заполнение")
     await message.answer("📋 <b>Заполнение анкеты для вступления в семью</b>\n\n1️⃣ Ваш Nickname в игре?")
 
 @dp.message(lambda m: m.from_user.id in user_surveys)
@@ -225,6 +260,7 @@ async def survey_handler(message: Message):
             }
             save_data()
 
+            await log_action(user_id, "анкета", f"заполнил анкету (app {app_id})")
             await message.answer("✅ <b>Анкета заполнена! Ваша заявка отправлена администраторам.</b>")
 
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -256,8 +292,10 @@ async def survey_handler(message: Message):
 async def survey_button(message: Message):
     user_id = message.from_user.id
     if str(user_id) in data["users"]:
+        await log_action(user_id, "кнопка Заполнить анкету", "уже заполнил анкету")
         await message.answer("ℹ️ Вы уже заполнили анкету. Ожидайте решения администрации.")
         return
+    await log_action(user_id, "кнопка Заполнить анкету", "начал")
     await start_survey(message)
 
 # ===== ПРИНЯТЬ =====
@@ -266,6 +304,8 @@ async def accept_application(callback: CallbackQuery):
     app_id = callback.data.split(":")[1]
     admin_id = callback.from_user.id
     admin_name = callback.from_user.full_name or callback.from_user.username or str(admin_id)
+
+    await log_action(admin_id, "принятие", f"заявка {app_id}")
 
     if not is_admin(admin_id):
         await callback.answer("❌ Нет прав!")
@@ -317,6 +357,8 @@ async def reject_application(callback: CallbackQuery):
     app_id = callback.data.split(":")[1]
     admin_id = callback.from_user.id
     admin_name = callback.from_user.full_name or callback.from_user.username or str(admin_id)
+
+    await log_action(admin_id, "отклонение", f"заявка {app_id}")
 
     if not is_admin(admin_id):
         await callback.answer("❌ Нет прав!")
@@ -370,6 +412,7 @@ async def all_applications(message: Message):
         await message.answer("❌ Нет прав!")
         return
 
+    await log_action(message.from_user.id, "кнопка Все заявки", "")
     apps = data["applications"]
     if not apps:
         await message.answer("📭 Заявок нет.")
@@ -403,6 +446,7 @@ async def active_applications(message: Message):
         await message.answer("❌ Нет прав!")
         return
 
+    await log_action(message.from_user.id, "кнопка Активные", "")
     pending_apps = {k: v for k, v in data["applications"].items() if v["status"] == "pending"}
     if not pending_apps:
         await message.answer("📭 Активных заявок нет.")
@@ -432,6 +476,8 @@ async def stats_button(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌ Нет прав!")
         return
+
+    await log_action(message.from_user.id, "кнопка Статистика", "")
     total = len(data["users"])
     pending = sum(1 for app in data["applications"].values() if app["status"] == "pending")
     rejected = sum(1 for app in data["applications"].values() if app["status"] == "rejected")
@@ -450,6 +496,8 @@ async def history_button(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌ Нет прав!")
         return
+
+    await log_action(message.from_user.id, "кнопка История", "")
     apps = data["applications"]
     if not apps:
         await message.answer("📭 Заявок нет.")
@@ -470,6 +518,8 @@ async def status_button(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌ Нет прав!")
         return
+
+    await log_action(message.from_user.id, "кнопка Статус бота", "")
     total = len(data["users"])
     pending = sum(1 for app in data["applications"].values() if app["status"] == "pending")
     rejected = sum(1 for app in data["applications"].values() if app["status"] == "rejected")
@@ -490,6 +540,7 @@ async def status_button(message: Message):
 @dp.message(F.text == "👤 Мой профиль")
 async def my_profile(message: Message):
     user_id = str(message.from_user.id)
+    await log_action(message.from_user.id, "кнопка Мой профиль", "")
     if user_id in data["users"]:
         u = data["users"][user_id]
         await message.answer(
@@ -511,6 +562,7 @@ async def manage_admins(message: Message):
         await message.answer("❌ Только владелец может управлять админами!")
         return
 
+    await log_action(message.from_user.id, "кнопка Управление админами", "")
     current_admins = get_admins()
     text = "👑 <b>Управление админами</b>\n\n"
     text += "📋 <b>Текущие админы (ID):</b>\n"
@@ -529,6 +581,7 @@ async def add_admin_command(message: Message):
         await message.answer("❌ Только владелец может добавлять админов!")
         return
 
+    await log_action(message.from_user.id, "команда add_admin", "")
     args = message.text.split()
     if len(args) != 2:
         await message.answer("❌ Использование: /add_admin 123456789")
@@ -565,6 +618,7 @@ async def remove_admin_command(message: Message):
         await message.answer("❌ Только владелец может удалять админов!")
         return
 
+    await log_action(message.from_user.id, "команда remove_admin", "")
     args = message.text.split()
     if len(args) != 2:
         await message.answer("❌ Использование: /remove_admin 123456789")
@@ -598,9 +652,45 @@ async def remove_admin_command(message: Message):
     except:
         pass
 
+# ===== ЛОГИ (команды для владельца) =====
+@dp.message(Command("logs"))
+async def get_logs(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только для владельца!")
+        return
+
+    await log_action(message.from_user.id, "команда /logs", "просмотр логов")
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        last_lines = lines[-30:] if lines else ["📭 Логов пока нет."]
+        text = "📋 <b>Последние действия в боте:</b>\n\n"
+        text += "".join(last_lines)
+        if len(text) > 4000:
+            text = text[:3900] + "\n... (обрезано)"
+        await message.answer(text)
+    except FileNotFoundError:
+        await message.answer("📭 Лог-файл пока не создан.")
+
+@dp.message(Command("clearlogs"))
+async def clear_logs(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только для владельца!")
+        return
+
+    await log_action(message.from_user.id, "команда /clearlogs", "очистка логов")
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
+        f.write("")
+    await message.answer("✅ Логи очищены.")
+
+@dp.message(F.text == "📜 Логи")
+async def logs_button(message: Message):
+    await get_logs(message)
+
 # ===== /START =====
 @dp.message(CommandStart())
 async def start_command(message: Message):
+    await log_action(message.from_user.id, "start", "запустил бота")
     await show_main_menu(message)
 
 # ===== ЗАПУСК =====
