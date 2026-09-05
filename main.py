@@ -33,12 +33,12 @@ threading.Thread(target=run_web, daemon=True).start()
 TOKEN = "8768874617:AAGXy_Jk5x4hv583or1tGeJy__YJlpoU7vA"
 SUPER_ADMIN = 6166697485
 ADMIN_IDS = {6166697485, 123456789, 6863392923, 1980341141}
-GROUP_ID = -1002409536359  # основная группа
+GROUP_ID = -1002409536359
 GROUP_LINK = "https://t.me/+f_eKIP4gwcs0YTcy"
 BOT_NAME = "@Staff_Grand_Bot"
 
-# ID группы, которую защищаем (только админы могут писать)
-PROTECTED_GROUP_ID = -1002409536359  # та же группа – защищена полностью
+# Группа, которую защищаем (только админы могут писать)
+PROTECTED_GROUP_ID = -1002409536359
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -163,7 +163,7 @@ async def set_user_nickname(user_id: int, nickname: str):
         print(f"Ошибка при установке ника: {e}")
         return False
 
-# ===== КОМАНДА /кто =====
+# ===== КОМАНДА /кто (работает, но не отображается в меню) =====
 @dp.message(Command("кто"))
 async def who_command(message: Message):
     if not is_admin(message.from_user.id):
@@ -720,7 +720,6 @@ async def help_command(message: Message):
 # ===== ЗАЩИТА ГРУППЫ (только админы могут писать) =====
 @dp.message(F.chat.id == PROTECTED_GROUP_ID)
 async def protect_group(message: Message):
-    # Если сообщение из защищённой группы и отправитель не админ
     if not is_admin(message.from_user.id):
         await message.delete()
         await bot.send_message(
@@ -759,10 +758,10 @@ async def start_command(message: Message):
 async def main():
     print("🤖 Бот запущен!")
     
+    # Список команд, которые будут отображаться в меню (без кириллицы!)
     commands = [
         BotCommand(command="start", description="Запустить бота"),
         BotCommand(command="help", description="Список команд"),
-        BotCommand(command="кто", description="Информация о пользователе (в группе)"),
         BotCommand(command="ping", description="Проверить задержку (админы)"),
         BotCommand(command="all", description="Отправить важное объявление (админы)"),
         BotCommand(command="add_admin", description="Добавить админа (владелец)"),
