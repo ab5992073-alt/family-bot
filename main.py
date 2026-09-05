@@ -37,8 +37,8 @@ GROUP_ID = -1002409536359
 GROUP_LINK = "https://t.me/+f_eKIP4gwcs0YTcy"
 BOT_NAME = "@Staff_Grand_Bot"
 
-# ID темы "Новости" – ты дал этот ID (это ID группы, поэтому сообщения будут в общий чат)
-ANNOUNCE_TOPIC_ID = -1002409536359
+# ID темы "Новости" – пока 0, получим через /topic_id
+ANNOUNCE_TOPIC_ID = 0
 
 # Группа, которую защищаем (только админы могут писать)
 PROTECTED_GROUP_ID = -1002409536359
@@ -731,11 +731,14 @@ async def protect_group(message: Message):
             reply_to_message_id=message.message_id
         )
 
-# ===== КОМАНДА /all (отправляет в общий чат или в тему, если указан правильный ID) =====
+# ===== КОМАНДА /all (отправляет в тему "Новости") =====
 @dp.message(Command("all"))
 async def all_command(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌ Только для админов!")
+        return
+    if ANNOUNCE_TOPIC_ID == 0:
+        await message.answer("❌ ID темы 'Новости' не настроен. Используйте /topic_id в теме, чтобы узнать ID.")
         return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
@@ -743,13 +746,12 @@ async def all_command(message: Message):
         return
     msg_text = args[1]
     try:
-        # Отправляем в группу (если ANNOUNCE_TOPIC_ID – ID группы, то в общий чат)
         await bot.send_message(
             GROUP_ID,
             f"⚠️ <b>ВНИМАНИЕ! ВАЖНОЕ ОБЪЯВЛЕНИЕ</b>\n\n{msg_text}\n\n@all",
             message_thread_id=ANNOUNCE_TOPIC_ID
         )
-        await message.answer("✅ Объявление отправлено.")
+        await message.answer("✅ Объявление отправлено в тему 'Новости'.")
     except Exception as e:
         await message.answer(f"❌ Ошибка при отправке: {e}")
 
