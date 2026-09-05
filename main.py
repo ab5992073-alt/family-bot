@@ -37,7 +37,10 @@ GROUP_ID = -1002409536359
 GROUP_LINK = "https://t.me/+f_eKIP4gwcs0YTcy"
 BOT_NAME = "@Staff_Grand_Bot"
 
-# Группа, которую защищаем (только админы могут писать)
+# ID темы "Новости" – замени на реальный ID после получения через /topic_id
+ANNOUNCE_TOPIC_ID = 0  # <-- сюда вставь ID темы
+
+# Группа, которую защищаем (только админы могут писать) – можно использовать ту же группу
 PROTECTED_GROUP_ID = -1002409536359
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -163,7 +166,7 @@ async def set_user_nickname(user_id: int, nickname: str):
         print(f"Ошибка при установке ника: {e}")
         return False
 
-# ===== КОМАНДА /кто (работает, но не отображается в меню) =====
+# ===== КОМАНДА /кто =====
 @dp.message(Command("кто"))
 async def who_command(message: Message):
     if not is_admin(message.from_user.id):
@@ -728,11 +731,14 @@ async def protect_group(message: Message):
             reply_to_message_id=message.message_id
         )
 
-# ===== КОМАНДА /all (отправить объявление) =====
+# ===== КОМАНДА /all (отправить объявление в тему "Новости") =====
 @dp.message(Command("all"))
 async def all_command(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌ Только для админов!")
+        return
+    if ANNOUNCE_TOPIC_ID == 0:
+        await message.answer("❌ ID темы 'Новости' не настроен. Используйте /topic_id в теме, чтобы узнать ID.")
         return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
@@ -741,12 +747,21 @@ async def all_command(message: Message):
     msg_text = args[1]
     try:
         await bot.send_message(
-            PROTECTED_GROUP_ID,
-            f"⚠️ <b>ВНИМАНИЕ! ВАЖНОЕ ОБЪЯВЛЕНИЕ</b>\n\n{msg_text}\n\n@all"
+            GROUP_ID,
+            f"⚠️ <b>ВНИМАНИЕ! ВАЖНОЕ ОБЪЯВЛЕНИЕ</b>\n\n{msg_text}\n\n@all",
+            message_thread_id=ANNOUNCE_TOPIC_ID
         )
-        await message.answer("✅ Объявление отправлено в группу.")
+        await message.answer("✅ Объявление отправлено в тему 'Новости'.")
     except Exception as e:
         await message.answer(f"❌ Ошибка при отправке: {e}")
+
+# ===== КОМАНДА ДЛЯ ПОЛУЧЕНИЯ ID ТЕМЫ =====
+@dp.message(Command("topic_id"))
+async def get_topic_id(message: Message):
+    if message.chat.id == GROUP_ID and message.message_thread_id:
+        await message.answer(f"ID этой темы: {message.message_thread_id}")
+    else:
+        await message.answer("❌ Это сообщение не в теме, или ID не найден.")
 
 # ===== /START =====
 @dp.message(CommandStart())
@@ -758,12 +773,12 @@ async def start_command(message: Message):
 async def main():
     print("🤖 Бот запущен!")
     
-    # Список команд, которые будут отображаться в меню (без кириллицы!)
     commands = [
         BotCommand(command="start", description="Запустить бота"),
         BotCommand(command="help", description="Список команд"),
         BotCommand(command="ping", description="Проверить задержку (админы)"),
         BotCommand(command="all", description="Отправить важное объявление (админы)"),
+        BotCommand(command="topic_id", description="Узнать ID текущей темы"),
         BotCommand(command="add_admin", description="Добавить админа (владелец)"),
         BotCommand(command="remove_admin", description="Удалить админа (владелец)"),
         BotCommand(command="logs", description="Показать логи (владелец)"),
