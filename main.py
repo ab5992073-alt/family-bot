@@ -70,12 +70,9 @@ def save_data():
 
 data = load_data()
 
-# Инициализация статистики замов
 if "zam_stats" not in data:
     data["zam_stats"] = {}
     save_data()
-
-# Если в data.json нет bot_token – добавляем
 if "bot_token" not in data:
     data["bot_token"] = TOKEN
     save_data()
@@ -123,9 +120,11 @@ async def log_action(user_id, action, details=""):
         pass
 
 # ===== КНОПКИ =====
-def main_keyboard():
+def main_keyboard(user_has_survey=False):
     builder = ReplyKeyboardBuilder()
     builder.row(KeyboardButton(text="📝 Заполнить анкету"))
+    if user_has_survey:
+        builder.row(KeyboardButton(text="🔄 Перезаполнить анкету"))
     builder.row(KeyboardButton(text="👤 Мой профиль"))
     return builder.as_markup(resize_keyboard=True)
 
@@ -218,12 +217,44 @@ async def show_main_menu(message: Message):
     if is_admin(user_id):
         await message.answer("🛡️ <b>Панель администратора</b>", reply_markup=admin_keyboard(user_id))
     else:
+        has_survey = str(user_id) in data["users"]
         await message.answer(
             "👋 <b>Добро пожаловать!</b>\n"
             "Для вступления в семью нажмите:\n"
             "📝 <b>Заполнить анкету</b>",
-            reply_markup=main_keyboard()
+            reply_markup=main_keyboard(has_survey)
         )
+
+# ===== СБРОС АНКЕТЫ =====
+@dp.message(F.text == "🔄 Перезаполнить анкету")
+async def reset_survey(message: Message):
+    user_id = str(message.from_user.id)
+    if user_id not in data["users"]:
+        await message.answer("❌ У вас нет заполненной анкеты.")
+        return
+
+    # Удаляем старую анкету
+    old_data = data["users"].pop(user_id)
+    save_data()
+
+    # Корректируем статистику зама
+    old_inviter = old_data.get("inviter")
+    if old_inviter and old_inviter in ZAM_LIST:
+        if old_inviter in data["zam_stats"]:
+            data["zam_stats"][old_inviter]["count"] -= 1
+            data["zam_stats"][old_inviter]["earned"] -= 100000
+            # Удаляем запись о приглашении из истории (по user_id)
+            if "history" in data["zam_stats"][old_inviter]:
+                data["zam_stats"][old_inviter]["history"] = [
+                    h for h in data["zam_stats"][old_inviter]["history"]
+                    if h["user_id"] != int(user_id)
+                ]
+            save_data()
+
+    await log_action(int(user_id), "сброс анкеты", "начал перезаполнение")
+    await message.answer("✅ Анкета сброшена. Вы можете заполнить её заново.")
+    # Показываем меню без кнопки перезаполнения
+    await show_main_menu(message)
 
 # ===== АНКЕТА С ВЫБОРОМ ЗАМА =====
 user_surveys = {}
@@ -286,6 +317,20 @@ async def finish_survey(message: Message, user_id: int):
     if not survey:
         return
     answers = survey["answers"]
+
+    # Если пользователь уже есть в базе – удаляем (на случай, если перезаполнение не через кнопку)
+    old_data = data["users"].get(str(user_id))
+    if old_data:
+        old_inviter = old_data.get("inviter")
+        if old_inviter and old_inviter in ZAM_LIST:
+            if old_inviter in data["zam_stats"]:
+                data["zam_stats"][old_inviter]["count"] -= 1
+                data["zam_stats"][old_inviter]["earned"] -= 100000
+                if "history" in data["zam_stats"][old_inviter]:
+                    data["zam_stats"][old_inviter]["history"] = [
+                        h for h in data["zam_stats"][old_inviter]["history"]
+                        if h["user_id"] != user_id
+                    ]
 
     user_data = {
         "nickname": answers.get("nickname", "—"),
@@ -371,7 +416,7 @@ async def survey_button(message: Message):
     user_id = message.from_user.id
     if str(user_id) in data["users"]:
         await log_action(user_id, "кнопка Заполнить анкету", "уже заполнил анкету")
-        await message.answer("ℹ️ Вы уже заполнили анкету. Ожидайте решения администрации.")
+        await message.answer("ℹ️ Вы уже заполнили анкету. Используйте «🔄 Перезаполнить анкету», чтобы начать заново.")
         return
     await log_action(user_id, "кнопка Заполнить анкету", "начал")
     await start_survey(message)
@@ -679,7 +724,6 @@ async def add_admin_command(message: Message):
 
     arg = args[1].strip()
     user_id = None
-    username = None
 
     if arg.startswith('@'):
         username = arg[1:]
@@ -940,7 +984,6 @@ async def withdraw_command(message: Message):
     zam_info["earned"] -= 500000
     save_data()
 
-    # Уведомляем зама
     zam_user_id = None
     for uid, udata in data["users"].items():
         if udata.get("nickname") == zam_username:
@@ -1003,7 +1046,7 @@ async def main():
         BotCommand(command="clearlogs", description="Очистить логи (владелец)"),
         BotCommand(command="zam_stats", description="Статистика замов (владелец)"),
         BotCommand(command="withdraw", description="Снять 500k с зама (владелец)"),
-        
+        BotCommand(command="set_token", description="Сменить токен бота (владелец)"),
     ]
     await bot.set_my_commands(commands)
     
