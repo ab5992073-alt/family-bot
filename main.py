@@ -37,8 +37,8 @@ GROUP_ID = -1002409536359
 GROUP_LINK = "https://t.me/+f_eKIP4gwcs0YTcy"
 BOT_NAME = "@Staff_Grand_Bot"
 
-# ID темы "Новости" – пока 0, получим через /topic_id
-ANNOUNCE_TOPIC_ID = 0
+# ID темы "Новости" – получи через /topic_id в теме
+ANNOUNCE_TOPIC_ID = 0  # замени на реальный ID
 
 # Группа, которую защищаем (только админы могут писать)
 PROTECTED_GROUP_ID = -1002409536359
