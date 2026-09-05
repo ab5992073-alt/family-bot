@@ -40,8 +40,8 @@ BOT_NAME = "@Staff_Grand_Bot"
 # ID темы "Новости" – получи через /topic_id в теме и замени 0 на число
 ANNOUNCE_TOPIC_ID = 0
 
-# Группа, которую защищаем (только админы могут писать)
-PROTECTED_GROUP_ID = -1002409536359
+# Защита группы ОТКЛЮЧЕНА (установлено 0)
+PROTECTED_GROUP_ID = 0
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -720,16 +720,16 @@ async def help_command(message: Message):
         text += f"{cmd} — {desc}\n"
     await message.answer(text)
 
-# ===== ЗАЩИТА ГРУППЫ (только админы могут писать) =====
-@dp.message(F.chat.id == PROTECTED_GROUP_ID)
-async def protect_group(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.delete()
-        await bot.send_message(
-            PROTECTED_GROUP_ID,
-            f"❌ {message.from_user.full_name}, только администраторы могут писать в эту группу!",
-            reply_to_message_id=message.message_id
-        )
+# ===== ЗАЩИТА ГРУППЫ ОТКЛЮЧЕНА (закомментировано) =====
+# @dp.message(F.chat.id == PROTECTED_GROUP_ID)
+# async def protect_group(message: Message):
+#     if not is_admin(message.from_user.id):
+#         await message.delete()
+#         await bot.send_message(
+#             PROTECTED_GROUP_ID,
+#             f"❌ {message.from_user.full_name}, только администраторы могут писать в эту группу!",
+#             reply_to_message_id=message.message_id
+#         )
 
 # ===== КОМАНДА /all (отправляет в тему "Новости") =====
 @dp.message(Command("all"))
