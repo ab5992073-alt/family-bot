@@ -58,6 +58,15 @@ RANK_LIST = [
     "ОХРАНИК", "СТ. ОХРАНИК", "РЕШАЛО", "ПОЛОЖЕНЕЦ", "ВОР"
 ]
 
+# ===== СПИСОК ОРГАНИЗАЦИЙ =====
+ORG_LIST = [
+    "Правительство", "Воинская часть", "Больница г. Арзамас",
+    "Больница г. Южный", "Новостная сеть", "Полиция г. Арзамас",
+    "Полиция г. Южный", "ФСБ", "МВД-А", "МВД-Ю",
+    "МЗ-А", "МЗ-Ю", "Курганская ОПГ", "Ореховская ОПГ",
+    "Тамбовская ОПГ", "Кавказская ОПГ"
+]
+
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
@@ -134,11 +143,13 @@ def main_keyboard(user_has_survey=False):
     builder.row(KeyboardButton(text="👤 Мой профиль"))
     return builder.as_markup(resize_keyboard=True)
 
-def admin_keyboard(user_id):
+def admin_keyboard(user_id, has_survey=False):
     builder = ReplyKeyboardBuilder()
     builder.row(KeyboardButton(text="📋 Все заявки"), KeyboardButton(text="⏳ Активные"))
     builder.row(KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🔄 История"))
     builder.row(KeyboardButton(text="🟢 Статус бота"))
+    if has_survey:
+        builder.row(KeyboardButton(text="🔄 Перезаполнить анкету"))
     if is_super_admin(user_id):
         builder.row(KeyboardButton(text="👑 Управление админами"))
         builder.row(KeyboardButton(text="📜 Логи"))
@@ -220,10 +231,10 @@ async def who_command(message: Message):
 
 async def show_main_menu(message: Message):
     user_id = message.from_user.id
+    has_survey = str(user_id) in data["users"]
     if is_admin(user_id):
-        await message.answer("🛡️ <b>Панель администратора</b>", reply_markup=admin_keyboard(user_id))
+        await message.answer("🛡️ <b>Панель администратора</b>", reply_markup=admin_keyboard(user_id, has_survey))
     else:
-        has_survey = str(user_id) in data["users"]
         await message.answer(
             "👋 <b>Добро пожаловать!</b>\n"
             "Для вступления в семью нажмите:\n"
@@ -258,7 +269,7 @@ async def reset_survey(message: Message):
     await message.answer("✅ Анкета сброшена. Вы можете заполнить её заново.")
     await show_main_menu(message)
 
-# ===== АНКЕТА С ВЫБОРОМ РАНГА И ЗАМА (ТЕГ АВТОМАТИЧЕСКИ) =====
+# ===== АНКЕТА С ВЫБОРОМ РАНГА, ОРГАНИЗАЦИИ И ЗАМА =====
 user_surveys = {}
 
 async def start_survey(message: Message):
@@ -284,16 +295,19 @@ async def survey_handler(message: Message):
             answers["tag"] = str(user.id)
         survey["step"] = 1
         await show_rank_choice(message)
-    elif step == 1: # выбор ранга обрабатывается в колбэке
+    elif step == 1:
+        # выбор ранга обрабатывается в колбэке
         pass
     elif step == 2:
-        answers["organization"] = message.text
-        survey["step"] = 3
-        await message.answer("4️⃣ Ваш ранг в организации?")
+        # выбор организации обрабатывается в колбэке
+        pass
     elif step == 3:
         answers["rank_org"] = message.text
         survey["step"] = 4
         await show_zam_choice(message)
+    elif step == 4:
+        # выбор зама обрабатывается в колбэке
+        pass
     else:
         await message.answer("⚠️ Что-то пошло не так. Начните анкету заново /start")
 
@@ -315,9 +329,30 @@ async def rank_selected(callback: CallbackQuery):
     rank = callback.data[5:]
     survey = user_surveys[user_id]
     survey["answers"]["rank_fam"] = rank
-    survey["step"] = 2  # переходим к вопросу об организации
+    survey["step"] = 2  # переходим к выбору организации
     await callback.answer(f"✅ Вы выбрали {rank}")
-    await callback.message.answer("3️⃣ Ваша организация?")
+    await show_org_choice(callback.message, user_id)
+
+async def show_org_choice(message: Message, user_id: int):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=org, callback_data=f"org_{org}")]
+        for org in ORG_LIST
+    ])
+    await message.answer("🏢 Выберите вашу организацию:", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("org_"))
+async def org_selected(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in user_surveys:
+        await callback.answer("❌ Анкета не найдена.")
+        return
+
+    org = callback.data[4:]
+    survey = user_surveys[user_id]
+    survey["answers"]["organization"] = org
+    survey["step"] = 3  # переходим к вопросу о ранге в организации
+    await callback.answer(f"✅ Вы выбрали {org}")
+    await callback.message.answer("📌 Ваш ранг в организации?")
 
 async def show_zam_choice(message: Message):
     user_id = message.from_user.id
@@ -363,7 +398,7 @@ async def finish_survey(message: Message, user_id: int):
 
     user_data = {
         "nickname": answers.get("nickname", "—"),
-        "tag": answers.get("tag", "—"),  # уже автоматически заполнен
+        "tag": answers.get("tag", "—"),
         "rank_fam": answers.get("rank_fam", "—"),
         "organization": answers.get("organization", "—"),
         "rank_org": answers.get("rank_org", "—"),
