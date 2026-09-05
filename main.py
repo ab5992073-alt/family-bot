@@ -37,10 +37,10 @@ GROUP_ID = -1002409536359
 GROUP_LINK = "https://t.me/+f_eKIP4gwcs0YTcy"
 BOT_NAME = "@Staff_Grand_Bot"
 
-# ID темы "Новости" – получи через /topic_id в теме и замени 0 на число
-ANNOUNCE_TOPIC_ID = 0
+# ID темы "Новости" – теперь установлен
+ANNOUNCE_TOPIC_ID = 126387
 
-# Защита группы ОТКЛЮЧЕНА (установлено 0)
+# Защита группы отключена (0), но защита темы работает отдельно
 PROTECTED_GROUP_ID = 0
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -557,7 +557,7 @@ async def my_profile(message: Message):
     else:
         await message.answer("ℹ️ Вы ещё не заполнили анкету. Нажмите «📝 Заполнить анкету».")
 
-# ===== УПРАВЛЕНИЕ АДМИНАМИ =====
+# ===== УПРАВЛЕНИЕ АДМИНАМИ (с поддержкой username) =====
 @dp.message(F.text == "👑 Управление админами")
 async def manage_admins(message: Message):
     if not is_super_admin(message.from_user.id):
@@ -569,11 +569,18 @@ async def manage_admins(message: Message):
     text = "👑 <b>Управление админами</b>\n\n"
     text += "📋 <b>Текущие админы (ID):</b>\n"
     for admin_id in current_admins:
-        text += f"• {admin_id}\n"
+        try:
+            user = await bot.get_user(admin_id)
+            username = f"@{user.username}" if user.username else user.full_name
+        except:
+            username = str(admin_id)
+        text += f"• {username} ({admin_id})\n"
 
     text += "\n<b>Команды:</b>\n"
-    text += "/add_admin 123456789 — добавить админа\n"
-    text += "/remove_admin 123456789 — удалить админа\n"
+    text += "/add_admin 123456789 — добавить по ID\n"
+    text += "/add_admin @username — добавить по тегу\n"
+    text += "/remove_admin 123456789 — удалить по ID\n"
+    text += "/remove_admin @username — удалить по тегу\n"
 
     await message.answer(text)
 
@@ -584,30 +591,51 @@ async def add_admin_command(message: Message):
         return
 
     await log_action(message.from_user.id, "команда add_admin", "")
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("❌ Использование: /add_admin 123456789")
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("❌ Использование: /add_admin <ID или @username>")
         return
 
-    try:
-        new_admin_id = int(args[1])
-    except ValueError:
-        await message.answer("❌ ID должен быть числом!")
+    arg = args[1].strip()
+    user_id = None
+    username = None
+
+    # Определяем, что передано: ID или username
+    if arg.startswith('@'):
+        username = arg[1:]  # убираем @
+        try:
+            user = await bot.get_user(username)
+            user_id = user.id
+        except Exception:
+            await message.answer(f"❌ Пользователь {arg} не найден.")
+            return
+    else:
+        try:
+            user_id = int(arg)
+        except ValueError:
+            await message.answer("❌ Неверный формат. Укажите ID (число) или @username.")
+            return
+
+    # Если user_id всё ещё None – ошибка
+    if user_id is None:
+        await message.answer("❌ Не удалось определить пользователя.")
         return
 
     current_admins = get_admins()
-    if new_admin_id in current_admins:
-        await message.answer(f"❌ Пользователь {new_admin_id} уже является админом.")
+    if user_id in current_admins:
+        await message.answer(f"❌ Пользователь {user_id} уже является админом.")
         return
 
-    current_admins.add(new_admin_id)
+    current_admins.add(user_id)
     save_admins(current_admins)
 
-    await message.answer(f"✅ Пользователь {new_admin_id} добавлен в список админов!")
+    await message.answer(f"✅ Пользователь {user_id} добавлен в список админов!")
 
     try:
+        user = await bot.get_user(user_id)
+        name = f"@{user.username}" if user.username else user.full_name
         await bot.send_message(
-            new_admin_id,
+            user_id,
             f"👑 <b>Вы назначены администратором!</b>\n\n"
             f"Теперь вам доступна админ-панель бота."
         )
@@ -621,34 +649,51 @@ async def remove_admin_command(message: Message):
         return
 
     await log_action(message.from_user.id, "команда remove_admin", "")
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("❌ Использование: /remove_admin 123456789")
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("❌ Использование: /remove_admin <ID или @username>")
         return
 
-    try:
-        admin_id_to_remove = int(args[1])
-    except ValueError:
-        await message.answer("❌ ID должен быть числом!")
+    arg = args[1].strip()
+    user_id = None
+    username = None
+
+    if arg.startswith('@'):
+        username = arg[1:]
+        try:
+            user = await bot.get_user(username)
+            user_id = user.id
+        except Exception:
+            await message.answer(f"❌ Пользователь {arg} не найден.")
+            return
+    else:
+        try:
+            user_id = int(arg)
+        except ValueError:
+            await message.answer("❌ Неверный формат. Укажите ID (число) или @username.")
+            return
+
+    if user_id is None:
+        await message.answer("❌ Не удалось определить пользователя.")
         return
 
-    if admin_id_to_remove == SUPER_ADMIN:
+    if user_id == SUPER_ADMIN:
         await message.answer("❌ Нельзя удалить владельца!")
         return
 
     current_admins = get_admins()
-    if admin_id_to_remove not in current_admins:
-        await message.answer(f"❌ Пользователь {admin_id_to_remove} не является админом.")
+    if user_id not in current_admins:
+        await message.answer(f"❌ Пользователь {user_id} не является админом.")
         return
 
-    current_admins.remove(admin_id_to_remove)
+    current_admins.remove(user_id)
     save_admins(current_admins)
 
-    await message.answer(f"✅ Пользователь {admin_id_to_remove} удалён из списка админов.")
+    await message.answer(f"✅ Пользователь {user_id} удалён из списка админов.")
 
     try:
         await bot.send_message(
-            admin_id_to_remove,
+            user_id,
             f"❌ <b>Вы больше не администратор.</b>"
         )
     except:
@@ -710,8 +755,8 @@ async def help_command(message: Message):
         ("/кто", "Информация о пользователе (ответить на сообщение)"),
         ("/ping", "Проверить задержку (админы)"),
         ("/all", "Отправить важное объявление (админы)"),
-        ("/add_admin", "Добавить админа (владелец)"),
-        ("/remove_admin", "Удалить админа (владелец)"),
+        ("/add_admin", "Добавить админа по ID или @username (владелец)"),
+        ("/remove_admin", "Удалить админа по ID или @username (владелец)"),
         ("/logs", "Показать логи (владелец)"),
         ("/clearlogs", "Очистить логи (владелец)"),
     ]
@@ -720,16 +765,22 @@ async def help_command(message: Message):
         text += f"{cmd} — {desc}\n"
     await message.answer(text)
 
-# ===== ЗАЩИТА ГРУППЫ ОТКЛЮЧЕНА (закомментировано) =====
+# ===== ЗАЩИТА ГРУППЫ ОТКЛЮЧЕНА =====
 # @dp.message(F.chat.id == PROTECTED_GROUP_ID)
 # async def protect_group(message: Message):
-#     if not is_admin(message.from_user.id):
-#         await message.delete()
-#         await bot.send_message(
-#             PROTECTED_GROUP_ID,
-#             f"❌ {message.from_user.full_name}, только администраторы могут писать в эту группу!",
-#             reply_to_message_id=message.message_id
-#         )
+#     ...
+
+# ===== ЗАЩИТА ТЕМЫ "НОВОСТИ" (только админы) =====
+@dp.message(F.chat.id == GROUP_ID)
+async def protect_announce_topic(message: Message):
+    if message.message_thread_id == ANNOUNCE_TOPIC_ID:
+        if not is_admin(message.from_user.id):
+            await message.delete()
+            await bot.send_message(
+                GROUP_ID,
+                f"❌ {message.from_user.full_name}, в этой теме могут писать только администраторы!",
+                reply_to_message_id=message.message_id
+            )
 
 # ===== КОМАНДА /all (отправляет в тему "Новости") =====
 @dp.message(Command("all"))
@@ -738,7 +789,7 @@ async def all_command(message: Message):
         await message.answer("❌ Только для админов!")
         return
     if ANNOUNCE_TOPIC_ID == 0:
-        await message.answer("❌ ID темы 'Новости' не настроен. Используйте /topic_id в теме, чтобы узнать ID.")
+        await message.answer("❌ ID темы 'Новости' не настроен.")
         return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
