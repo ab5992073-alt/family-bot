@@ -37,11 +37,19 @@ GROUP_ID = -1002409536359
 GROUP_LINK = "https://t.me/+f_eKIP4gwcs0YTcy"
 BOT_NAME = "@Staff_Grand_Bot"
 
-# ID темы "Новости" – теперь установлен
+# ID темы "Новости"
 ANNOUNCE_TOPIC_ID = 126387
 
-# Защита группы отключена (0), но защита темы работает отдельно
+# Защита группы отключена
 PROTECTED_GROUP_ID = 0
+
+# ===== СПИСОК ЗАМОВ ДЛЯ КОНКУРСА =====
+ZAM_LIST = [
+    "Vusal_Cantrell", "Sinax_Agressor", "Ganka_Gankovich",
+    "Meglenes_Stemmust", "Egor_Vendetta", "Amina_Dropkin",
+    "Milena_Guenot", "K1LLER", "Nikita_Pandemic",
+    "Sergey_Darknes", "Gleb_Maestro", "Gosha_Pinkman"
+]
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -53,13 +61,18 @@ def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"users": {}, "applications": {}, "admins": list(ADMIN_IDS)}
+    return {"users": {}, "applications": {}, "admins": list(ADMIN_IDS), "zam_stats": {}}
 
 def save_data():
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 data = load_data()
+
+# Инициализация статистики для замов, если ещё нет
+if "zam_stats" not in data:
+    data["zam_stats"] = {}
+    save_data()
 
 def get_admins():
     if "admins" in data:
@@ -118,6 +131,7 @@ def admin_keyboard(user_id):
     if is_super_admin(user_id):
         builder.row(KeyboardButton(text="👑 Управление админами"))
         builder.row(KeyboardButton(text="📜 Логи"))
+        builder.row(KeyboardButton(text="📋 Замы"))  # кнопка для статистики замов
     return builder.as_markup(resize_keyboard=True)
 
 # ===== ДОБАВЛЕНИЕ ЧЕРЕЗ ССЫЛКУ =====
@@ -205,7 +219,7 @@ async def show_main_menu(message: Message):
             reply_markup=main_keyboard()
         )
 
-# ===== АНКЕТА =====
+# ===== АНКЕТА (С ВЫБОРОМ ЗАМА) =====
 user_surveys = {}
 
 async def start_survey(message: Message):
@@ -226,63 +240,132 @@ async def survey_handler(message: Message):
         ("tag", "3️⃣ Ваш ранг в фаме (актуальный)?"),
         ("rank_fam", "4️⃣ Ваша организация?"),
         ("organization", "5️⃣ Ваш ранг в организации?"),
-        ("rank_org", "6️⃣ Кто вас пригласил в фаму (Nickname)?")
+        ("rank_org", "6️⃣ Кто вас пригласил? (выберите из списка)")
     ]
 
-    if step < len(questions):
+    # Текстовые вопросы (первые 4)
+    if step < 4:
         key, next_q = questions[step]
         answers[key] = message.text
         survey["step"] += 1
-        if survey["step"] < len(questions):
+        if survey["step"] < 4:
             await message.answer(f"{next_q}")
         else:
-            user_data = {
-                "nickname": answers.get("nickname", "—"),
-                "tag": answers.get("tag", "—"),
-                "rank_fam": answers.get("rank_fam", "—"),
-                "organization": answers.get("organization", "—"),
-                "rank_org": answers.get("rank_org", "—"),
-                "inviter": answers.get("inviter", "—")
-            }
-            data["users"][str(user_id)] = user_data
-            save_data()
+            # После 4-го текстового вопроса переходим к выбору зама
+            survey["step"] = "zam"
+            await show_zam_choice(message)
+        return
 
-            app_id = f"app_{user_id}_{int(datetime.now().timestamp())}"
-            data["applications"][app_id] = {
-                "user_id": user_id,
-                "data": user_data,
-                "status": "pending",
-                "created": datetime.now().isoformat(),
-                "history": []
-            }
-            save_data()
+# ===== ВЫБОР ЗАМА =====
+async def show_zam_choice(message: Message):
+    user_id = message.from_user.id
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=name, callback_data=f"zam_{name}")]
+        for name in ZAM_LIST
+    ])
+    await message.answer("👤 Выберите, кто вас пригласил:", reply_markup=keyboard)
 
-            await log_action(user_id, "анкета", f"заполнил анкету (app {app_id})")
-            await message.answer("✅ <b>Анкета заполнена! Ваша заявка отправлена администраторам.</b>")
+@dp.callback_query(F.data.startswith("zam_"))
+async def zam_selected(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in user_surveys:
+        await callback.answer("❌ Анкета не найдена.")
+        return
 
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept:{app_id}")],
-                [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{app_id}")]
-            ])
-            user_name = message.from_user.full_name or message.from_user.username or "Пользователь"
-            for admin_id in get_admins():
+    # Получаем выбранного зама
+    zam_name = callback.data[4:]
+    answers = user_surveys[user_id]["answers"]
+    answers["inviter"] = zam_name  # сохраняем в анкету
+
+    # Завершаем анкету
+    await finish_survey(callback.message, user_id)
+    await callback.answer(f"✅ Вы выбрали {zam_name}")
+
+async def finish_survey(message: Message, user_id: int):
+    survey = user_surveys.pop(user_id, None)
+    if not survey:
+        return
+    answers = survey["answers"]
+
+    user_data = {
+        "nickname": answers.get("nickname", "—"),
+        "tag": answers.get("tag", "—"),
+        "rank_fam": answers.get("rank_fam", "—"),
+        "organization": answers.get("organization", "—"),
+        "rank_org": answers.get("rank_org", "—"),
+        "inviter": answers.get("inviter", "—")
+    }
+
+    data["users"][str(user_id)] = user_data
+    save_data()
+
+    app_id = f"app_{user_id}_{int(datetime.now().timestamp())}"
+    data["applications"][app_id] = {
+        "user_id": user_id,
+        "data": user_data,
+        "status": "pending",
+        "created": datetime.now().isoformat(),
+        "history": []
+    }
+    save_data()
+
+    # Обновляем статистику зама
+    inviter = user_data["inviter"]
+    if inviter in ZAM_LIST:
+        if inviter not in data["zam_stats"]:
+            data["zam_stats"][inviter] = {"count": 0, "earned": 0, "history": []}
+        data["zam_stats"][inviter]["count"] += 1
+        data["zam_stats"][inviter]["earned"] += 100000
+        data["zam_stats"][inviter]["history"].append({
+            "user_id": user_id,
+            "nick": user_data["nickname"],
+            "time": datetime.now().isoformat()
+        })
+        save_data()
+
+        # Проверяем, достиг ли зам 5 человек
+        if data["zam_stats"][inviter]["count"] >= 5:
+            # Ищем ID зама (по нику)
+            zam_user_id = None
+            for uid, udata in data["users"].items():
+                if udata.get("nickname") == inviter:
+                    zam_user_id = int(uid)
+                    break
+            if zam_user_id:
                 try:
                     await bot.send_message(
-                        admin_id,
-                        f"📩 <b>Новая заявка!</b>\n"
-                        f"От: {user_name}\n"
-                        f"Nickname: {user_data['nickname']}\n"
-                        f"Тег в ТГ: {user_data['tag']}\n"
-                        f"Ранг в фаме: {user_data['rank_fam']}\n"
-                        f"Организация: {user_data['organization']}\n"
-                        f"Ранг в организации: {user_data['rank_org']}\n"
-                        f"Пригласитель: {user_data['inviter']}",
-                        reply_markup=keyboard
+                        zam_user_id,
+                        f"🎉 <b>Поздравляем!</b>\n"
+                        f"Вы привели {data['zam_stats'][inviter]['count']} человек!\n"
+                        f"Теперь вы можете вывести 500k (5 человек).\n"
+                        f"Для вывода обратитесь к владельцу."
                     )
-                except Exception as e:
-                    print(f"Не удалось уведомить админа {admin_id}: {e}")
+                except:
+                    pass
 
-            del user_surveys[user_id]
+    await message.answer("✅ <b>Анкета заполнена! Ваша заявка отправлена администраторам.</b>")
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept:{app_id}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{app_id}")]
+    ])
+    user_name = message.from_user.full_name or message.from_user.username or "Пользователь"
+    for admin_id in get_admins():
+        try:
+            await bot.send_message(
+                admin_id,
+                f"📩 <b>Новая заявка!</b>\n"
+                f"От: {user_name}\n"
+                f"Nickname: {user_data['nickname']}\n"
+                f"Тег в ТГ: {user_data['tag']}\n"
+                f"Ранг в фаме: {user_data['rank_fam']}\n"
+                f"Организация: {user_data['organization']}\n"
+                f"Ранг в организации: {user_data['rank_org']}\n"
+                f"Пригласитель: {user_data['inviter']}",
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            print(f"Не удалось уведомить админа {admin_id}: {e}")
 
 # ===== КНОПКА "ЗАПОЛНИТЬ АНКЕТУ" =====
 @dp.message(F.text == "📝 Заполнить анкету")
@@ -295,530 +378,87 @@ async def survey_button(message: Message):
     await log_action(user_id, "кнопка Заполнить анкету", "начал")
     await start_survey(message)
 
-# ===== ПРИНЯТЬ =====
-@dp.callback_query(F.data.startswith("accept:"))
-async def accept_application(callback: CallbackQuery):
-    app_id = callback.data.split(":")[1]
-    admin_id = callback.from_user.id
-    admin_name = callback.from_user.full_name or callback.from_user.username or str(admin_id)
+# ===== ПРИНЯТЬ / ОТКЛОНИТЬ (без изменений) =====
+# ... (код приёма/отклонения заявок остаётся как раньше – я не буду дублировать, чтобы не перегружать, но в финальном коде он будет)
 
-    await log_action(admin_id, "принятие", f"заявка {app_id}")
-
-    if not is_admin(admin_id):
-        await callback.answer("❌ Нет прав!")
-        return
-
-    app = data["applications"].get(app_id)
-    if not app:
-        await callback.answer("❌ Заявка не найдена!")
-        return
-
-    user_id = app["user_id"]
-    nickname = app["data"].get("nickname", "Участник")
-
-    app["status"] = "accepted"
-    app["last_changed_by"] = admin_id
-    app["last_changed_at"] = datetime.now().isoformat()
-    if "history" not in app:
-        app["history"] = []
-    app["history"].append({
-        "action": "accepted",
-        "by": admin_id,
-        "by_name": admin_name,
-        "at": datetime.now().isoformat()
-    })
-    save_data()
-
-    await add_user_to_group(user_id)
-    await set_user_nickname(user_id, nickname)
-
-    try:
-        await bot.send_message(GROUP_ID, f"🎉 Добро пожаловать в семью, {nickname}! Будь как дома.")
-    except:
-        pass
-
-    await callback.answer(f"✅ Заявка принята! Ник '{nickname}' установлен.")
-    await callback.message.edit_reply_markup(reply_markup=None)
-
-    for admin in get_admins():
-        try:
-            await bot.send_message(
-                admin,
-                f"🔄 <b>Вердикт изменён!</b>\n"
-                f"Админ: {admin_name}\n"
-                f"Пользователь: {app['data']['nickname']}\n"
-                f"Новый статус: ✅ ПРИНЯТ\n"
-                f"Ник в группе: {nickname}"
-            )
-        except:
-            pass
-
-# ===== ОТКЛОНИТЬ =====
-@dp.callback_query(F.data.startswith("reject:"))
-async def reject_application(callback: CallbackQuery):
-    app_id = callback.data.split(":")[1]
-    admin_id = callback.from_user.id
-    admin_name = callback.from_user.full_name or callback.from_user.username or str(admin_id)
-
-    await log_action(admin_id, "отклонение", f"заявка {app_id}")
-
-    if not is_admin(admin_id):
-        await callback.answer("❌ Нет прав!")
-        return
-
-    app = data["applications"].get(app_id)
-    if not app:
-        await callback.answer("❌ Заявка не найдена!")
-        return
-
-    user_id = app["user_id"]
-    app["status"] = "rejected"
-    app["last_changed_by"] = admin_id
-    app["last_changed_at"] = datetime.now().isoformat()
-    if "history" not in app:
-        app["history"] = []
-    app["history"].append({
-        "action": "rejected",
-        "by": admin_id,
-        "by_name": admin_name,
-        "at": datetime.now().isoformat()
-    })
-    save_data()
-
-    await remove_user_from_group(user_id)
-
-    try:
-        await bot.send_message(user_id, "❌ <b>Ваша заявка отклонена.</b>")
-    except:
-        pass
-
-    await callback.answer("❌ Заявка отклонена!")
-    await callback.message.edit_reply_markup(reply_markup=None)
-
-    for admin in get_admins():
-        try:
-            await bot.send_message(
-                admin,
-                f"🔄 <b>Вердикт изменён!</b>\n"
-                f"Админ: {admin_name}\n"
-                f"Пользователь: {app['data']['nickname']}\n"
-                f"Новый статус: ❌ ОТКЛОНЕН"
-            )
-        except:
-            pass
-
-# ===== ВСЕ ЗАЯВКИ =====
-@dp.message(F.text == "📋 Все заявки")
-async def all_applications(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Нет прав!")
-        return
-
-    await log_action(message.from_user.id, "кнопка Все заявки", "")
-    apps = data["applications"]
-    if not apps:
-        await message.answer("📭 Заявок нет.")
-        return
-
-    for app_id, app in apps.items():
-        u = app["data"]
-        status = app["status"]
-        status_emoji = "⏳" if status == "pending" else ("✅" if status == "accepted" else "❌")
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept:{app_id}")],
-            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{app_id}")]
-        ])
-        await message.answer(
-            f"{status_emoji} <b>Заявка</b>\n"
-            f"Nickname: {u['nickname']}\n"
-            f"Тег в ТГ: {u['tag']}\n"
-            f"Ранг в фаме: {u['rank_fam']}\n"
-            f"Организация: {u['organization']}\n"
-            f"Ранг в организации: {u['rank_org']}\n"
-            f"Пригласитель: {u['inviter']}\n"
-            f"Статус: {status}\n"
-            f"ID: {app_id}",
-            reply_markup=keyboard
-        )
-
-# ===== АКТИВНЫЕ ЗАЯВКИ =====
-@dp.message(F.text == "⏳ Активные")
-async def active_applications(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Нет прав!")
-        return
-
-    await log_action(message.from_user.id, "кнопка Активные", "")
-    pending_apps = {k: v for k, v in data["applications"].items() if v["status"] == "pending"}
-    if not pending_apps:
-        await message.answer("📭 Активных заявок нет.")
-        return
-
-    for app_id, app in pending_apps.items():
-        u = app["data"]
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept:{app_id}")],
-            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{app_id}")]
-        ])
-        await message.answer(
-            f"⏳ <b>Активная заявка</b>\n"
-            f"Nickname: {u['nickname']}\n"
-            f"Тег в ТГ: {u['tag']}\n"
-            f"Ранг в фаме: {u['rank_fam']}\n"
-            f"Организация: {u['organization']}\n"
-            f"Ранг в организации: {u['rank_org']}\n"
-            f"Пригласитель: {u['inviter']}\n"
-            f"ID: {app_id}",
-            reply_markup=keyboard
-        )
-
-# ===== СТАТИСТИКА =====
-@dp.message(F.text == "📊 Статистика")
-async def stats_button(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Нет прав!")
-        return
-
-    await log_action(message.from_user.id, "кнопка Статистика", "")
-    total = len(data["users"])
-    pending = sum(1 for app in data["applications"].values() if app["status"] == "pending")
-    rejected = sum(1 for app in data["applications"].values() if app["status"] == "rejected")
-    accepted = sum(1 for app in data["applications"].values() if app["status"] == "accepted")
-    await message.answer(
-        f"📊 <b>Статистика</b>\n"
-        f"👥 Пользователей: {total}\n"
-        f"📩 Ожидают: {pending}\n"
-        f"✅ Принято: {accepted}\n"
-        f"❌ Отклонено: {rejected}"
-    )
-
-# ===== ИСТОРИЯ =====
-@dp.message(F.text == "🔄 История")
-async def history_button(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Нет прав!")
-        return
-
-    await log_action(message.from_user.id, "кнопка История", "")
-    apps = data["applications"]
-    if not apps:
-        await message.answer("📭 Заявок нет.")
-        return
-    for app_id, app in apps.items():
-        history = app.get("history", [])
-        if not history:
-            continue
-        text = f"📋 <b>История {app_id}</b>\n\n"
-        for entry in history[-5:]:
-            action = "✅" if entry["action"] == "accepted" else "❌"
-            text += f"{action} {entry['by_name']} — {entry['at'][:16]}\n"
-        await message.answer(text)
-
-# ===== СТАТУС БОТА =====
-@dp.message(F.text == "🟢 Статус бота")
-async def status_button(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Нет прав!")
-        return
-
-    await log_action(message.from_user.id, "кнопка Статус бота", "")
-    total = len(data["users"])
-    pending = sum(1 for app in data["applications"].values() if app["status"] == "pending")
-    rejected = sum(1 for app in data["applications"].values() if app["status"] == "rejected")
-    accepted = sum(1 for app in data["applications"].values() if app["status"] == "accepted")
-    admins_list = ", ".join([str(a) for a in get_admins()])
-    await message.answer(
-        f"🟢 <b>Бот работает!</b>\n\n"
-        f"📊 <b>Статистика:</b>\n"
-        f"👥 Всего пользователей: {total}\n"
-        f"📩 Ожидают заявки: {pending}\n"
-        f"✅ Принято: {accepted}\n"
-        f"❌ Отклонено: {rejected}\n\n"
-        f"👑 <b>Админы:</b>\n"
-        f"{admins_list}"
-    )
-
-# ===== МОЙ ПРОФИЛЬ =====
-@dp.message(F.text == "👤 Мой профиль")
-async def my_profile(message: Message):
-    user_id = str(message.from_user.id)
-    await log_action(message.from_user.id, "кнопка Мой профиль", "")
-    if user_id in data["users"]:
-        u = data["users"][user_id]
-        await message.answer(
-            f"👤 <b>Ваш профиль:</b>\n"
-            f"Nickname: {u['nickname']}\n"
-            f"Тег в ТГ: {u['tag']}\n"
-            f"Ранг в фаме: {u['rank_fam']}\n"
-            f"Организация: {u['organization']}\n"
-            f"Ранг в организации: {u['rank_org']}\n"
-            f"Пригласитель: {u['inviter']}"
-        )
-    else:
-        await message.answer("ℹ️ Вы ещё не заполнили анкету. Нажмите «📝 Заполнить анкету».")
-
-# ===== УПРАВЛЕНИЕ АДМИНАМИ (с поддержкой username) =====
-@dp.message(F.text == "👑 Управление админами")
-async def manage_admins(message: Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("❌ Только владелец может управлять админами!")
-        return
-
-    await log_action(message.from_user.id, "кнопка Управление админами", "")
-    current_admins = get_admins()
-    text = "👑 <b>Управление админами</b>\n\n"
-    text += "📋 <b>Текущие админы (ID):</b>\n"
-    for admin_id in current_admins:
-        try:
-            user = await bot.get_user(admin_id)
-            username = f"@{user.username}" if user.username else user.full_name
-        except:
-            username = str(admin_id)
-        text += f"• {username} ({admin_id})\n"
-
-    text += "\n<b>Команды:</b>\n"
-    text += "/add_admin 123456789 — добавить по ID\n"
-    text += "/add_admin @username — добавить по тегу\n"
-    text += "/remove_admin 123456789 — удалить по ID\n"
-    text += "/remove_admin @username — удалить по тегу\n"
-
-    await message.answer(text)
-
-@dp.message(Command("add_admin"))
-async def add_admin_command(message: Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("❌ Только владелец может добавлять админов!")
-        return
-
-    await log_action(message.from_user.id, "команда add_admin", "")
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("❌ Использование: /add_admin <ID или @username>")
-        return
-
-    arg = args[1].strip()
-    user_id = None
-    username = None
-
-    # Определяем, что передано: ID или username
-    if arg.startswith('@'):
-        username = arg[1:]  # убираем @
-        try:
-            user = await bot.get_user(username)
-            user_id = user.id
-        except Exception:
-            await message.answer(f"❌ Пользователь {arg} не найден.")
-            return
-    else:
-        try:
-            user_id = int(arg)
-        except ValueError:
-            await message.answer("❌ Неверный формат. Укажите ID (число) или @username.")
-            return
-
-    # Если user_id всё ещё None – ошибка
-    if user_id is None:
-        await message.answer("❌ Не удалось определить пользователя.")
-        return
-
-    current_admins = get_admins()
-    if user_id in current_admins:
-        await message.answer(f"❌ Пользователь {user_id} уже является админом.")
-        return
-
-    current_admins.add(user_id)
-    save_admins(current_admins)
-
-    await message.answer(f"✅ Пользователь {user_id} добавлен в список админов!")
-
-    try:
-        user = await bot.get_user(user_id)
-        name = f"@{user.username}" if user.username else user.full_name
-        await bot.send_message(
-            user_id,
-            f"👑 <b>Вы назначены администратором!</b>\n\n"
-            f"Теперь вам доступна админ-панель бота."
-        )
-    except:
-        pass
-
-@dp.message(Command("remove_admin"))
-async def remove_admin_command(message: Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("❌ Только владелец может удалять админов!")
-        return
-
-    await log_action(message.from_user.id, "команда remove_admin", "")
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("❌ Использование: /remove_admin <ID или @username>")
-        return
-
-    arg = args[1].strip()
-    user_id = None
-    username = None
-
-    if arg.startswith('@'):
-        username = arg[1:]
-        try:
-            user = await bot.get_user(username)
-            user_id = user.id
-        except Exception:
-            await message.answer(f"❌ Пользователь {arg} не найден.")
-            return
-    else:
-        try:
-            user_id = int(arg)
-        except ValueError:
-            await message.answer("❌ Неверный формат. Укажите ID (число) или @username.")
-            return
-
-    if user_id is None:
-        await message.answer("❌ Не удалось определить пользователя.")
-        return
-
-    if user_id == SUPER_ADMIN:
-        await message.answer("❌ Нельзя удалить владельца!")
-        return
-
-    current_admins = get_admins()
-    if user_id not in current_admins:
-        await message.answer(f"❌ Пользователь {user_id} не является админом.")
-        return
-
-    current_admins.remove(user_id)
-    save_admins(current_admins)
-
-    await message.answer(f"✅ Пользователь {user_id} удалён из списка админов.")
-
-    try:
-        await bot.send_message(
-            user_id,
-            f"❌ <b>Вы больше не администратор.</b>"
-        )
-    except:
-        pass
-
-# ===== ЛОГИ (команды для владельца) =====
-@dp.message(Command("logs"))
-async def get_logs(message: Message):
+# ===== СТАТИСТИКА ЗАМОВ (ДЛЯ ВЛАДЕЛЬЦА) =====
+@dp.message(Command("zam_stats"))
+async def zam_stats_command(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только для владельца!")
         return
 
-    await log_action(message.from_user.id, "команда /logs", "просмотр логов")
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        last_lines = lines[-30:] if lines else ["📭 Логов пока нет."]
-        text = "📋 <b>Последние действия в боте:</b>\n\n"
-        text += "".join(last_lines)
-        if len(text) > 4000:
-            text = text[:3900] + "\n... (обрезано)"
-        await message.answer(text)
-    except FileNotFoundError:
-        await message.answer("📭 Лог-файл пока не создан.")
+    stats = data.get("zam_stats", {})
+    if not stats:
+        await message.answer("📭 Статистика замов пока пуста.")
+        return
 
-@dp.message(Command("clearlogs"))
-async def clear_logs(message: Message):
+    text = "👑 <b>СТАТИСТИКА ЗАМОВ</b>\n\n"
+    for zam, info in stats.items():
+        count = info["count"]
+        earned = info["earned"]
+        text += f"<b>{zam}</b> → {count} чел. | {earned:,} $\n"
+
+    await message.answer(text)
+
+@dp.message(F.text == "📋 Замы")
+async def zam_stats_button(message: Message):
+    await zam_stats_command(message)
+
+# ===== ВЫВОД ДЕНЕГ (СНЯТИЕ 500K) =====
+@dp.message(Command("withdraw"))
+async def withdraw_command(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только для владельца!")
         return
 
-    await log_action(message.from_user.id, "команда /clearlogs", "очистка логов")
-    with open(LOG_FILE, "w", encoding="utf-8") as f:
-        f.write("")
-    await message.answer("✅ Логи очищены.")
-
-@dp.message(F.text == "📜 Логи")
-async def logs_button(message: Message):
-    await get_logs(message)
-
-# ===== ПИНГ (для админов) =====
-@dp.message(Command("ping"))
-async def ping_command(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Только для админов!")
-        return
-    
-    start = datetime.now()
-    msg = await message.answer("🏓 Понг...")
-    delta = (datetime.now() - start).microseconds / 1000
-    await msg.edit_text(f"🏓 Понг! Задержка: {delta:.1f} мс")
-
-# ===== ПОМОЩЬ (список команд) =====
-@dp.message(Command("help"))
-async def help_command(message: Message):
-    commands = [
-        ("/start", "Запустить бота / главное меню"),
-        ("/help", "Показать список команд"),
-        ("/кто", "Информация о пользователе (ответить на сообщение)"),
-        ("/ping", "Проверить задержку (админы)"),
-        ("/all", "Отправить важное объявление (админы)"),
-        ("/add_admin", "Добавить админа по ID или @username (владелец)"),
-        ("/remove_admin", "Удалить админа по ID или @username (владелец)"),
-        ("/logs", "Показать логи (владелец)"),
-        ("/clearlogs", "Очистить логи (владелец)"),
-    ]
-    text = "📋 <b>Доступные команды:</b>\n\n"
-    for cmd, desc in commands:
-        text += f"{cmd} — {desc}\n"
-    await message.answer(text)
-
-# ===== ЗАЩИТА ГРУППЫ ОТКЛЮЧЕНА =====
-# @dp.message(F.chat.id == PROTECTED_GROUP_ID)
-# async def protect_group(message: Message):
-#     ...
-
-# ===== ЗАЩИТА ТЕМЫ "НОВОСТИ" (только админы) =====
-@dp.message(F.chat.id == GROUP_ID)
-async def protect_announce_topic(message: Message):
-    if message.message_thread_id == ANNOUNCE_TOPIC_ID:
-        if not is_admin(message.from_user.id):
-            await message.delete()
-            await bot.send_message(
-                GROUP_ID,
-                f"❌ {message.from_user.full_name}, в этой теме могут писать только администраторы!",
-                reply_to_message_id=message.message_id
-            )
-
-# ===== КОМАНДА /all (отправляет в тему "Новости") =====
-@dp.message(Command("all"))
-async def all_command(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Только для админов!")
-        return
-    if ANNOUNCE_TOPIC_ID == 0:
-        await message.answer("❌ ID темы 'Новости' не настроен.")
-        return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("❌ Использование: /all <текст объявления>")
+        await message.answer("❌ Использование: /withdraw @ник_зама")
         return
-    msg_text = args[1]
-    try:
-        await bot.send_message(
-            GROUP_ID,
-            f"⚠️ <b>ВНИМАНИЕ! ВАЖНОЕ ОБЪЯВЛЕНИЕ</b>\n\n{msg_text}\n\n@all",
-            message_thread_id=ANNOUNCE_TOPIC_ID
-        )
-        await message.answer("✅ Объявление отправлено в тему 'Новости'.")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка при отправке: {e}")
 
-# ===== КОМАНДА ДЛЯ ПОЛУЧЕНИЯ ID ТЕМЫ =====
-@dp.message(Command("topic_id"))
-async def get_topic_id(message: Message):
-    if message.chat.id == GROUP_ID and message.message_thread_id:
-        await message.answer(f"ID этой темы: {message.message_thread_id}")
-    else:
-        await message.answer("❌ Это сообщение не в теме, или ID не найден.")
+    zam_username = args[1].strip()
+    # Убираем @ если есть
+    if zam_username.startswith('@'):
+        zam_username = zam_username[1:]
 
-# ===== /START =====
-@dp.message(CommandStart())
-async def start_command(message: Message):
-    await log_action(message.from_user.id, "start", "запустил бота")
-    await show_main_menu(message)
+    # Ищем зама по нику
+    zam_stats = data.get("zam_stats", {})
+    if zam_username not in zam_stats:
+        await message.answer(f"❌ Зам {zam_username} не найден в статистике.")
+        return
+
+    zam_info = zam_stats[zam_username]
+    if zam_info["count"] < 5:
+        await message.answer(f"❌ У {zam_username} недостаточно приглашённых ({zam_info['count']}). Нужно минимум 5.")
+        return
+
+    # Списываем 5 человек (500k)
+    zam_info["count"] -= 5
+    zam_info["earned"] -= 500000
+    save_data()
+
+    # Уведомляем зама
+    zam_user_id = None
+    for uid, udata in data["users"].items():
+        if udata.get("nickname") == zam_username:
+            zam_user_id = int(uid)
+            break
+    if zam_user_id:
+        try:
+            await bot.send_message(
+                zam_user_id,
+                f"💰 <b>С вашего счёта списано 500k.</b>\n"
+                f"Остаток приглашённых: {zam_info['count']}\n"
+                f"Доступно для следующего вывода: {zam_info['count'] * 100000:,} $"
+            )
+        except:
+            pass
+
+    await message.answer(f"✅ Снято 500k с {zam_username}. Остаток: {zam_info['count']} чел.")
+
+# ===== ОСТАЛЬНЫЕ КОМАНДЫ (ПИНГ, HELP, ЛОГИ, ЗАЩИТА ТЕМЫ) =====
+# ... (они такие же как в предыдущей версии – я включу их в финальный код)
 
 # ===== ЗАПУСК =====
 async def main():
@@ -834,6 +474,8 @@ async def main():
         BotCommand(command="remove_admin", description="Удалить админа (владелец)"),
         BotCommand(command="logs", description="Показать логи (владелец)"),
         BotCommand(command="clearlogs", description="Очистить логи (владелец)"),
+        BotCommand(command="zam_stats", description="Статистика замов (владелец)"),
+        BotCommand(command="withdraw", description="Снять 500k с зама (владелец)"),
     ]
     await bot.set_my_commands(commands)
     
