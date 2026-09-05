@@ -44,12 +44,18 @@ ANNOUNCE_TOPIC_ID = 126387
 # Защита группы отключена
 PROTECTED_GROUP_ID = 0
 
-# ===== СПИСОК ЗАМОВ ДЛЯ КОНКУРСА =====
+# ===== СПИСОК ЗАМОВ =====
 ZAM_LIST = [
     "Vusal_Cantrell", "Sinax_Agressor", "Ganka_Gankovich",
     "Meglenes_Stemmust", "Egor_Vendetta", "Amina_Dropkin",
     "Milena_Guenot", "K1LLER", "Nikita_Pandemic",
     "Sergey_Darknes", "Gleb_Maestro", "Gosha_Pinkman"
+]
+
+# ===== СПИСОК РАНГОВ В ФАМЕ =====
+RANK_LIST = [
+    "НОВИЧОК", "БандИТ", "Стрелок", "ФРАЕР",
+    "ОХРАНИК", "СТ. ОХРАНИК", "РЕШАЛО", "ПОЛОЖЕНЕЦ", "ВОР"
 ]
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -233,17 +239,14 @@ async def reset_survey(message: Message):
         await message.answer("❌ У вас нет заполненной анкеты.")
         return
 
-    # Удаляем старую анкету
     old_data = data["users"].pop(user_id)
     save_data()
 
-    # Корректируем статистику зама
     old_inviter = old_data.get("inviter")
     if old_inviter and old_inviter in ZAM_LIST:
         if old_inviter in data["zam_stats"]:
             data["zam_stats"][old_inviter]["count"] -= 1
             data["zam_stats"][old_inviter]["earned"] -= 100000
-            # Удаляем запись о приглашении из истории (по user_id)
             if "history" in data["zam_stats"][old_inviter]:
                 data["zam_stats"][old_inviter]["history"] = [
                     h for h in data["zam_stats"][old_inviter]["history"]
@@ -253,10 +256,9 @@ async def reset_survey(message: Message):
 
     await log_action(int(user_id), "сброс анкеты", "начал перезаполнение")
     await message.answer("✅ Анкета сброшена. Вы можете заполнить её заново.")
-    # Показываем меню без кнопки перезаполнения
     await show_main_menu(message)
 
-# ===== АНКЕТА С ВЫБОРОМ ЗАМА =====
+# ===== АНКЕТА С ВЫБОРОМ РАНГА И ЗАМА (ТЕГ АВТОМАТИЧЕСКИ) =====
 user_surveys = {}
 
 async def start_survey(message: Message):
@@ -272,24 +274,50 @@ async def survey_handler(message: Message):
     step = survey["step"]
     answers = survey["answers"]
 
-    questions = [
-        ("nickname", "2️⃣ Ваш Тег в Telegram @ ?"),
-        ("tag", "3️⃣ Ваш ранг в фаме (актуальный)?"),
-        ("rank_fam", "4️⃣ Ваша организация?"),
-        ("organization", "5️⃣ Ваш ранг в организации?"),
-        ("rank_org", "6️⃣ Кто вас пригласил? (выберите из списка)")
-    ]
-
-    if step < 4:
-        key, next_q = questions[step]
-        answers[key] = message.text
-        survey["step"] += 1
-        if survey["step"] < 4:
-            await message.answer(f"{next_q}")
+    if step == 0:
+        answers["nickname"] = message.text
+        # Автоматически заполняем тег
+        user = message.from_user
+        if user.username:
+            answers["tag"] = f"@{user.username}"
         else:
-            survey["step"] = "zam"
-            await show_zam_choice(message)
+            answers["tag"] = str(user.id)
+        survey["step"] = 1
+        await show_rank_choice(message)
+    elif step == 1: # выбор ранга обрабатывается в колбэке
+        pass
+    elif step == 2:
+        answers["organization"] = message.text
+        survey["step"] = 3
+        await message.answer("4️⃣ Ваш ранг в организации?")
+    elif step == 3:
+        answers["rank_org"] = message.text
+        survey["step"] = 4
+        await show_zam_choice(message)
+    else:
+        await message.answer("⚠️ Что-то пошло не так. Начните анкету заново /start")
+
+async def show_rank_choice(message: Message):
+    user_id = message.from_user.id
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=rank, callback_data=f"rank_{rank}")]
+        for rank in RANK_LIST
+    ])
+    await message.answer("👤 Выберите ваш ранг в фаме:", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("rank_"))
+async def rank_selected(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in user_surveys:
+        await callback.answer("❌ Анкета не найдена.")
         return
+
+    rank = callback.data[5:]
+    survey = user_surveys[user_id]
+    survey["answers"]["rank_fam"] = rank
+    survey["step"] = 2  # переходим к вопросу об организации
+    await callback.answer(f"✅ Вы выбрали {rank}")
+    await callback.message.answer("3️⃣ Ваша организация?")
 
 async def show_zam_choice(message: Message):
     user_id = message.from_user.id
@@ -307,8 +335,8 @@ async def zam_selected(callback: CallbackQuery):
         return
 
     zam_name = callback.data[4:]
-    answers = user_surveys[user_id]["answers"]
-    answers["inviter"] = zam_name
+    survey = user_surveys[user_id]
+    survey["answers"]["inviter"] = zam_name
     await finish_survey(callback.message, user_id)
     await callback.answer(f"✅ Вы выбрали {zam_name}")
 
@@ -318,7 +346,7 @@ async def finish_survey(message: Message, user_id: int):
         return
     answers = survey["answers"]
 
-    # Если пользователь уже есть в базе – удаляем (на случай, если перезаполнение не через кнопку)
+    # Удаляем старую анкету, если была
     old_data = data["users"].get(str(user_id))
     if old_data:
         old_inviter = old_data.get("inviter")
@@ -331,10 +359,11 @@ async def finish_survey(message: Message, user_id: int):
                         h for h in data["zam_stats"][old_inviter]["history"]
                         if h["user_id"] != user_id
                     ]
+                save_data()
 
     user_data = {
         "nickname": answers.get("nickname", "—"),
-        "tag": answers.get("tag", "—"),
+        "tag": answers.get("tag", "—"),  # уже автоматически заполнен
         "rank_fam": answers.get("rank_fam", "—"),
         "organization": answers.get("organization", "—"),
         "rank_org": answers.get("rank_org", "—"),
@@ -354,7 +383,6 @@ async def finish_survey(message: Message, user_id: int):
     }
     save_data()
 
-    # Обновляем статистику зама
     inviter = user_data["inviter"]
     if inviter in ZAM_LIST:
         if inviter not in data["zam_stats"]:
