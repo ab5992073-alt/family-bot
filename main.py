@@ -8,7 +8,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton
+    ReplyKeyboardMarkup, KeyboardButton,
+    BotCommand
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
@@ -32,9 +33,12 @@ threading.Thread(target=run_web, daemon=True).start()
 TOKEN = "8768874617:AAGXy_Jk5x4hv583or1tGeJy__YJlpoU7vA"
 SUPER_ADMIN = 6166697485
 ADMIN_IDS = {6166697485, 123456789, 6863392923, 1980341141}
-GROUP_ID = -1002409536359
+GROUP_ID = -1002409536359  # основная группа
 GROUP_LINK = "https://t.me/+f_eKIP4gwcs0YTcy"
 BOT_NAME = "@Staff_Grand_Bot"
+
+# ID группы, которую защищаем (только админы могут писать)
+PROTECTED_GROUP_ID = -1002409536359  # та же группа – защищена полностью
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -73,7 +77,6 @@ def is_super_admin(user_id: int) -> bool:
 LOG_FILE = "bot_activity.log"
 
 async def log_action(user_id, action, details=""):
-    """Записывает действие в лог и отправляет уведомление владельцу"""
     try:
         user = await bot.get_user(user_id)
         username = f"@{user.username}" if user.username else user.full_name
@@ -325,6 +328,11 @@ async def accept_application(callback: CallbackQuery):
 
     await add_user_to_group(user_id)
     await set_user_nickname(user_id, nickname)
+
+    try:
+        await bot.send_message(GROUP_ID, f"🎉 Добро пожаловать в семью, {nickname}! Будь как дома.")
+    except:
+        pass
 
     await callback.answer(f"✅ Заявка принята! Ник '{nickname}' установлен.")
     await callback.message.edit_reply_markup(reply_markup=None)
@@ -678,6 +686,69 @@ async def clear_logs(message: Message):
 async def logs_button(message: Message):
     await get_logs(message)
 
+# ===== ПИНГ (для админов) =====
+@dp.message(Command("ping"))
+async def ping_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Только для админов!")
+        return
+    
+    start = datetime.now()
+    msg = await message.answer("🏓 Понг...")
+    delta = (datetime.now() - start).microseconds / 1000
+    await msg.edit_text(f"🏓 Понг! Задержка: {delta:.1f} мс")
+
+# ===== ПОМОЩЬ (список команд) =====
+@dp.message(Command("help"))
+async def help_command(message: Message):
+    commands = [
+        ("/start", "Запустить бота / главное меню"),
+        ("/help", "Показать список команд"),
+        ("/кто", "Информация о пользователе (ответить на сообщение)"),
+        ("/ping", "Проверить задержку (админы)"),
+        ("/all", "Отправить важное объявление (админы)"),
+        ("/add_admin", "Добавить админа (владелец)"),
+        ("/remove_admin", "Удалить админа (владелец)"),
+        ("/logs", "Показать логи (владелец)"),
+        ("/clearlogs", "Очистить логи (владелец)"),
+    ]
+    text = "📋 <b>Доступные команды:</b>\n\n"
+    for cmd, desc in commands:
+        text += f"{cmd} — {desc}\n"
+    await message.answer(text)
+
+# ===== ЗАЩИТА ГРУППЫ (только админы могут писать) =====
+@dp.message(F.chat.id == PROTECTED_GROUP_ID)
+async def protect_group(message: Message):
+    # Если сообщение из защищённой группы и отправитель не админ
+    if not is_admin(message.from_user.id):
+        await message.delete()
+        await bot.send_message(
+            PROTECTED_GROUP_ID,
+            f"❌ {message.from_user.full_name}, только администраторы могут писать в эту группу!",
+            reply_to_message_id=message.message_id
+        )
+
+# ===== КОМАНДА /all (отправить объявление) =====
+@dp.message(Command("all"))
+async def all_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Только для админов!")
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("❌ Использование: /all <текст объявления>")
+        return
+    msg_text = args[1]
+    try:
+        await bot.send_message(
+            PROTECTED_GROUP_ID,
+            f"⚠️ <b>ВНИМАНИЕ! ВАЖНОЕ ОБЪЯВЛЕНИЕ</b>\n\n{msg_text}\n\n@all"
+        )
+        await message.answer("✅ Объявление отправлено в группу.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при отправке: {e}")
+
 # ===== /START =====
 @dp.message(CommandStart())
 async def start_command(message: Message):
@@ -687,6 +758,20 @@ async def start_command(message: Message):
 # ===== ЗАПУСК =====
 async def main():
     print("🤖 Бот запущен!")
+    
+    commands = [
+        BotCommand(command="start", description="Запустить бота"),
+        BotCommand(command="help", description="Список команд"),
+        BotCommand(command="кто", description="Информация о пользователе (в группе)"),
+        BotCommand(command="ping", description="Проверить задержку (админы)"),
+        BotCommand(command="all", description="Отправить важное объявление (админы)"),
+        BotCommand(command="add_admin", description="Добавить админа (владелец)"),
+        BotCommand(command="remove_admin", description="Удалить админа (владелец)"),
+        BotCommand(command="logs", description="Показать логи (владелец)"),
+        BotCommand(command="clearlogs", description="Очистить логи (владелец)"),
+    ]
+    await bot.set_my_commands(commands)
+    
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
