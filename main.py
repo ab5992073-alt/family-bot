@@ -76,7 +76,8 @@ def load_data():
         "zam_stats": {},
         "bot_token": TOKEN,
         "zam_data": {},
-        "log_notify_enabled": False
+        "log_notify_enabled": False,
+        "admin_usernames": {}  # user_id -> username (без @)
     }
 
 def save_data():
@@ -92,6 +93,8 @@ if "bot_token" not in data:
     data["bot_token"] = TOKEN
 if "log_notify_enabled" not in data:
     data["log_notify_enabled"] = False
+if "admin_usernames" not in data:
+    data["admin_usernames"] = {}
 save_data()
 
 def get_zam_nicknames():
@@ -690,12 +693,17 @@ async def status_button(message: Message):
     accepted = sum(1 for app in data["applications"].values() if app["status"] == "accepted")
     admins_list = []
     for admin_id in get_admins():
-        try:
-            user = await bot.get_user(admin_id)
-            name = f"@{user.username}" if user.username else user.full_name
-            admins_list.append(name)
-        except:
-            admins_list.append(str(admin_id))
+        # сначала ищем в сохранённых username
+        saved_username = data.get("admin_usernames", {}).get(str(admin_id))
+        if saved_username:
+            admins_list.append(f"@{saved_username}")
+        else:
+            try:
+                user = await bot.get_user(admin_id)
+                name = f"@{user.username}" if user.username else user.full_name
+                admins_list.append(name)
+            except:
+                admins_list.append(str(admin_id))
     admins_text = "\n".join(admins_list) if admins_list else "Нет"
     await message.answer(
         f"🟢 <b>Бот работает!</b>\n\n📊 <b>Статистика:</b>\n👥 Всего пользователей: {total}\n📩 Ожидают заявки: {pending}\n✅ Принято: {accepted}\n❌ Отклонено: {rejected}\n\n👑 <b>Админы:</b>\n{admins_text}"
@@ -724,15 +732,18 @@ async def manage_admins(message: Message):
     current_admins = get_admins()
     text = "👑 <b>Администрирование</b>\n\n📋 <b>Текущие админы:</b>\n"
     for admin_id in current_admins:
-        try:
-            user = await bot.get_user(admin_id)
-            if user.username:
-                username = f"@{user.username}"
-            else:
-                username = user.full_name or str(admin_id)
-        except:
-            username = str(admin_id)
-        text += f"• {username}\n"
+        saved_username = data.get("admin_usernames", {}).get(str(admin_id))
+        if saved_username:
+            text += f"• @{saved_username}\n"
+        else:
+            try:
+                user = await bot.get_user(admin_id)
+                if user.username:
+                    text += f"• @{user.username}\n"
+                else:
+                    text += f"• {user.full_name}\n"
+            except:
+                text += f"• {admin_id}\n"
     text += "\n<b>Команды:</b>\n"
     text += "/add_admin adm @username — добавить админа\n"
     text += "/remove_admin adm @username — удалить админа\n"
@@ -769,6 +780,11 @@ async def add_admin_command(message: Message):
             return
         current_admins.add(user_id)
         save_admins(current_admins)
+        # Сохраняем username в базу
+        if "admin_usernames" not in data:
+            data["admin_usernames"] = {}
+        data["admin_usernames"][str(user_id)] = username
+        save_data()
         await message.answer(f"✅ Админ @{username} добавлен.")
         try:
             await bot.send_message(user_id, "👑 <b>Вы назначены администратором!</b>")
@@ -840,6 +856,10 @@ async def remove_admin_command(message: Message):
             return
         current_admins.remove(user_id)
         save_admins(current_admins)
+        # Удаляем из сохранённых username
+        if "admin_usernames" in data and str(user_id) in data["admin_usernames"]:
+            del data["admin_usernames"][str(user_id)]
+            save_data()
         await message.answer(f"✅ Админ @{username} удалён.")
         try:
             await bot.send_message(user_id, "❌ <b>Вы больше не администратор.</b>")
@@ -1040,11 +1060,12 @@ async def help_command(message: Message):
         ("/all", "📢 Объявление (админы)"),
         ("/add_admin", "➕ Добавить админа/зама (владелец)"),
         ("/remove_admin", "➖ Удалить админа/зама (владелец)"),
-        ("/admins", "👑 Админы(владелец)"),
-        ("/logs", "📜 Logs (владелец)"),
+        ("/admins", "👑 Список админов (владелец)"),
+        ("/logs", "📜 Журнал действий (владелец)"),
         ("/clearlogs", "🗑 Очистить журнал (владелец)"),
         ("/zam_stats", "🏦 Банк замов (владелец)"),
         ("/withdraw", "💰 Вывод денег (владелец)"),
+        ("/set_token", "🔑 Смена токена (владелец)"),
         ("/topic_id", "🆔 ID темы"),
         ("/log_on", "🔔 Включить уведомления (владелец)"),
         ("/log_off", "🔕 Выключить уведомления (владелец)"),
@@ -1111,15 +1132,18 @@ async def admins_command(message: Message):
         return
     text = "👑 <b>Список админов</b>\n\n"
     for admin_id in admins:
-        try:
-            user = await bot.get_user(admin_id)
-            if user.username:
-                name = f"@{user.username}"
-            else:
-                name = user.full_name or str(admin_id)
-        except:
-            name = str(admin_id)
-        text += f"• {name}\n"
+        saved_username = data.get("admin_usernames", {}).get(str(admin_id))
+        if saved_username:
+            text += f"• @{saved_username}\n"
+        else:
+            try:
+                user = await bot.get_user(admin_id)
+                if user.username:
+                    text += f"• @{user.username}\n"
+                else:
+                    text += f"• {user.full_name}\n"
+            except:
+                text += f"• {admin_id}\n"
     await message.answer(text)
 
 # ===== /set_token =====
