@@ -32,12 +32,12 @@ threading.Thread(target=run_web, daemon=True).start()
 
 # ===== КОНФИГУРАЦИЯ =====
 TOKEN = "8768874617:AAGXy_Jk5x4hv583or1tGeJy__YJlpoU7vA"
-SUPER_ADMIN = 6166697485  # твой ID (владелец)
+SUPER_ADMIN = 6166697485
 GROUP_ID = -1002409536359
 GROUP_LINK = "https://t.me/+f_eKIP4gwcs0YTcy"
 BOT_NAME = "@Staff_Grand_Bot"
 
-# Админы по юзернеймам (без @) – они будут добавлены в список админов вместе с владельцем
+# Админы по юзернеймам (без @)
 ADMINS_USERNAMES = {"Eremey128", "VusalFatalitii", "da_rkknes"}
 
 ANNOUNCE_TOPIC_ID = 126387
@@ -103,66 +103,42 @@ save_data()
 
 # ===== ИНИЦИАЛИЗАЦИЯ АДМИНОВ =====
 async def init_admins():
-    """При запуске бота добавляет SUPER_ADMIN и админов из ADMINS_USERNAMES."""
     admin_ids = set()
     admin_info = {}
     
-    # 1. Добавляем владельца (SUPER_ADMIN) явно
+    # Владелец
     super_admin_id = SUPER_ADMIN
     admin_ids.add(super_admin_id)
     try:
-        user = await bot.get_chat(super_admin_id)  # исправлено
+        chat = await bot.get_chat(super_admin_id)
         info = {}
-        if user.username:
-            info["username"] = user.username
-        if user.full_name:
-            info["full_name"] = user.full_name
+        if chat.username:
+            info["username"] = chat.username
+        if chat.full_name:
+            info["full_name"] = chat.full_name
         if not info:
             info["full_name"] = str(super_admin_id)
         admin_info[str(super_admin_id)] = info
     except:
         admin_info[str(super_admin_id)] = {"full_name": str(super_admin_id)}
     
-    # 2. Добавляем админов из ADMINS_USERNAMES
+    # Админы из списка
     for username in ADMINS_USERNAMES:
         try:
-            user = await bot.get_chat(username)  # исправлено
-            if user:
-                admin_ids.add(user.id)
+            chat = await bot.get_chat(username)
+            if chat:
+                admin_ids.add(chat.id)
                 info = {}
-                if user.username:
-                    info["username"] = user.username
-                if user.full_name:
-                    info["full_name"] = user.full_name
+                if chat.username:
+                    info["username"] = chat.username
+                if chat.full_name:
+                    info["full_name"] = chat.full_name
                 if not info:
-                    info["full_name"] = str(user.id)
-                admin_info[str(user.id)] = info
+                    info["full_name"] = str(chat.id)
+                admin_info[str(chat.id)] = info
         except Exception as e:
             print(f"Не удалось найти пользователя @{username}: {e}")
 
-    data["admins"] = list(admin_ids)
-    for uid, info in admin_info.items():
-        data["admin_usernames"][uid] = info
-    save_data()
-    print(f"✅ Админы инициализированы: {[get_admin_display(int(uid)) for uid in admin_info]}")
-    # 2. Добавляем админов из ADMINS_USERNAMES
-    for username in ADMINS_USERNAMES:
-        try:
-            user = await bot.get_user(username)
-            if user:
-                admin_ids.add(user.id)
-                info = {}
-                if user.username:
-                    info["username"] = user.username
-                if user.full_name:
-                    info["full_name"] = user.full_name
-                if not info:
-                    info["full_name"] = str(user.id)
-                admin_info[str(user.id)] = info
-        except Exception as e:
-            print(f"Не удалось найти пользователя @{username}: {e}")
-
-    # Сохраняем
     data["admins"] = list(admin_ids)
     for uid, info in admin_info.items():
         data["admin_usernames"][uid] = info
@@ -170,7 +146,6 @@ async def init_admins():
     print(f"✅ Админы инициализированы: {[get_admin_display(int(uid)) for uid in admin_info]}")
 
 def get_admin_display(admin_id):
-    """Возвращает строку для отображения админа (с @ или имя)"""
     uid = str(admin_id)
     info = data.get("admin_usernames", {}).get(uid)
     if info:
@@ -178,13 +153,12 @@ def get_admin_display(admin_id):
             return f"@{info['username']}"
         elif info.get("full_name"):
             return info["full_name"]
-    # fallback
     try:
-        user = bot.get_user(admin_id)
-        if user.username:
-            return f"@{user.username}"
-        elif user.full_name:
-            return user.full_name
+        chat = bot.get_chat(admin_id)
+        if chat.username:
+            return f"@{chat.username}"
+        elif chat.full_name:
+            return chat.full_name
     except:
         pass
     return str(admin_id)
@@ -221,8 +195,8 @@ LOG_FILE = "bot_activity.log"
 
 async def log_action(user_id, action, details=""):
     try:
-        user = await bot.get_user(user_id)
-        username = f"@{user.username}" if user.username else user.full_name
+        chat = await bot.get_chat(user_id)
+        username = f"@{chat.username}" if chat.username else chat.full_name
     except:
         username = str(user_id)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -315,8 +289,8 @@ async def who_command(message: Message):
         await message.answer("❌ У этого пользователя нет заполненной анкеты.")
         return
     try:
-        user = await bot.get_user(target_user_id)
-        tag = f"@{user.username}" if user.username else user.full_name
+        chat = await bot.get_chat(target_user_id)
+        tag = f"@{chat.username}" if chat.username else chat.full_name
     except:
         tag = str(target_user_id)
     await message.answer(
@@ -751,8 +725,8 @@ async def send_users_page(message: Message, users, page):
     for i in range(start, end):
         user_id, u = users[i]
         try:
-            user = await bot.get_user(int(user_id))
-            tag = f"@{user.username}" if user.username else user.full_name
+            chat = await bot.get_chat(int(user_id))
+            tag = f"@{chat.username}" if chat.username else chat.full_name
         except:
             tag = str(user_id)
         text += f"<b>{i+1}.</b> {u['nickname']} — {tag}\n"
@@ -838,27 +812,27 @@ async def add_admin_command(message: Message):
         return
     type_ = parts[0].lower()
     username = parts[1].lstrip('@')
+    try:
+        chat = await bot.get_chat(username)
+    except Exception as e:
+        await message.answer(f"❌ Пользователь @{username} не найден. Ошибка: {e}")
+        return
+
     if type_ == "adm":
-        try:
-            user = await bot.get_user(username)
-            user_id = user.id
-        except:
-            await message.answer(f"❌ Пользователь @{username} не найден.")
-            return
+        user_id = chat.id
         current_admins = get_admins()
         if user_id in current_admins:
             await message.answer(f"❌ @{username} уже является админом.")
             return
         current_admins.add(user_id)
         save_admins(current_admins)
-        # Сохраняем информацию об админе
         if "admin_usernames" not in data:
             data["admin_usernames"] = {}
         info = {}
-        if user.username:
-            info["username"] = user.username
-        if user.full_name:
-            info["full_name"] = user.full_name
+        if chat.username:
+            info["username"] = chat.username
+        if chat.full_name:
+            info["full_name"] = chat.full_name
         if not info:
             info["full_name"] = str(user_id)
         data["admin_usernames"][str(user_id)] = info
@@ -877,12 +851,7 @@ async def add_admin_command(message: Message):
         if not game_nick:
             await message.answer("❌ Игровой ник не может быть пустым.")
             return
-        try:
-            user = await bot.get_user(username)
-            user_id = user.id
-        except:
-            await message.answer(f"❌ Пользователь @{username} не найден.")
-            return
+        user_id = chat.id
         if game_nick in data["zam_data"]:
             await message.answer(f"❌ Игровой ник '{game_nick}' уже используется.")
             return
@@ -920,8 +889,8 @@ async def remove_admin_command(message: Message):
     username = parts[1].lstrip('@')
     if type_ == "adm":
         try:
-            user = await bot.get_user(username)
-            user_id = user.id
+            chat = await bot.get_chat(username)
+            user_id = chat.id
         except:
             await message.answer(f"❌ Пользователь @{username} не найден.")
             return
@@ -1251,7 +1220,6 @@ async def clear_logs(message: Message):
 # ===== ЗАПУСК =====
 async def main():
     print("🤖 Бот запущен!")
-    # Инициализируем админов (владелец + ADMINS_USERNAMES)
     await init_admins()
     
     commands = [
