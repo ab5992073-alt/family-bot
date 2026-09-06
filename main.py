@@ -111,7 +111,7 @@ async def init_admins():
     super_admin_id = SUPER_ADMIN
     admin_ids.add(super_admin_id)
     try:
-        user = await bot.get_user(super_admin_id)
+        user = await bot.get_chat(super_admin_id)  # исправлено
         info = {}
         if user.username:
             info["username"] = user.username
@@ -123,6 +123,28 @@ async def init_admins():
     except:
         admin_info[str(super_admin_id)] = {"full_name": str(super_admin_id)}
     
+    # 2. Добавляем админов из ADMINS_USERNAMES
+    for username in ADMINS_USERNAMES:
+        try:
+            user = await bot.get_chat(username)  # исправлено
+            if user:
+                admin_ids.add(user.id)
+                info = {}
+                if user.username:
+                    info["username"] = user.username
+                if user.full_name:
+                    info["full_name"] = user.full_name
+                if not info:
+                    info["full_name"] = str(user.id)
+                admin_info[str(user.id)] = info
+        except Exception as e:
+            print(f"Не удалось найти пользователя @{username}: {e}")
+
+    data["admins"] = list(admin_ids)
+    for uid, info in admin_info.items():
+        data["admin_usernames"][uid] = info
+    save_data()
+    print(f"✅ Админы инициализированы: {[get_admin_display(int(uid)) for uid in admin_info]}")
     # 2. Добавляем админов из ADMINS_USERNAMES
     for username in ADMINS_USERNAMES:
         try:
