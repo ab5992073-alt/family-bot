@@ -77,7 +77,7 @@ def load_data():
         "bot_token": TOKEN,
         "zam_data": {},
         "log_notify_enabled": False,
-        "admin_usernames": {}  # user_id -> username (без @)
+        "admin_usernames": {}
     }
 
 def save_data():
@@ -96,6 +96,27 @@ if "log_notify_enabled" not in data:
 if "admin_usernames" not in data:
     data["admin_usernames"] = {}
 save_data()
+
+# ===== ИНИЦИАЛИЗАЦИЯ admin_usernames для существующих админов =====
+async def init_admin_usernames():
+    """При запуске бота заполняет admin_usernames для всех текущих админов, если они отсутствуют."""
+    changed = False
+    for admin_id in get_admins():
+        if str(admin_id) not in data["admin_usernames"]:
+            try:
+                user = await bot.get_user(admin_id)
+                if user.username:
+                    data["admin_usernames"][str(admin_id)] = user.username
+                elif user.full_name:
+                    data["admin_usernames"][str(admin_id)] = user.full_name
+                else:
+                    data["admin_usernames"][str(admin_id)] = str(admin_id)
+                changed = True
+            except:
+                data["admin_usernames"][str(admin_id)] = str(admin_id)
+                changed = True
+    if changed:
+        save_data()
 
 def get_zam_nicknames():
     return list(data["zam_data"].keys())
@@ -693,15 +714,16 @@ async def status_button(message: Message):
     accepted = sum(1 for app in data["applications"].values() if app["status"] == "accepted")
     admins_list = []
     for admin_id in get_admins():
-        # сначала ищем в сохранённых username
         saved_username = data.get("admin_usernames", {}).get(str(admin_id))
         if saved_username:
             admins_list.append(f"@{saved_username}")
         else:
             try:
                 user = await bot.get_user(admin_id)
-                name = f"@{user.username}" if user.username else user.full_name
-                admins_list.append(name)
+                if user.username:
+                    admins_list.append(f"@{user.username}")
+                else:
+                    admins_list.append(user.full_name)
             except:
                 admins_list.append(str(admin_id))
     admins_text = "\n".join(admins_list) if admins_list else "Нет"
@@ -780,7 +802,6 @@ async def add_admin_command(message: Message):
             return
         current_admins.add(user_id)
         save_admins(current_admins)
-        # Сохраняем username в базу
         if "admin_usernames" not in data:
             data["admin_usernames"] = {}
         data["admin_usernames"][str(user_id)] = username
@@ -856,7 +877,6 @@ async def remove_admin_command(message: Message):
             return
         current_admins.remove(user_id)
         save_admins(current_admins)
-        # Удаляем из сохранённых username
         if "admin_usernames" in data and str(user_id) in data["admin_usernames"]:
             del data["admin_usernames"][str(user_id)]
             save_data()
@@ -1185,6 +1205,9 @@ async def clear_logs(message: Message):
 # ===== ЗАПУСК =====
 async def main():
     print("🤖 Бот запущен!")
+    # Инициализируем admin_usernames для существующих админов
+    await init_admin_usernames()
+    
     commands = [
         BotCommand(command="start", description="🏠 Главное меню"),
         BotCommand(command="help", description="📖 Справка"),
