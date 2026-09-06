@@ -33,12 +33,14 @@ threading.Thread(target=run_web, daemon=True).start()
 # ===== КОНФИГУРАЦИЯ =====
 TOKEN = "8768874617:AAGXy_Jk5x4hv583or1tGeJy__YJlpoU7vA"
 SUPER_ADMIN = 6166697485
+# Старые ID админов (восстановлены)
+ADMIN_IDS = {6166697485, 123456789, 6863392923, 1980341141}
+# Юзернеймы для дополнительных админов (можно добавлять через команду)
+ADMINS_USERNAMES = set()  # оставляем пустым, чтобы не добавлялись автоматически
+
 GROUP_ID = -1002409536359
 GROUP_LINK = "https://t.me/+f_eKIP4gwcs0YTcy"
 BOT_NAME = "@Staff_Grand_Bot"
-
-# Админы по юзернеймам (без @)
-ADMINS_USERNAMES = {"Eremey128", "VusalFatalitii", "da_rkknes"}
 
 ANNOUNCE_TOPIC_ID = 126387
 PROTECTED_GROUP_ID = 0
@@ -74,7 +76,7 @@ def load_data():
     return {
         "users": {},
         "applications": {},
-        "admins": [],
+        "admins": list(ADMIN_IDS),  # начальные админы из ADMIN_IDS
         "zam_stats": {},
         "bot_token": TOKEN,
         "zam_data": {},
@@ -98,31 +100,36 @@ if "log_notify_enabled" not in data:
 if "admin_usernames" not in data:
     data["admin_usernames"] = {}
 if "admins" not in data or not data["admins"]:
-    data["admins"] = []
+    data["admins"] = list(ADMIN_IDS)
 save_data()
 
 # ===== ИНИЦИАЛИЗАЦИЯ АДМИНОВ =====
 async def init_admins():
-    admin_ids = set()
-    admin_info = {}
-    
-    # Владелец
-    super_admin_id = SUPER_ADMIN
-    admin_ids.add(super_admin_id)
-    try:
-        chat = await bot.get_chat(super_admin_id)
-        info = {}
-        if chat.username:
-            info["username"] = chat.username
-        if chat.full_name:
-            info["full_name"] = chat.full_name
-        if not info:
-            info["full_name"] = str(super_admin_id)
-        admin_info[str(super_admin_id)] = info
-    except:
-        admin_info[str(super_admin_id)] = {"full_name": str(super_admin_id)}
-    
-    # Админы из списка
+    """При запуске бота добавляет всех из ADMIN_IDS и, если указаны, из ADMINS_USERNAMES."""
+    admin_ids = set(data.get("admins", []))
+    admin_info = data.get("admin_usernames", {})
+    changed = False
+
+    # Добавляем всех из ADMIN_IDS (старые ID)
+    for admin_id in ADMIN_IDS:
+        if admin_id not in admin_ids:
+            admin_ids.add(admin_id)
+            changed = True
+            # Пытаемся получить информацию о пользователе
+            try:
+                chat = await bot.get_chat(admin_id)
+                info = {}
+                if chat.username:
+                    info["username"] = chat.username
+                if chat.full_name:
+                    info["full_name"] = chat.full_name
+                if not info:
+                    info["full_name"] = str(admin_id)
+                admin_info[str(admin_id)] = info
+            except:
+                admin_info[str(admin_id)] = {"full_name": str(admin_id)}
+
+    # Добавляем админов из ADMINS_USERNAMES (если они не пустые)
     for username in ADMINS_USERNAMES:
         try:
             chat = await bot.get_chat(username)
@@ -136,16 +143,18 @@ async def init_admins():
                 if not info:
                     info["full_name"] = str(chat.id)
                 admin_info[str(chat.id)] = info
+                changed = True
         except Exception as e:
             print(f"Не удалось найти пользователя @{username}: {e}")
 
-    data["admins"] = list(admin_ids)
-    for uid, info in admin_info.items():
-        data["admin_usernames"][uid] = info
-    save_data()
-    print(f"✅ Админы инициализированы: {[get_admin_display(int(uid)) for uid in admin_info]}")
+    if changed:
+        data["admins"] = list(admin_ids)
+        data["admin_usernames"] = admin_info
+        save_data()
+        print(f"✅ Админы инициализированы: {[get_admin_display(int(uid)) for uid in admin_info]}")
 
 def get_admin_display(admin_id):
+    """Возвращает строку для отображения админа (с @ или имя)"""
     uid = str(admin_id)
     info = data.get("admin_usernames", {}).get(uid)
     if info:
@@ -153,6 +162,7 @@ def get_admin_display(admin_id):
             return f"@{info['username']}"
         elif info.get("full_name"):
             return info["full_name"]
+    # fallback
     try:
         chat = bot.get_chat(admin_id)
         if chat.username:
@@ -812,20 +822,20 @@ async def add_admin_command(message: Message):
         return
     type_ = parts[0].lower()
     username = parts[1].lstrip('@')
-    try:
-        chat = await bot.get_chat(username)
-    except Exception as e:
-        await message.answer(f"❌ Пользователь @{username} не найден. Ошибка: {e}")
-        return
-
     if type_ == "adm":
-        user_id = chat.id
+        try:
+            chat = await bot.get_chat(username)
+            user_id = chat.id
+        except:
+            await message.answer(f"❌ Пользователь @{username} не найден.")
+            return
         current_admins = get_admins()
         if user_id in current_admins:
             await message.answer(f"❌ @{username} уже является админом.")
             return
         current_admins.add(user_id)
         save_admins(current_admins)
+        # Сохраняем информацию
         if "admin_usernames" not in data:
             data["admin_usernames"] = {}
         info = {}
@@ -851,7 +861,12 @@ async def add_admin_command(message: Message):
         if not game_nick:
             await message.answer("❌ Игровой ник не может быть пустым.")
             return
-        user_id = chat.id
+        try:
+            chat = await bot.get_chat(username)
+            user_id = chat.id
+        except:
+            await message.answer(f"❌ Пользователь @{username} не найден.")
+            return
         if game_nick in data["zam_data"]:
             await message.answer(f"❌ Игровой ник '{game_nick}' уже используется.")
             return
@@ -1220,6 +1235,7 @@ async def clear_logs(message: Message):
 # ===== ЗАПУСК =====
 async def main():
     print("🤖 Бот запущен!")
+    # Инициализация админов
     await init_admins()
     
     commands = [
