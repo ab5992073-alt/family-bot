@@ -32,12 +32,12 @@ threading.Thread(target=run_web, daemon=True).start()
 
 # ===== КОНФИГУРАЦИЯ =====
 TOKEN = "8768874617:AAGXy_Jk5x4hv583or1tGeJy__YJlpoU7vA"
-SUPER_ADMIN = 6166697485  # владелец (твой ID)
+SUPER_ADMIN = 6166697485  # твой ID (владелец)
 GROUP_ID = -1002409536359
 GROUP_LINK = "https://t.me/+f_eKIP4gwcs0YTcy"
 BOT_NAME = "@Staff_Grand_Bot"
 
-# Админы по юзернеймам (без @) – именно они будут иметь права админа в боте
+# Админы по юзернеймам (без @) – они будут добавлены в список админов вместе с владельцем
 ADMINS_USERNAMES = {"Eremey128", "VusalFatalitii", "da_rkknes"}
 
 ANNOUNCE_TOPIC_ID = 126387
@@ -74,12 +74,12 @@ def load_data():
     return {
         "users": {},
         "applications": {},
-        "admins": [],  # будет заполнено при старте из ADMINS_USERNAMES
+        "admins": [],
         "zam_stats": {},
         "bot_token": TOKEN,
         "zam_data": {},
         "log_notify_enabled": False,
-        "admin_usernames": {}  # user_id -> {"username": str, "full_name": str}
+        "admin_usernames": {}
     }
 
 def save_data():
@@ -98,14 +98,32 @@ if "log_notify_enabled" not in data:
 if "admin_usernames" not in data:
     data["admin_usernames"] = {}
 if "admins" not in data or not data["admins"]:
-    data["admins"] = []  # будут заполнены при инициализации
+    data["admins"] = []
 save_data()
 
-# ===== ИНИЦИАЛИЗАЦИЯ АДМИНОВ ПО ЮЗЕРНЕЙМАМ =====
+# ===== ИНИЦИАЛИЗАЦИЯ АДМИНОВ =====
 async def init_admins():
-    """При запуске бота добавляет админов из ADMINS_USERNAMES, удаляя старых."""
+    """При запуске бота добавляет SUPER_ADMIN и админов из ADMINS_USERNAMES."""
     admin_ids = set()
     admin_info = {}
+    
+    # 1. Добавляем владельца (SUPER_ADMIN) явно
+    super_admin_id = SUPER_ADMIN
+    admin_ids.add(super_admin_id)
+    try:
+        user = await bot.get_user(super_admin_id)
+        info = {}
+        if user.username:
+            info["username"] = user.username
+        if user.full_name:
+            info["full_name"] = user.full_name
+        if not info:
+            info["full_name"] = str(super_admin_id)
+        admin_info[str(super_admin_id)] = info
+    except:
+        admin_info[str(super_admin_id)] = {"full_name": str(super_admin_id)}
+    
+    # 2. Добавляем админов из ADMINS_USERNAMES
     for username in ADMINS_USERNAMES:
         try:
             user = await bot.get_user(username)
@@ -122,9 +140,8 @@ async def init_admins():
         except Exception as e:
             print(f"Не удалось найти пользователя @{username}: {e}")
 
-    # Сохраняем админов в data
+    # Сохраняем
     data["admins"] = list(admin_ids)
-    # Обновляем admin_usernames
     for uid, info in admin_info.items():
         data["admin_usernames"][uid] = info
     save_data()
@@ -1212,7 +1229,7 @@ async def clear_logs(message: Message):
 # ===== ЗАПУСК =====
 async def main():
     print("🤖 Бот запущен!")
-    # Инициализируем админов из ADMINS_USERNAMES
+    # Инициализируем админов (владелец + ADMINS_USERNAMES)
     await init_admins()
     
     commands = [
