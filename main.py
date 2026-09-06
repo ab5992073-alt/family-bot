@@ -135,7 +135,6 @@ async def log_action(user_id, action, details=""):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(log_entry)
     
-    # Отправляем уведомление владельцу, если включено
     if data.get("log_notify_enabled", False):
         try:
             await bot.send_message(
@@ -161,7 +160,7 @@ def admin_keyboard(user_id, has_survey=False):
         KeyboardButton(text="⏳ Активные заявки")
     )
     builder.row(
-        KeyboardButton(text="👥 Список участników"),
+        KeyboardButton(text="👥 Список участников"),
         KeyboardButton(text="🟢 Статус бота")
     )
     if has_survey:
@@ -631,7 +630,7 @@ async def active_applications(message: Message):
         await message.answer(text, reply_markup=keyboard)
         idx += 1
 
-# ===== СПИСОК УЧАСТНИКОВ (с пагинацией) =====
+# ===== СПИСОК УЧАСТНИКОВ =====
 @dp.message(F.text == "👥 Список участников")
 async def list_users(message: Message):
     if not is_admin(message.from_user.id):
@@ -642,7 +641,6 @@ async def list_users(message: Message):
     if not users:
         await message.answer("📭 Нет заполненных анкет.")
         return
-    # Пагинация: по 3 анкеты на страницу
     page = 0
     await send_users_page(message, users, page)
 
@@ -657,15 +655,13 @@ async def send_users_page(message: Message, users, page):
     text = "👥 <b>Список участников (заполнившие анкету)</b>\n\n"
     for i in range(start, end):
         user_id, u = users[i]
-        # Получаем имя пользователя
         try:
             user = await bot.get_user(int(user_id))
             tag = f"@{user.username}" if user.username else user.full_name
         except:
             tag = str(user_id)
         text += f"<b>{i+1}.</b> {u['nickname']} — {tag}\n"
-        text += f"   Ранг: {u['rank_fam']} | Орг: {u['organization']} | Пригласил: {u['inviter']}\n"
-        text += "\n"
+        text += f"   Ранг: {u['rank_fam']} | Орг: {u['organization']} | Пригласил: {u['inviter']}\n\n"
     text += f"Страница {page+1} из {pages}"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     if page > 0:
@@ -730,7 +726,10 @@ async def manage_admins(message: Message):
     for admin_id in current_admins:
         try:
             user = await bot.get_user(admin_id)
-            username = f"@{user.username}" if user.username else user.full_name
+            if user.username:
+                username = f"@{user.username}"
+            else:
+                username = user.full_name or str(admin_id)
         except:
             username = str(admin_id)
         text += f"• {username}\n"
@@ -939,7 +938,7 @@ async def withdraw_command(message: Message):
             pass
     await message.answer(f"✅ Снято {amount}k с {game_nick}. Остаток: {info['count']} чел.")
 
-# ===== ЖУРНАЛ ДЕЙСТВИЙ (с пагинацией) =====
+# ===== ЖУРНАЛ ДЕЙСТВИЙ =====
 @dp.message(Command("logs"))
 async def get_logs(message: Message):
     if not is_super_admin(message.from_user.id):
@@ -954,7 +953,6 @@ async def get_logs(message: Message):
     if not lines:
         await message.answer("📭 Лог-файл пока не создан.")
         return
-    # Пагинация по 10 строк
     page = 0
     await send_logs_page(message, lines, page)
 
@@ -1042,12 +1040,11 @@ async def help_command(message: Message):
         ("/all", "📢 Объявление (админы)"),
         ("/add_admin", "➕ Добавить админа/зама (владелец)"),
         ("/remove_admin", "➖ Удалить админа/зама (владелец)"),
-        ("/admins", "👑 Список админов (владелец)"),
-        ("/logs", "📜 Журнал действий (владелец)"),
+        ("/admins", "👑 Админы(владелец)"),
+        ("/logs", "📜 Logs (владелец)"),
         ("/clearlogs", "🗑 Очистить журнал (владелец)"),
         ("/zam_stats", "🏦 Банк замов (владелец)"),
         ("/withdraw", "💰 Вывод денег (владелец)"),
-        ("/set_token", "🔑 Смена токена (владелец)"),
         ("/topic_id", "🆔 ID темы"),
         ("/log_on", "🔔 Включить уведомления (владелец)"),
         ("/log_off", "🔕 Выключить уведомления (владелец)"),
@@ -1116,10 +1113,13 @@ async def admins_command(message: Message):
     for admin_id in admins:
         try:
             user = await bot.get_user(admin_id)
-            name = f"@{user.username}" if user.username else user.full_name
-            text += f"• {name}\n"
+            if user.username:
+                name = f"@{user.username}"
+            else:
+                name = user.full_name or str(admin_id)
         except:
-            text += f"• {admin_id}\n"
+            name = str(admin_id)
+        text += f"• {name}\n"
     await message.answer(text)
 
 # ===== /set_token =====
