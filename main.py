@@ -29,7 +29,7 @@ def run_web():
 threading.Thread(target=run_web, daemon=True).start()
 
 # ===== КОНФИГУРАЦИЯ =====
-TOKEN = "8768874617:AAGXy_Jk5x4hv583or1tGeJy__YJlpoU7vA"
+TOKEN = os.environ["BOT_TOKEN"]
 SUPER_ADMIN = 6166697485
 ADMIN_IDS = {6166697485, 123456789, 6863392923, 1980341141}
 GROUP_ID = -1002409536359
