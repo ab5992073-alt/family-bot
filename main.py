@@ -21,6 +21,15 @@ from aiogram.types import (
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from flask import Flask
 
+try:
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from telethon.tl.types import User as TgUser
+except ImportError:
+    TelegramClient = None
+    StringSession = None
+    TgUser = None
+
 
 # =========================================================
 # WEB-SERVER ДЛЯ RENDER
@@ -47,6 +56,13 @@ threading.Thread(target=run_web, daemon=True).start()
 # =========================================================
 
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+
+# Необязательно: данные личного Telegram-аккаунта владельца.
+# Нужны только для /add_admin, чтобы показать диалоги владельца,
+# включая людей, которые никогда не писали боту.
+TG_API_ID_RAW = os.environ.get("TG_API_ID", "").strip()
+TG_API_HASH = os.environ.get("TG_API_HASH", "").strip()
+TG_SESSION_STRING = os.environ.get("TG_SESSION_STRING", "").strip()
 
 SUPER_ADMIN = 6166697485
 
@@ -93,6 +109,23 @@ ORG_LIST = [
     "Тамбовская ОПГ",
     "Кавказская ОПГ",
     "Не в организации",
+]
+
+# Замы, которые были видны на присланных скриншотах.
+# Они добавляются один раз при запуске и сохраняются в data.json.
+INITIAL_ZAMS = [
+    "Vusal_Cantrell",
+    "_Sinax_Agressor_",
+    "K1LLER",
+    "Milena_Guenot",
+    "Meglenes_Stemmust",
+    "Sergey_Darknes",
+    "Gleb_Maestro",
+    "Ganka_Gankovich",
+    "Gosha_Pinkman",
+    "Nikita_Pandemic",
+    "Egor_Vendetta",
+    "Victoria_Sergeevna",
 ]
 
 if not TOKEN:
@@ -149,6 +182,7 @@ defaults = {
     "zam_data": {},
     "log_notify_enabled": False,
     "admin_usernames": {},
+    "initial_zams_installed": False,
 }
 
 changed = False
@@ -205,6 +239,25 @@ for nick in data.get("zam_data", {}):
         changed = True
 
 if changed:
+    save_data()
+
+# Автоматически добавляем начальных замов со скриншотов только один раз.
+# После этого их можно свободно удалять через /remove_zam — повторно они
+# сами уже не появятся.
+if not data.get("initial_zams_installed", False):
+    for initial_nick in INITIAL_ZAMS:
+        if initial_nick not in data["zam_data"]:
+            data["zam_data"][initial_nick] = {
+                "tg_user_id": None,
+                "tg_username": None,
+            }
+            data["zam_stats"][initial_nick] = {
+                "count": 0,
+                "withdrawn": 0,
+                "history": [],
+            }
+
+    data["initial_zams_installed"] = True
     save_data()
 
 
@@ -268,6 +321,170 @@ def is_admin(user_id):
 
 def is_super_admin(user_id):
     return user_id == SUPER_ADMIN
+
+
+# =========================================================
+# ЛИЧНЫЕ ДИАЛОГИ ВЛАДЕЛЬЦА ДЛЯ ВЫДАЧИ АДМИНКИ
+# =========================================================
+
+owner_tg_client = None
+owner_dialog_cache = []
+owner_dialog_cache_time = 0.0
+
+
+def telegram_dialogs_enabled():
+    return (
+        TelegramClient is not None
+        and bool(TG_API_ID_RAW)
+        and bool(TG_API_HASH)
+        and bool(TG_SESSION_STRING)
+    )
+
+
+async def init_owner_telegram():
+    global owner_tg_client
+
+    if not telegram_dialogs_enabled():
+        print(
+            "ℹ️ Telegram-диалоги владельца отключены: "
+            "нужно задать TG_API_ID, TG_API_HASH и TG_SESSION_STRING."
+        )
+        return False
+
+    try:
+        api_id = int(TG_API_ID_RAW)
+        owner_tg_client = TelegramClient(
+            StringSession(TG_SESSION_STRING),
+            api_id,
+            TG_API_HASH,
+        )
+        await owner_tg_client.connect()
+
+        if not await owner_tg_client.is_user_authorized():
+            print("⚠️ TG_SESSION_STRING не авторизован.")
+            await owner_tg_client.disconnect()
+            owner_tg_client = None
+            return False
+
+        me = await owner_tg_client.get_me()
+        print(
+            f"✅ Личные Telegram-диалоги подключены: "
+            f"@{me.username}" if me and me.username else "✅ Личные Telegram-диалоги подключены."
+        )
+        return True
+    except Exception as e:
+        owner_tg_client = None
+        print(f"⚠️ Не удалось подключить Telegram-диалоги владельца: {e}")
+        return False
+
+
+async def get_owner_dialog_users(force=False):
+    global owner_dialog_cache, owner_dialog_cache_time
+
+    now = datetime.now().timestamp()
+    if owner_dialog_cache and not force and now - owner_dialog_cache_time < 60:
+        return owner_dialog_cache
+
+    if owner_tg_client is None:
+        return []
+
+    users = []
+    seen = set()
+
+    try:
+        async for dialog in owner_tg_client.iter_dialogs(limit=None):
+            entity = dialog.entity
+            if not isinstance(entity, TgUser):
+                continue
+            if getattr(entity, "bot", False) or getattr(entity, "deleted", False):
+                continue
+            if entity.id == SUPER_ADMIN or entity.id in seen:
+                continue
+
+            seen.add(entity.id)
+            users.append({
+                "id": entity.id,
+                "username": entity.username or "",
+                "name": " ".join(
+                    x for x in [entity.first_name or "", entity.last_name or ""]
+                    if x
+                ).strip() or str(entity.id),
+            })
+    except Exception as e:
+        print(f"⚠️ Ошибка получения диалогов владельца: {e}")
+        return []
+
+    users.sort(key=lambda x: (x["name"].lower(), x["id"]))
+    owner_dialog_cache = users
+    owner_dialog_cache_time = now
+    return users
+
+
+def format_tg_user(user):
+    username = user.get("username")
+    name = user.get("name") or str(user.get("id"))
+    if username:
+        return f"{name} — @{username}"
+    return name
+
+
+def owner_dialog_keyboard(users, page=0, per_page=8):
+    total = len(users)
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    start = page * per_page
+    end = min(start + per_page, total)
+
+    rows = []
+    for user in users[start:end]:
+        title = format_tg_user(user)
+        if len(title) > 55:
+            title = title[:52] + "..."
+        rows.append([
+            InlineKeyboardButton(
+                text=title,
+                callback_data=f"admuser:{user['id']}",
+            )
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admusers:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="admusers:no"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admusers:{page+1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append([
+        InlineKeyboardButton(text="🔄 Обновить список", callback_data="admusers:refresh"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_admin_user_list(message, page=0, force=False):
+    users = await get_owner_dialog_users(force=force)
+
+    if not users:
+        if owner_tg_client is None:
+            await message.answer(
+                "⚠️ Не могу показать личные Telegram-диалоги.\n\n"
+                "Bot API не имеет доступа к вашей личной переписке. "
+                "Для этого в Render нужно подключить Telegram-сессию "
+                "через TG_API_ID, TG_API_HASH и TG_SESSION_STRING.\n\n"
+                "После подключения /add_admin покажет список людей, "
+                "с которыми вы общались, даже если они никогда не запускали бота."
+            )
+        else:
+            await message.answer("📭 В личных диалогах не найдено подходящих пользователей.")
+        return
+
+    await message.answer(
+        "👑 <b>Выдача админки</b>\n\n"
+        "Выберите человека из ваших личных Telegram-диалогов.\n"
+        "После нажатия он сразу получит права администратора.",
+        reply_markup=owner_dialog_keyboard(users, page),
+    )
 
 
 # =========================================================
@@ -1285,8 +1502,9 @@ async def admin_panel(message: Message):
 
     await message.answer(
         "👑 <b>Управление администраторами</b>\n\n"
-        "Здесь можно добавить или удалить админа.\n"
-        "Команды /add_admin и /remove_admin также остаются рабочими.",
+        "➕ /add_admin — выбрать человека из ваших Telegram-диалогов и сразу выдать админку.\n"
+        "➖ /remove_admin — выбрать действующего админа и снять права.\n\n"
+        "👑 Замы управляются отдельно через /add_zam и /remove_zam.",
         reply_markup=admin_panel_keyboard(),
     )
 
@@ -1298,13 +1516,9 @@ async def adm_list_cb(cb: CallbackQuery):
         return
 
     text = "👑 <b>Администраторы</b>\n\n"
-
     for admin_id in sorted(get_admins()):
         role = "Владелец" if admin_id == SUPER_ADMIN else "Админ"
-        text += (
-            f"• {escape(get_admin_display(admin_id))} "
-            f"— {role}\n"
-        )
+        text += f"• {escape(get_admin_display(admin_id))} — {role}\n"
 
     await cb.message.answer(text)
     await cb.answer()
@@ -1316,12 +1530,96 @@ async def adm_add_cb(cb: CallbackQuery):
         await cb.answer("❌ Только владелец!", show_alert=True)
         return
 
-    admin_actions[cb.from_user.id] = "add_admin"
-    await cb.message.answer(
-        "➕ Введите Telegram username нового админа:\n"
-        "<code>@username</code>"
-    )
+    await send_admin_user_list(cb.message, 0, force=True)
     await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("admusers:"))
+async def admin_users_page_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌ Только владелец!", show_alert=True)
+        return
+
+    action = cb.data.split(":", 1)[1]
+    if action == "no":
+        await cb.answer()
+        return
+
+    force = action == "refresh"
+    page = 0 if force else int(action)
+    await send_admin_user_list(cb.message, page, force=force)
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("admuser:"))
+async def admin_user_selected_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌ Только владелец!", show_alert=True)
+        return
+
+    try:
+        user_id = int(cb.data.split(":", 1)[1])
+    except (TypeError, ValueError):
+        await cb.answer("❌ Некорректный пользователь.", show_alert=True)
+        return
+
+    if user_id == SUPER_ADMIN:
+        await cb.answer("❌ Это владелец.", show_alert=True)
+        return
+
+    if user_id in get_admins():
+        await cb.answer("⚠️ Этот человек уже админ.", show_alert=True)
+        return
+
+    user_info = None
+    for user in await get_owner_dialog_users():
+        if user["id"] == user_id:
+            user_info = user
+            break
+
+    if user_info is None:
+        try:
+            entity = await owner_tg_client.get_entity(user_id) if owner_tg_client else None
+            if isinstance(entity, TgUser):
+                user_info = {
+                    "id": entity.id,
+                    "username": entity.username or "",
+                    "name": " ".join(
+                        x for x in [entity.first_name or "", entity.last_name or ""]
+                        if x
+                    ).strip() or str(entity.id),
+                }
+        except Exception:
+            pass
+
+    if user_info is None:
+        await cb.answer("❌ Пользователь больше недоступен.", show_alert=True)
+        return
+
+    admins = get_admins()
+    admins.add(user_id)
+    save_admins(admins)
+
+    data["admin_usernames"][str(user_id)] = {
+        "username": user_info.get("username") or None,
+        "full_name": user_info.get("name") or str(user_id),
+    }
+    save_data()
+
+    display = format_tg_user(user_info)
+    await log_action(cb.from_user.id, "выдал админку", display)
+
+    await cb.message.answer(
+        f"✅ <b>Админка выдана.</b>\n\n👤 {escape(display)}"
+    )
+
+    try:
+        await bot.send_message(user_id, "👑 Вы назначены администратором!")
+    except Exception:
+        pass
+
+    await set_command_scopes()
+    await cb.answer("✅ Админ назначен!")
 
 
 @dp.callback_query(F.data == "adm:remove")
@@ -1330,16 +1628,80 @@ async def adm_remove_cb(cb: CallbackQuery):
         await cb.answer("❌ Только владелец!", show_alert=True)
         return
 
-    admin_actions[cb.from_user.id] = "remove_admin"
+    admins = [
+        {
+            "id": admin_id,
+            "name": get_admin_display(admin_id),
+        }
+        for admin_id in sorted(get_admins())
+        if admin_id != SUPER_ADMIN
+    ]
+
+    if not admins:
+        await cb.message.answer("📭 Кроме владельца администраторов нет.")
+        await cb.answer()
+        return
+
+    rows = []
+    for admin in admins:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"➖ {admin['name']}",
+                callback_data=f"removeadm:{admin['id']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="removeadm:no")])
+
     await cb.message.answer(
-        "➖ Введите Telegram username админа:\n"
-        "<code>@username</code>"
+        "➖ <b>Снять админку</b>\n\nВыберите администратора:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await cb.answer()
 
 
+@dp.callback_query(F.data.startswith("removeadm:"))
+async def remove_admin_selected_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌ Только владелец!", show_alert=True)
+        return
+
+    value = cb.data.split(":", 1)[1]
+    if value == "no":
+        await cb.message.edit_reply_markup(reply_markup=None)
+        await cb.answer()
+        return
+
+    try:
+        user_id = int(value)
+    except (TypeError, ValueError):
+        await cb.answer("❌ Ошибка.", show_alert=True)
+        return
+
+    if user_id == SUPER_ADMIN:
+        await cb.answer("❌ Нельзя удалить владельца.", show_alert=True)
+        return
+
+    admins = get_admins()
+    if user_id not in admins:
+        await cb.answer("⚠️ Уже не админ.", show_alert=True)
+        return
+
+    admins.remove(user_id)
+    save_admins(admins)
+    data["admin_usernames"].pop(str(user_id), None)
+    save_data()
+
+    display = get_admin_display(user_id)
+    await log_action(cb.from_user.id, "снял админку", display)
+
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.message.answer(f"✅ Админка снята с <b>{escape(display)}</b>.")
+    await set_command_scopes()
+    await cb.answer("✅ Готово")
+
+
 # =========================================================
-# АДМИНСКИЕ КОМАНДЫ
+# КОМАНДА /ADD_ADMIN
 # =========================================================
 
 @dp.message(Command("add_admin"))
@@ -1349,199 +1711,58 @@ async def add_admin(message: Message):
         return
 
     args = message.text.split(maxsplit=1)
-
-    if len(args) < 2:
+    if len(args) > 1:
         await message.answer(
-            "❌ Формат:\n"
-            "/add_admin adm @username\n"
-            "/add_admin zam @username Nik: игровой_ник"
+            "ℹ️ Теперь админ назначается выбором из ваших Telegram-диалогов.\n"
+            "Просто используйте /add_admin без аргументов."
         )
         return
 
-    parts = args[1].split()
-
-    if len(parts) < 2:
-        await message.answer("❌ Мало аргументов.")
-        return
-
-    type_ = parts[0].lower()
-    username = parts[1].lstrip("@")
-
-    if type_ == "adm":
-        try:
-            chat = await bot.get_chat(username)
-        except Exception:
-            await message.answer(
-                f"❌ @{escape(username)} не найден."
-            )
-            return
-
-        if chat.id in get_admins():
-            await message.answer("❌ Уже админ.")
-            return
-
-        admins = get_admins()
-        admins.add(chat.id)
-        save_admins(admins)
-
-        data["admin_usernames"][str(chat.id)] = {
-            "username": chat.username or username,
-            "full_name": chat.full_name or str(chat.id),
-        }
-        save_data()
-
-        await message.answer(
-            f"✅ Админ @{escape(username)} добавлен."
-        )
-
-        try:
-            await bot.send_message(
-                chat.id,
-                "👑 Вы назначены администратором!",
-            )
-        except Exception:
-            pass
-
-        await set_command_scopes()
-        return
-
-    if type_ == "zam":
-        if len(parts) < 4 or parts[2].lower() != "nik:":
-            await message.answer(
-                "❌ Формат:\n"
-                "/add_admin zam @username Nik: игровой_ник"
-            )
-            return
-
-        game_nick = " ".join(parts[3:]).strip()
-
-        try:
-            chat = await bot.get_chat(username)
-        except Exception:
-            await message.answer(
-                f"❌ @{escape(username)} не найден."
-            )
-            return
-
-        for nick, info in data["zam_data"].items():
-            if info.get("tg_user_id") == chat.id:
-                await message.answer(
-                    f"❌ Уже зам ({escape(nick)})."
-                )
-                return
-
-        ok, result = add_zam_nick(
-            game_nick,
-            chat.id,
-            username,
-        )
-
-        if not ok:
-            await message.answer(f"❌ {result}")
-            return
-
-        await message.answer(
-            f"✅ Зам <b>{escape(game_nick)}</b> "
-            f"(@{escape(username)}) добавлен."
-        )
-
-        try:
-            await bot.send_message(
-                chat.id,
-                f"👑 Вы назначены замом!\n"
-                f"Ваш игровой ник: {escape(game_nick)}",
-            )
-        except Exception:
-            pass
-
-        return
-
-    await message.answer("❌ Тип: adm или zam")
+    await send_admin_user_list(message, 0, force=True)
 
 
-@dp.message(Command("remove_admin"))
-async def remove_admin(message: Message):
+# Совместимость: /add admin -> Telegram воспринимает это как команду /add.
+@dp.message(Command("add"))
+async def add_command_alias(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только владелец!")
         return
 
-    args = message.text.split(maxsplit=1)
+    parts = (message.text or "").split()
+    if len(parts) >= 2 and parts[1].lower() == "admin":
+        await send_admin_user_list(message, 0, force=True)
+    else:
+        await message.answer("❌ Используйте /add_admin.")
 
-    if len(args) < 2:
-        await message.answer(
-            "❌ Формат:\n"
-            "/remove_admin adm @username\n"
-            "/remove_admin zam @username"
-        )
+
+@dp.message(Command("remove_admin"))
+async def remove_admin_command(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец!")
         return
 
-    parts = args[1].split()
+    admins = [
+        admin_id for admin_id in sorted(get_admins())
+        if admin_id != SUPER_ADMIN
+    ]
 
-    if len(parts) < 2:
-        await message.answer("❌ Мало аргументов.")
+    if not admins:
+        await message.answer("📭 Кроме владельца администраторов нет.")
         return
 
-    type_ = parts[0].lower()
-    username = parts[1].lstrip("@")
+    rows = [
+        [InlineKeyboardButton(
+            text=f"➖ {get_admin_display(admin_id)}",
+            callback_data=f"removeadm:{admin_id}",
+        )]
+        for admin_id in admins
+    ]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="removeadm:no")])
 
-    if type_ == "adm":
-        try:
-            chat = await bot.get_chat(username)
-        except Exception:
-            await message.answer(
-                f"❌ @{escape(username)} не найден."
-            )
-            return
-
-        if chat.id == SUPER_ADMIN:
-            await message.answer("❌ Нельзя удалить владельца!")
-            return
-
-        if chat.id not in get_admins():
-            await message.answer("❌ Не админ.")
-            return
-
-        admins = get_admins()
-        admins.remove(chat.id)
-        save_admins(admins)
-
-        data["admin_usernames"].pop(str(chat.id), None)
-        save_data()
-
-        await message.answer(
-            f"✅ Админ @{escape(username)} удалён."
-        )
-
-        await set_command_scopes()
-        return
-
-    if type_ == "zam":
-        found_nick = None
-
-        for nick, info in data["zam_data"].items():
-            tg_username = info.get("tg_username")
-
-            if (
-                tg_username
-                and tg_username.lower() == username.lower()
-            ):
-                found_nick = nick
-                break
-
-        if not found_nick:
-            await message.answer(
-                f"❌ Зам @{escape(username)} не найден."
-            )
-            return
-
-        remove_zam_nick(found_nick)
-
-        await message.answer(
-            f"✅ Зам <b>{escape(found_nick)}</b> удалён."
-        )
-        return
-
-    await message.answer("❌ Тип: adm или zam")
+    await message.answer(
+        "➖ <b>Снять админку</b>\n\nВыберите администратора:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
 
 
 # =========================================================
@@ -1642,81 +1863,6 @@ async def admin_action_handler(message: Message):
 
     value = message.text.strip()
 
-    # Добавление админа через кнопку.
-    if action == "add_admin":
-        username = value.lstrip("@")
-
-        try:
-            chat = await bot.get_chat(username)
-        except Exception:
-            await message.answer(
-                f"❌ @{escape(username)} не найден."
-            )
-            return
-
-        if chat.id in get_admins():
-            await message.answer("❌ Уже админ.")
-            return
-
-        admins = get_admins()
-        admins.add(chat.id)
-        save_admins(admins)
-
-        data["admin_usernames"][str(chat.id)] = {
-            "username": chat.username or username,
-            "full_name": chat.full_name or str(chat.id),
-        }
-        save_data()
-
-        await message.answer(
-            f"✅ Админ <b>@{escape(username)}</b> добавлен."
-        )
-
-        try:
-            await bot.send_message(
-                chat.id,
-                "👑 Вы назначены администратором!",
-            )
-        except Exception:
-            pass
-
-        await set_command_scopes()
-        return
-
-    # Удаление админа через кнопку.
-    if action == "remove_admin":
-        username = value.lstrip("@")
-
-        try:
-            chat = await bot.get_chat(username)
-        except Exception:
-            await message.answer(
-                f"❌ @{escape(username)} не найден."
-            )
-            return
-
-        if chat.id == SUPER_ADMIN:
-            await message.answer("❌ Нельзя удалить владельца!")
-            return
-
-        if chat.id not in get_admins():
-            await message.answer("❌ Не админ.")
-            return
-
-        admins = get_admins()
-        admins.remove(chat.id)
-        save_admins(admins)
-
-        data["admin_usernames"].pop(str(chat.id), None)
-        save_data()
-
-        await message.answer(
-            f"✅ Админ <b>@{escape(username)}</b> удалён."
-        )
-
-        await set_command_scopes()
-        return
-
     # Добавление зама через кнопку.
     if action == "add_zam":
         parts = value.split()
@@ -1725,79 +1871,167 @@ async def admin_action_handler(message: Message):
             game_nick = parts[0]
             tg_username = None
             tg_user_id = None
-
         elif len(parts) == 2:
             game_nick = parts[0]
             tg_username = parts[1].lstrip("@")
-
             try:
                 chat = await bot.get_chat(tg_username)
             except Exception:
-                await message.answer(
-                    f"❌ @{escape(tg_username)} не найден."
-                )
+                await message.answer(f"❌ @{escape(tg_username)} не найден.")
                 return
-
             tg_user_id = chat.id
         else:
             await message.answer(
                 "❌ Формат:\n"
-                "<code>игровой_ник</code>\n"
+                "<code>/add_zam ИгровойНик</code>\n"
                 "или\n"
-                "<code>игровой_ник @username</code>"
+                "<code>/add_zam ИгровойНик @username</code>"
             )
             return
 
-        ok, result = add_zam_nick(
-            game_nick,
-            tg_user_id,
-            tg_username,
-        )
-
+        ok, result = add_zam_nick(game_nick, tg_user_id, tg_username)
         if not ok:
             await message.answer(f"❌ {result}")
             return
 
-        await log_action(
-            uid,
-            "добавил зама",
-            game_nick,
-        )
-
-        await message.answer(
-            f"✅ Зам <b>{escape(game_nick)}</b> добавлен."
-        )
+        await log_action(uid, "добавил зама", game_nick)
+        await message.answer(f"✅ Зам <b>{escape(game_nick)}</b> добавлен.")
 
         if tg_user_id:
             try:
                 await bot.send_message(
                     tg_user_id,
-                    f"👑 Вы назначены замом!\n"
-                    f"Ваш игровой ник: {escape(game_nick)}",
+                    f"👑 Вы назначены замом!\nВаш игровой ник: {escape(game_nick)}",
                 )
             except Exception:
                 pass
-
         return
 
     # Удаление зама через кнопку.
     if action == "remove_zam":
         game_nick = value
-
         if not remove_zam_nick(game_nick):
             await message.answer("❌ Такой зам не найден.")
             return
 
-        await log_action(
-            uid,
-            "удалил зама",
-            game_nick,
-        )
+        await log_action(uid, "удалил зама", game_nick)
+        await message.answer(f"✅ Зам <b>{escape(game_nick)}</b> удалён.")
+        return
 
+
+# =========================================================
+# ПРЯМЫЕ КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ ЗАМЫМИ
+# =========================================================
+
+@dp.message(Command("add_zam"))
+async def add_zam_command(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец!")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) not in (2, 3):
         await message.answer(
-            f"✅ Зам <b>{escape(game_nick)}</b> удалён."
+            "❌ Формат:\n"
+            "/add_zam <игровой_ник>\n"
+            "или\n"
+            "/add_zam <игровой_ник> @username"
         )
         return
+
+    game_nick = parts[1].strip()
+    tg_username = parts[2].lstrip("@") if len(parts) == 3 else None
+    tg_user_id = None
+
+    if tg_username:
+        try:
+            chat = await bot.get_chat(tg_username)
+        except Exception:
+            await message.answer(f"❌ @{escape(tg_username)} не найден через Bot API.")
+            return
+        tg_user_id = chat.id
+        tg_username = chat.username or tg_username
+
+    ok, result = add_zam_nick(game_nick, tg_user_id, tg_username)
+    if not ok:
+        await message.answer(f"❌ {result}")
+        return
+
+    await log_action(message.from_user.id, "добавил зама", game_nick)
+    await message.answer(f"✅ Зам <b>{escape(game_nick)}</b> добавлен.")
+
+    if tg_user_id:
+        try:
+            await bot.send_message(
+                tg_user_id,
+                f"👑 Вы назначены замом!\nВаш игровой ник: {escape(game_nick)}",
+            )
+        except Exception:
+            pass
+
+
+@dp.message(Command("remove_zam"))
+async def remove_zam_command(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец!")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("❌ Формат: /remove_zam <игровой_ник>")
+        return
+
+    game_nick = parts[1].strip()
+    if not remove_zam_nick(game_nick):
+        await message.answer("❌ Такой зам не найден.")
+        return
+
+    await log_action(message.from_user.id, "удалил зама", game_nick)
+    await message.answer(f"✅ Зам <b>{escape(game_nick)}</b> удалён.")
+
+
+# =========================================================
+# ПРИВЯЗКА TELEGRAM К УЖЕ ДОБАВЛЕННОМУ ЗАМУ
+# =========================================================
+
+@dp.message(Command("bind_zam"))
+async def bind_zam(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец!")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        await message.answer("❌ Формат: /bind_zam <игровой_ник> @username")
+        return
+
+    game_nick = parts[1]
+    username = parts[2].lstrip("@")
+
+    if game_nick not in data["zam_data"]:
+        await message.answer("❌ Такой зам не найден.")
+        return
+
+    try:
+        chat = await bot.get_chat(username)
+    except Exception:
+        await message.answer(f"❌ @{escape(username)} не найден через Bot API.")
+        return
+
+    # Не даём одному Telegram-пользователю быть привязанным к двум замам.
+    for nick, info in data["zam_data"].items():
+        if nick != game_nick and info.get("tg_user_id") == chat.id:
+            await message.answer(f"❌ Этот Telegram уже привязан к заму <b>{escape(nick)}</b>.")
+            return
+
+    data["zam_data"][game_nick]["tg_user_id"] = chat.id
+    data["zam_data"][game_nick]["tg_username"] = chat.username or username
+    save_data()
+
+    await log_action(message.from_user.id, "привязал Telegram к заму", f"{game_nick} @{username}")
+    await message.answer(
+        f"✅ Зам <b>{escape(game_nick)}</b> привязан к @{escape(chat.username or username)}."
+    )
 
 
 # =========================================================
@@ -2113,8 +2347,8 @@ async def help_cmd(message: Message):
             "/help — справка\n"
             "/ping — пинг\n"
             "/all — объявление\n"
-            "/add_admin — добавить админа/зама\n"
-            "/remove_admin — удалить админа/зама\n"
+            "/add_admin — выбрать человека из личных Telegram-диалогов и выдать админку\n"
+            "/remove_admin — снять админку\n"
             "/add_zam — добавить зама\n"
             "/remove_zam — удалить зама\n"
             "/admins — список админов\n"
@@ -2125,7 +2359,7 @@ async def help_cmd(message: Message):
             "/log_on — уведомления вкл\n"
             "/log_off — уведомления выкл\n"
             "/topic_id — ID темы\n"
-            "/set_token — смена токена\n"
+            "/set_token — информация о токене\n"
         )
     elif is_admin(message.from_user.id):
         text = (
@@ -2271,6 +2505,7 @@ OWNER_COMMANDS = ADMIN_COMMANDS + [
     BotCommand(command="remove_admin", description="➖ Убрать админа/зама"),
     BotCommand(command="add_zam", description="👤 Добавить зама"),
     BotCommand(command="remove_zam", description="❌ Удалить зама"),
+    BotCommand(command="bind_zam", description="🔗 Привязать Telegram к заму"),
     BotCommand(command="admins", description="👑 Админы"),
     BotCommand(command="zam_stats", description="📊 Статистика замов"),
     BotCommand(command="withdraw", description="💰 Вывод"),
@@ -2320,6 +2555,7 @@ async def main():
     print("🤖 Бот запускается...")
 
     await init_admins()
+    await init_owner_telegram()
     await set_command_scopes()
 
     await bot.delete_webhook(drop_pending_updates=True)
