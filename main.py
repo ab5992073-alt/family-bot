@@ -8,7 +8,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    KeyboardButton
+    KeyboardButton, BotCommand
 )
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
@@ -912,7 +912,6 @@ async def set_token(message: Message):
 async def main():
     print("🤖 Бот запущен!")
     await init_admins()
-    from aiogram.types import BotCommand
     cmds = [
         BotCommand(command="start", description="🏠 Меню"),
         BotCommand(command="help", description="📖 Справка"),
