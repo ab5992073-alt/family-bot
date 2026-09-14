@@ -220,34 +220,38 @@ async def bind_pending_admin_for_user(user):
 
 class GroupMemberTrackerMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        if isinstance(event, Message) and event.chat.id == GROUP_ID:
+        if isinstance(event, Message):
             try:
                 user = event.from_user
                 if user and not user.is_bot:
+                    # ВАЖНО: проверяем ожидающих админов для ВСЕХ сообщений,
+                    # включая личные сообщения боту. Раньше проверка была только
+                    # внутри группы, поэтому пользователь мог написать боту, а
+                    # username так и оставался в ожидании.
                     await bind_pending_admin_for_user(user)
-                    uid = str(user.id)
-                    username = user.username or None
-                    full_name = user.full_name or str(user.id)
-                    old = data_global.get("group_members", {}).get(uid, {})
-                    new = {
-                        "id": user.id,
-                        "username": username,
-                        "full_name": full_name,
-                        "last_seen": datetime.now().isoformat(),
-                    }
-                    # Не перезаписываем файл на каждое сообщение,
-                    # если данные человека уже известны и имя/username не изменились.
-                    if (
-                        old.get("username") != username
-                        or old.get("full_name") != full_name
-                        or uid not in data_global.get("group_members", {})
-                    ):
-                        data_global.setdefault("group_members", {})[uid] = new
-                        save_data()
-                    else:
-                        data_global["group_members"][uid]["last_seen"] = new["last_seen"]
-            except Exception:
-                pass
+
+                    if event.chat.id == GROUP_ID:
+                        uid = str(user.id)
+                        username = user.username or None
+                        full_name = user.full_name or str(user.id)
+                        old = data_global.get("group_members", {}).get(uid, {})
+                        new = {
+                            "id": user.id,
+                            "username": username,
+                            "full_name": full_name,
+                            "last_seen": datetime.now().isoformat(),
+                        }
+                        if (
+                            old.get("username") != username
+                            or old.get("full_name") != full_name
+                            or uid not in data_global.get("group_members", {})
+                        ):
+                            data_global.setdefault("group_members", {})[uid] = new
+                            save_data()
+                        else:
+                            data_global["group_members"][uid]["last_seen"] = new["last_seen"]
+            except Exception as e:
+                print(f"⚠️ Ошибка обработки пользователя: {e}")
 
         return await handler(event, data)
 
@@ -1712,6 +1716,21 @@ async def add_admin_legacy(message: Message):
         await message.answer("❌ Использование: <code>/add_admin @username</code>")
 
 
+@dp.message(Command("pending_admins"))
+async def pending_admins_command(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец!")
+        return
+    pending = data.get("pending_admin_usernames", {})
+    if not pending:
+        await message.answer("📭 Ожидающих админов нет.")
+        return
+    text = "⏳ <b>Ожидают привязки:</b>\n\n"
+    for key, item in pending.items():
+        text += f"• @{escape(item.get('username', key))}\n"
+    await message.answer(text)
+
+
 @dp.message(Command("remove_admin"))
 async def remove_admin_legacy(message: Message):
     if not is_super_admin(message.from_user.id):
@@ -2682,6 +2701,7 @@ OWNER_COMMANDS = ADMIN_COMMANDS + [
     BotCommand(command="remove", description="➖ Убрать админа/зама"),
     BotCommand(command="add_admin", description="➕ Админ (алиас)"),
     BotCommand(command="remove_admin", description="➖ Админ (алиас)"),
+    BotCommand(command="pending_admins", description="⏳ Ожидающие админы"),
     BotCommand(command="add_zam", description="👤 Добавить зама"),
     BotCommand(command="remove_zam", description="❌ Удалить зама"),
     BotCommand(command="admins", description="👑 Админы"),
