@@ -280,14 +280,21 @@ _db_warned = False
 
 
 def _db_connect():
-    if not DATABASE_URL or psycopg2 is None:
-        return None
+    if psycopg2 is None:
+        raise RuntimeError("Не установлен psycopg2-binary. Добавь его в requirements.txt.")
+    if not DATABASE_URL:
+        raise RuntimeError("Не задан DATABASE_URL. Бот остановлен, чтобы не потерять данные.")
+
+    conninfo = DATABASE_URL
+    if "sslmode=" not in conninfo.lower():
+        conninfo += ("&" if "?" in conninfo else "?") + "sslmode=require"
+
     try:
-        return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        return psycopg2.connect(conninfo, connect_timeout=10)
     except Exception as e:
         global _db_warned
         if not _db_warned:
-            print(f"⚠️ PostgreSQL недоступен, временно используется локальная база: {e}")
+            print(f"❌ PostgreSQL недоступен: {e}")
             _db_warned = True
         return None
 
@@ -2937,7 +2944,7 @@ async def all_cmd(message: Message):
     args = message.text.split(maxsplit=1)
 
     if len(args) < 2:
-        await message.answer("❌ Использование: <code>/all текст</code>")
+        await message.answer("❌ Использование: <code>/all</code> <code>текст</code>")
         return
 
     try:
@@ -3082,13 +3089,19 @@ async def set_command_scopes():
 async def main():
     print("🤖 Бот запускается...")
 
-    if DATABASE_URL and psycopg2 is not None:
-        if _db_init():
-            print("✅ Постоянная база PostgreSQL подключена.")
-        else:
-            print("⚠️ PostgreSQL указан, но подключение не удалось. Проверь DATABASE_URL.")
-    elif os.environ.get("RENDER"):
-        print("⚠️ ВНИМАНИЕ: DATABASE_URL не задан. На Render локальная база не гарантирует сохранность после deploy/restart.")
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "❌ DATABASE_URL не задан. Добавь URL Supabase в Render Environment. "
+            "Бот намеренно не запускается без постоянной базы, чтобы не потерять данные."
+        )
+
+    if not _db_init():
+        raise RuntimeError(
+            "❌ Не удалось подключиться к постоянной PostgreSQL базе. "
+            "Проверь DATABASE_URL в Render Environment."
+        )
+
+    print("✅ Постоянная база PostgreSQL подключена. Локальный data.json больше не является источником истины.")
 
     await init_telegram_user_client()
     await init_admins()
