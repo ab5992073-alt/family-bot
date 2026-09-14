@@ -88,7 +88,7 @@ ADMIN_IDS = {
 }
 
 GROUP_ID = -1002409536359
-GROUP_LINK = "https://t.me/+f_eKIP4gwcs0YTcy"
+GROUP_LINK = "https://t.me/+DIWXSbc93A41YTA6"
 BOT_NAME = "@Staff_Grand_Bot"
 ANNOUNCE_TOPIC_ID = 126387
 BOT_START_TIME = datetime.now()
@@ -995,30 +995,17 @@ def zams_panel_keyboard():
 # =========================================================
 
 async def add_user_to_group(user_id):
+    # Используем только постоянную ссылку на нашу группу.
+    # Дополнительные invite-ссылки Telegram больше не создаём.
     try:
-        link = await bot.create_chat_invite_link(
-            GROUP_ID,
-            member_limit=1,
-        )
-
         await bot.send_message(
             user_id,
             f"🔗 <b>Вы приняты в семью!</b>\n\n"
-            f"Вступите по ссылке:\n{link.invite_link}\n\n"
-            f"Или:\n{GROUP_LINK}",
+            f"Вступите в группу по ссылке:\n{GROUP_LINK}",
         )
         return True
-
     except Exception:
-        try:
-            await bot.send_message(
-                user_id,
-                f"🔗 <b>Вы приняты в семью!</b>\n\n"
-                f"Вступите:\n{GROUP_LINK}",
-            )
-            return True
-        except Exception:
-            return False
+        return False
 
 
 async def remove_user_from_group(user_id):
