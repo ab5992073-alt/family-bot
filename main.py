@@ -2924,7 +2924,7 @@ async def all_cmd(message: Message):
     args = message.text.split(maxsplit=1)
 
     if len(args) < 2:
-        await message.answer("❌ /all <текст>")
+        await message.answer("❌ Использование: <code>/all текст</code>")
         return
 
     try:
