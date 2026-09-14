@@ -398,19 +398,44 @@ def _write_local_json(path, value):
         print(f"⚠️ Не удалось сохранить {path}: {e}")
 
 
+def _has_real_local_data(local):
+    if not isinstance(local, dict):
+        return False
+    if local.get("users"):
+        return True
+    if local.get("applications"):
+        return True
+    if local.get("admins") and set(local.get("admins", [])) - set(ADMIN_IDS):
+        return True
+    if local.get("zam_data"):
+        return True
+    if local.get("zam_stats"):
+        return True
+    if local.get("admin_usernames"):
+        return True
+    if local.get("group_members"):
+        return True
+    if local.get("pending_admin_usernames"):
+        return True
+    return False
+
+
 def load_data():
-    # 1) Постоянная база PostgreSQL — главный источник данных.
+    # PostgreSQL — главный источник. Никогда не заменяем существующую
+    # непустую БД пустым локальным data.json после redeploy.
     if DATABASE_URL and psycopg2 is not None:
         existing = _db_get("data")
-        if isinstance(existing, dict):
+        if isinstance(existing, dict) and _has_real_local_data(existing):
             return existing
 
-        # Первая миграция: если рядом есть старый data.json, переносим его в PostgreSQL.
         local = _read_local_json(DATA_FILE, None)
-        if isinstance(local, dict):
-            print("🔄 Найден старый data.json — выполняю однократную миграцию в PostgreSQL...")
-            _db_set("data", local)
-            return local
+        if isinstance(local, dict) and _has_real_local_data(local):
+            print("🔄 Найден локальный data.json — выполняю однократный импорт в PostgreSQL...")
+            if _db_set("data", local):
+                return local
+
+        if isinstance(existing, dict):
+            return existing
 
     local = _read_local_json(DATA_FILE, None)
     if isinstance(local, dict):
@@ -442,15 +467,16 @@ def load_logs():
         if isinstance(logs, list):
             return [str(x) for x in logs]
 
-        # Однократная миграция старого файла логов.
         if os.path.exists(LOG_FILE):
             try:
                 with open(LOG_FILE, "r", encoding="utf-8") as f:
                     lines = f.readlines()
-                _db_set("logs", lines)
-                return lines
+                if lines:
+                    _db_set("logs", lines)
+                    return lines
             except Exception:
                 pass
+        return []
 
     try:
         with open(LOG_FILE, "r", encoding="utf-8") as f:
@@ -3071,6 +3097,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
 
     print("🤖 Бот запущен!")
+    print("📌 Основная группа:", GROUP_LINK)
 
     await dp.start_polling(bot)
 
