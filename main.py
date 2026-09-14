@@ -5,6 +5,13 @@ from datetime import datetime
 from html import escape
 import threading
 
+try:
+    import psycopg2
+    from psycopg2.extras import Json
+except ImportError:
+    psycopg2 = None
+    Json = None
+
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
@@ -267,15 +274,147 @@ dp.message.outer_middleware(GroupMemberTrackerMiddleware())
 
 DATA_FILE = "data.json"
 LOG_FILE = "bot_activity.log"
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+_db_warned = False
+
+
+def _db_connect():
+    if not DATABASE_URL or psycopg2 is None:
+        return None
+    try:
+        return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+    except Exception as e:
+        global _db_warned
+        if not _db_warned:
+            print(f"⚠️ PostgreSQL недоступен, временно используется локальная база: {e}")
+            _db_warned = True
+        return None
+
+
+def _db_init():
+    conn = _db_connect()
+    if not conn:
+        return False
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS staff_grand_state (
+                        state_key TEXT PRIMARY KEY,
+                        state_value JSONB NOT NULL
+                    )
+                """)
+        return True
+    except Exception as e:
+        print(f"⚠️ Не удалось инициализировать PostgreSQL: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def _db_get(key):
+    conn = _db_connect()
+    if not conn:
+        return None
+    try:
+        _db_init()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT state_value FROM staff_grand_state WHERE state_key = %s",
+                (key,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return row[0]
+    except Exception as e:
+        print(f"⚠️ Ошибка чтения PostgreSQL ({key}): {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def _db_set(key, value):
+    conn = _db_connect()
+    if not conn:
+        return False
+    try:
+        _db_init()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO staff_grand_state (state_key, state_value)
+                    VALUES (%s, %s)
+                    ON CONFLICT (state_key)
+                    DO UPDATE SET state_value = EXCLUDED.state_value
+                    """,
+                    (key, Json(value)),
+                )
+        return True
+    except Exception as e:
+        print(f"⚠️ Ошибка записи PostgreSQL ({key}): {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def _db_delete(key):
+    conn = _db_connect()
+    if not conn:
+        return False
+    try:
+        _db_init()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM staff_grand_state WHERE state_key = %s",
+                    (key,),
+                )
+        return True
+    except Exception as e:
+        print(f"⚠️ Ошибка удаления PostgreSQL ({key}): {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def _read_local_json(path, default=None):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _write_local_json(path, value):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(value, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ Не удалось сохранить {path}: {e}")
 
 
 def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+    # 1) Постоянная база PostgreSQL — главный источник данных.
+    if DATABASE_URL and psycopg2 is not None:
+        existing = _db_get("data")
+        if isinstance(existing, dict):
+            return existing
+
+        # Первая миграция: если рядом есть старый data.json, переносим его в PostgreSQL.
+        local = _read_local_json(DATA_FILE, None)
+        if isinstance(local, dict):
+            print("🔄 Найден старый data.json — выполняю однократную миграцию в PostgreSQL...")
+            _db_set("data", local)
+            return local
+
+    local = _read_local_json(DATA_FILE, None)
+    if isinstance(local, dict):
+        return local
 
     return {
         "users": {},
@@ -289,12 +428,59 @@ def load_data():
 
 
 def save_data():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # Локальный файл оставляем как аварийную копию.
+    _write_local_json(DATA_FILE, data)
+
+    # Основное постоянное хранилище.
+    if DATABASE_URL and psycopg2 is not None:
+        _db_set("data", data)
 
 
+def load_logs():
+    if DATABASE_URL and psycopg2 is not None:
+        logs = _db_get("logs")
+        if isinstance(logs, list):
+            return [str(x) for x in logs]
+
+        # Однократная миграция старого файла логов.
+        if os.path.exists(LOG_FILE):
+            try:
+                with open(LOG_FILE, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                _db_set("logs", lines)
+                return lines
+            except Exception:
+                pass
+
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            return f.readlines()
+    except Exception:
+        return []
+
+
+def save_logs(lines):
+    lines = [str(x) for x in lines]
+    if DATABASE_URL and psycopg2 is not None:
+        _db_set("logs", lines)
+
+    try:
+        with open(LOG_FILE, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception:
+        pass
+
+
+def append_log_line(line):
+    lines = load_logs()
+    lines.append(line)
+    save_logs(lines)
+
+
+# Загружаем базу после объявления функций.
 data = load_data()
 data_global = data
+
 
 defaults = {
     "users": {},
@@ -688,10 +874,9 @@ async def log_action(user_id, action, details=""):
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(
-            f"[{ts}] {username} -> {action} {details}\n"
-        )
+    append_log_line(
+        f"[{ts}] {username} -> {action} {details}\n"
+    )
 
     if data.get("log_notify_enabled"):
         try:
@@ -1704,16 +1889,83 @@ async def add_admin_legacy(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только владелец!")
         return
-    args = message.text.split(maxsplit=1)
-    if len(args) > 1:
-        await add_admin_by_username(message, args[1])
-    elif message.reply_to_message and message.reply_to_message.from_user:
+
+    # Самый надёжный вариант: ответить на сообщение человека командой /add_admin.
+    if message.reply_to_message and message.reply_to_message.from_user:
         u = message.reply_to_message.from_user
-        await add_admin_by_username(message, u.username or str(u.id)) if u.username else await message.answer(
-            f"❌ У пользователя нет username. Используй ID <code>{u.id}</code> через команду в коде/базе или сначала пусть он напишет боту."
+        user_id = u.id
+        if user_id == SUPER_ADMIN:
+            await message.answer("ℹ️ Это владелец — права уже есть.")
+            return
+        admins = get_admins()
+        if user_id in admins:
+            await message.answer("❌ Этот пользователь уже администратор.")
+            return
+        admins.add(user_id)
+        save_admins(admins)
+        data.setdefault("admin_usernames", {})[str(user_id)] = {
+            "username": u.username,
+            "full_name": u.full_name or str(user_id),
+        }
+        data.setdefault("pending_admin_usernames", {}).pop(
+            normalize_username(u.username), None
+        ) if u.username else None
+        save_data()
+        await set_command_scopes()
+        await log_action(message.from_user.id, "добавил администратора", f"{u.full_name} / @{u.username}" if u.username else u.full_name)
+        display = f"@{u.username}" if u.username else (u.full_name or str(user_id))
+        await message.answer(f"✅ <b>{escape(display)}</b> назначен администратором.\n🆔 ID: <code>{user_id}</code>")
+        try:
+            await bot.send_message(user_id, "👑 Вы назначены администратором бота!\nИспользуйте /start для панели.")
+        except Exception:
+            pass
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) == 1:
+        await message.answer(
+            "❌ Используй один из вариантов:\n\n"
+            "1) Ответь на сообщение человека: <code>/add_admin</code>\n"
+            "2) <code>/add_admin @username</code>\n"
+            "3) <code>/add_admin 123456789</code>"
         )
-    else:
-        await message.answer("❌ Использование: <code>/add_admin @username</code>")
+        return
+
+    value = args[1].strip()
+    if value.isdigit():
+        user_id = int(value)
+        if user_id == SUPER_ADMIN:
+            await message.answer("ℹ️ Это владелец — права уже есть.")
+            return
+        if user_id in get_admins():
+            await message.answer("❌ Этот пользователь уже администратор.")
+            return
+        # ID достаточно для выдачи внутренних прав бота.
+        admins = get_admins()
+        admins.add(user_id)
+        save_admins(admins)
+        try:
+            chat = await bot.get_chat(user_id)
+            username = chat.username
+            full_name = chat.full_name
+        except Exception:
+            username = None
+            full_name = str(user_id)
+        data.setdefault("admin_usernames", {})[str(user_id)] = {
+            "username": username,
+            "full_name": full_name or str(user_id),
+        }
+        save_data()
+        await set_command_scopes()
+        await log_action(message.from_user.id, "добавил администратора", str(user_id))
+        await message.answer(f"✅ Администратор выдан.\n🆔 ID: <code>{user_id}</code>")
+        try:
+            await bot.send_message(user_id, "👑 Вы назначены администратором бота!\nИспользуйте /start для панели.")
+        except Exception:
+            pass
+        return
+
+    await add_admin_by_username(message, value)
 
 
 @dp.message(Command("pending_admins"))
@@ -1754,25 +2006,62 @@ async def add_command(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только владелец!")
         return
-    args = message.text.split()
+    args = message.text.split(maxsplit=2)
     if len(args) < 2:
         await message.answer(
             "❌ Использование:\n"
             "<code>/add admin @username</code>\n"
+            "или ответом на сообщение: <code>/add admin</code>\n"
+            "или <code>/add admin 123456789</code>\n"
             "<code>/add zam @username Game_Nick</code>"
         )
         return
     mode = args[1].lower()
     if mode == "admin":
-        if len(args) < 3:
-            await message.answer("❌ <code>/add admin @username</code>")
+        if message.reply_to_message and message.reply_to_message.from_user:
+            u = message.reply_to_message.from_user
+            admins = get_admins()
+            if u.id == SUPER_ADMIN:
+                await message.answer("ℹ️ Это владелец — права уже есть.")
+                return
+            if u.id in admins:
+                await message.answer("❌ Этот пользователь уже администратор.")
+                return
+            admins.add(u.id)
+            save_admins(admins)
+            data.setdefault("admin_usernames", {})[str(u.id)] = {"username": u.username, "full_name": u.full_name or str(u.id)}
+            save_data()
+            await set_command_scopes()
+            display = f"@{u.username}" if u.username else (u.full_name or str(u.id))
+            await log_action(message.from_user.id, "добавил администратора", display)
+            await message.answer(f"✅ <b>{escape(display)}</b> назначен администратором.\n🆔 ID: <code>{u.id}</code>")
             return
-        await add_admin_by_username(message, args[2])
+        if len(args) < 3:
+            await message.answer("❌ Укажи @username/ID или ответь на сообщение пользователя.")
+            return
+        value = args[2].strip()
+        if value.isdigit():
+            # Повторно используем основной обработчик через синтетический вызов не нужен.
+            uid = int(value)
+            if uid in get_admins():
+                await message.answer("❌ Уже администратор.")
+                return
+            admins = get_admins(); admins.add(uid); save_admins(admins)
+            data.setdefault("admin_usernames", {})[str(uid)] = {"username": None, "full_name": str(uid)}
+            save_data(); await set_command_scopes()
+            await log_action(message.from_user.id, "добавил администратора", str(uid))
+            await message.answer(f"✅ Администратор выдан. ID: <code>{uid}</code>")
+            return
+        await add_admin_by_username(message, value)
     elif mode == "zam":
-        if len(args) < 4:
+        if len(args) < 3:
             await message.answer("❌ <code>/add zam @username Game_Nick</code>")
             return
-        await add_zam_by_username(message, args[2], " ".join(args[3:]))
+        parts = args[2].split(maxsplit=1)
+        if len(parts) < 2:
+            await message.answer("❌ <code>/add zam @username Game_Nick</code>")
+            return
+        await add_zam_by_username(message, parts[0], parts[1])
     else:
         await message.answer("❌ Доступно: <code>admin</code> или <code>zam</code>.")
 
@@ -1784,18 +2073,16 @@ async def remove_command(message: Message):
         return
     args = message.text.split(maxsplit=2)
     if len(args) < 2:
-        await message.answer(
-            "❌ Использование:\n"
-            "<code>/remove admin @username</code>\n"
-            "<code>/remove zam Game_Nick</code>"
-        )
+        await message.answer("❌ <code>/remove admin @username</code> или <code>/remove zam Game_Nick</code>")
         return
     mode = args[1].lower()
     if mode == "admin":
-        if len(args) < 3:
-            await message.answer("❌ <code>/remove admin @username</code>")
-            return
-        await remove_admin_by_username(message, args[2])
+        if message.reply_to_message and message.reply_to_message.from_user:
+            await remove_admin_by_username(message, str(message.reply_to_message.from_user.id))
+        elif len(args) >= 3:
+            await remove_admin_by_username(message, args[2])
+        else:
+            await message.answer("❌ Укажи @username/ID или ответь на сообщение админа.")
     elif mode == "zam":
         if len(args) < 3:
             await message.answer("❌ <code>/remove zam Game_Nick</code>")
@@ -2075,11 +2362,7 @@ async def logs_cmd(message: Message):
         await message.answer("❌ Только владелец!")
         return
 
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except Exception:
-        lines = []
+    lines = load_logs()
 
     if not lines:
         await message.answer("📭 Пусто.")
@@ -2143,11 +2426,7 @@ async def lp_cb(cb: CallbackQuery):
         await cb.answer("❌")
         return
 
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except Exception:
-        lines = []
+    lines = load_logs()
 
     await send_logs_page(
         cb.message,
@@ -2168,8 +2447,7 @@ async def clear_logs(message: Message):
         await message.answer("❌ Только владелец!")
         return
 
-    with open(LOG_FILE, "w", encoding="utf-8") as f:
-        f.write("")
+    save_logs([])
 
     await message.answer("✅ Логи очищены.")
 
@@ -2200,6 +2478,32 @@ async def log_off(message: Message):
     save_data()
 
     await message.answer("❌ Уведомления выключены.")
+
+
+# =========================================================
+# СТАТУС БАЗЫ
+# =========================================================
+
+@dp.message(Command("db_status"))
+async def db_status_cmd(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец!")
+        return
+
+    if DATABASE_URL and psycopg2 is not None and _db_init():
+        saved = _db_get("data")
+        logs = _db_get("logs")
+        await message.answer(
+            "✅ <b>Постоянная база подключена</b>\n\n"
+            f"👥 Пользователей: <b>{len(saved.get('users', {})) if isinstance(saved, dict) else len(data.get('users', {}))}</b>\n"
+            f"📋 Заявок: <b>{len(saved.get('applications', {})) if isinstance(saved, dict) else len(data.get('applications', {}))}</b>\n"
+            f"📜 Логов: <b>{len(logs) if isinstance(logs, list) else 0}</b>"
+        )
+    else:
+        await message.answer(
+            "⚠️ <b>PostgreSQL не подключён.</b>\n\n"
+            "Добавь DATABASE_URL в Render, иначе локальная база может исчезнуть после redeploy/restart."
+        )
 
 
 # =========================================================
@@ -2702,6 +3006,7 @@ OWNER_COMMANDS = ADMIN_COMMANDS + [
     BotCommand(command="add_admin", description="➕ Админ (алиас)"),
     BotCommand(command="remove_admin", description="➖ Админ (алиас)"),
     BotCommand(command="pending_admins", description="⏳ Ожидающие админы"),
+    BotCommand(command="db_status", description="🗄️ Статус базы"),
     BotCommand(command="add_zam", description="👤 Добавить зама"),
     BotCommand(command="remove_zam", description="❌ Удалить зама"),
     BotCommand(command="admins", description="👑 Админы"),
@@ -2751,6 +3056,14 @@ async def set_command_scopes():
 
 async def main():
     print("🤖 Бот запускается...")
+
+    if DATABASE_URL and psycopg2 is not None:
+        if _db_init():
+            print("✅ Постоянная база PostgreSQL подключена.")
+        else:
+            print("⚠️ PostgreSQL указан, но подключение не удалось. Проверь DATABASE_URL.")
+    elif os.environ.get("RENDER"):
+        print("⚠️ ВНИМАНИЕ: DATABASE_URL не задан. На Render локальная база не гарантирует сохранность после deploy/restart.")
 
     await init_telegram_user_client()
     await init_admins()
