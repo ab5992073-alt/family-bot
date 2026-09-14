@@ -1422,102 +1422,109 @@ async def survey_button(message: Message):
 # ЗАЯВКИ
 # =========================================================
 
-@dp.callback_query(F.data.startswith("accept:"))
-async def accept_app(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        await cb.answer("❌ Нет прав!")
-        return
-
-    app_id = cb.data.split(":", 1)[1]
+async def change_application_verdict(app_id, new_status, admin_id):
     app = data["applications"].get(app_id)
-
     if not app:
-        await cb.answer("❌ Заявка не найдена.")
-        return
+        return False, "❌ Заявка не найдена."
 
-    if app.get("status") != "pending":
-        await cb.answer("ℹ️ Заявка уже обработана.")
-        return
+    old_status = app.get("status", "pending")
+    if old_status == new_status:
+        return False, "ℹ️ Этот вердикт уже установлен."
 
-    app["status"] = "accepted"
+    app["status"] = new_status
     app.setdefault("history", []).append(
         {
-            "action": "accepted",
-            "by": cb.from_user.id,
+            "action": new_status,
+            "previous_status": old_status,
+            "by": admin_id,
             "created": datetime.now().isoformat(),
         }
     )
     save_data()
 
-    await add_user_to_group(app["user_id"])
-    await set_user_nickname(
-        app["user_id"],
-        app["data"].get("nickname", "Участник"),
-    )
+    user_id = app.get("user_id")
+    nickname = app.get("data", {}).get("nickname", "Участник")
 
-    await log_action(
-        cb.from_user.id,
-        "принял заявку",
-        app_id,
-    )
-
-    try:
-        await bot.send_message(
-            app["user_id"],
-            "✅ Ваша заявка принята администрацией!",
+    if new_status == "accepted":
+        await add_user_to_group(user_id)
+        await set_user_nickname(user_id, nickname)
+        try:
+            await bot.send_message(
+                user_id,
+                "✅ Ваша заявка принята администрацией!",
+            )
+        except Exception:
+            pass
+        await log_action(
+            admin_id,
+            "изменил вердикт заявки",
+            f"{app_id}: {old_status} → accepted",
         )
-    except Exception:
-        pass
+        return True, "✅ Заявка отмечена как принята."
 
-    await cb.answer("✅ Принят")
-    await cb.message.edit_reply_markup(reply_markup=None)
+    if new_status == "rejected":
+        await remove_user_from_group(user_id)
+        try:
+            await bot.send_message(
+                user_id,
+                "❌ Ваша заявка отклонена администрацией.",
+            )
+        except Exception:
+            pass
+        await log_action(
+            admin_id,
+            "изменил вердикт заявки",
+            f"{app_id}: {old_status} → rejected",
+        )
+        return True, "❌ Заявка отмечена как отклонённая."
+
+    return False, "❌ Недопустимый вердикт."
+
+
+@dp.callback_query(F.data.startswith("accept:"))
+async def accept_app(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("❌ Нет прав!", show_alert=True)
+        return
+
+    app_id = cb.data.split(":", 1)[1]
+    ok, text = await change_application_verdict(
+        app_id,
+        "accepted",
+        cb.from_user.id,
+    )
+    await cb.answer("✅ Принят" if ok else text, show_alert=not ok)
+    if ok:
+        try:
+            await cb.message.edit_text(
+                application_text(data["applications"][app_id], None),
+                reply_markup=application_keyboard(app_id),
+            )
+        except Exception:
+            pass
 
 
 @dp.callback_query(F.data.startswith("reject:"))
 async def reject_app(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
-        await cb.answer("❌ Нет прав!")
+        await cb.answer("❌ Нет прав!", show_alert=True)
         return
 
     app_id = cb.data.split(":", 1)[1]
-    app = data["applications"].get(app_id)
-
-    if not app:
-        await cb.answer("❌ Заявка не найдена.")
-        return
-
-    if app.get("status") != "pending":
-        await cb.answer("ℹ️ Заявка уже обработана.")
-        return
-
-    app["status"] = "rejected"
-    app.setdefault("history", []).append(
-        {
-            "action": "rejected",
-            "by": cb.from_user.id,
-            "created": datetime.now().isoformat(),
-        }
-    )
-    save_data()
-
-    await remove_user_from_group(app["user_id"])
-
-    await log_action(
-        cb.from_user.id,
-        "отклонил заявку",
+    ok, text = await change_application_verdict(
         app_id,
+        "rejected",
+        cb.from_user.id,
     )
-
-    try:
-        await bot.send_message(
-            app["user_id"],
-            "❌ Ваша заявка отклонена администрацией.",
-        )
-    except Exception:
-        pass
-
-    await cb.answer("❌ Отклонён")
-    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.answer("❌ Отклонён" if ok else text, show_alert=not ok)
+    if ok:
+        try:
+            await cb.message.edit_text(
+                application_text(data["applications"][app_id], None),
+                reply_markup=application_keyboard(app_id),
+            )
+        except Exception:
+            pass
 
 
 def application_keyboard(app_id):
@@ -1525,11 +1532,11 @@ def application_keyboard(app_id):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅",
+                    text="✅ Принять",
                     callback_data=f"accept:{app_id}",
                 ),
                 InlineKeyboardButton(
-                    text="❌",
+                    text="❌ Отклонить",
                     callback_data=f"reject:{app_id}",
                 ),
             ]
@@ -1539,14 +1546,23 @@ def application_keyboard(app_id):
 
 def application_text(app, idx=None):
     u = app["data"]
+    status = app.get("status", "pending")
+    status_text = {
+        "pending": "⏳ Ожидает решения",
+        "accepted": "✅ Принята",
+        "rejected": "❌ Отклонена",
+        "cancelled": "🚫 Отменена",
+    }.get(status, status)
+
     prefix = (
-        f"⏳ <b>Заявка #{idx}</b>"
+        f"<b>Заявка #{idx}</b>"
         if idx is not None
-        else "⏳ <b>Заявка</b>"
+        else "<b>Заявка</b>"
     )
 
     return (
         f"{prefix}\n"
+        f"Статус: <b>{status_text}</b>\n\n"
         f"Nickname: {escape(u.get('nickname', '—'))}\n"
         f"Тег: {escape(u.get('tag', '—'))}\n"
         f"Ранг: {escape(u.get('rank_fam', '—'))}\n"
@@ -1585,11 +1601,7 @@ async def all_apps(message: Message):
             1,
         )
 
-        kb = (
-            application_keyboard(app_id)
-            if status == "pending"
-            else None
-        )
+        kb = application_keyboard(app_id) if status in {"pending", "accepted", "rejected"} else None
 
         await message.answer(text, reply_markup=kb)
         idx += 1
