@@ -1,10 +1,9 @@
 import asyncio
 import json
 import os
-import threading
 from datetime import datetime
 from html import escape
-from pathlib import Path
+import threading
 
 try:
     import psycopg2
@@ -67,6 +66,8 @@ threading.Thread(target=run_web, daemon=True).start()
 
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
+# Telegram user-account API (для списка личных диалогов владельца).
+# Получается на https://my.telegram.org → API development tools.
 TG_API_ID_RAW = os.environ.get("TG_API_ID", "").strip()
 TG_API_HASH = os.environ.get("TG_API_HASH", "").strip()
 TG_SESSION_STRING = os.environ.get("TG_SESSION_STRING", "").strip()
@@ -76,6 +77,10 @@ try:
 except ValueError:
     TG_API_ID = 0
 
+telegram_user_client = None
+telegram_user_ready = False
+
+# ВЛАДЕЛЕЦ БОТА — твой Telegram ID
 SUPER_ADMIN = 6166697485
 ADMIN_IDS = {
     SUPER_ADMIN,
@@ -100,7 +105,8 @@ RANK_LIST = [
     "РЕШАЛО",
     "ПОЛОЖЕНЕЦ",
     "ВОР",
-    "Союз/Нейтраль",
+    "Союз",
+    "Нейтраль",
 ]
 
 ORG_LIST = [
@@ -123,77 +129,241 @@ ORG_LIST = [
     "Не в организации",
 ]
 
-DATA_FILE = "data.json"
-LOG_FILE = "bot_activity.log"
-BACKUP_DIR = Path("data_backups")
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-
 if not TOKEN:
-    raise RuntimeError("Не найден BOT_TOKEN. Добавь переменную BOT_TOKEN в Render Environment.")
+    raise RuntimeError(
+        "Не найден BOT_TOKEN. Добавь переменную BOT_TOKEN в Render Environment."
+    )
 
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML"),
+)
 dp = Dispatcher()
 
-telegram_user_client = None
-telegram_user_ready = False
-_db_warned = False
-
 
 # =========================================================
-# УТИЛИТЫ
+# АВТОПРИВЯЗКА ОЖИДАЮЩИХ АДМИНОВ
 # =========================================================
-
-def now_iso():
-    return datetime.now().isoformat()
-
 
 def normalize_username(value):
     if not value:
         return ""
-    return str(value).strip().lstrip("@").lower()
+    return value.strip().lstrip("@").lower()
 
 
-def safe_int(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
+def find_user_id_by_username(username):
+    wanted = normalize_username(username)
+    if not wanted:
         return None
 
+    for uid, info in data_global.get("group_members", {}).items():
+        if normalize_username(info.get("username")) == wanted:
+            try:
+                return int(uid)
+            except (TypeError, ValueError):
+                pass
 
-def unique_list(values):
-    result = []
-    seen = set()
-    for value in values or []:
+    for uid, info in data_global.get("admin_usernames", {}).items():
+        if normalize_username(info.get("username")) == wanted:
+            try:
+                return int(uid)
+            except (TypeError, ValueError):
+                pass
+
+    for nick, info in data_global.get("zam_data", {}).items():
+        if normalize_username(info.get("tg_username")) == wanted and info.get("tg_user_id"):
+            return int(info["tg_user_id"])
+
+    for uid, user in data_global.get("users", {}).items():
+        tag = str(user.get("tag", ""))
+        if normalize_username(tag) == wanted:
+            try:
+                return int(uid)
+            except (TypeError, ValueError):
+                pass
+
+    return None
+
+
+async def bind_pending_admin_for_user(user):
+    if not user or user.is_bot:
+        return False
+
+    username = normalize_username(user.username)
+    if not username:
+        return False
+
+    pending = data_global.setdefault("pending_admin_usernames", {})
+    if username not in pending:
+        return False
+
+    if user.id in get_admins():
+        pending.pop(username, None)
+        save_data()
+        return False
+
+    data_global.setdefault("admins", []).append(user.id)
+    data_global["admins"] = list(dict.fromkeys(data_global["admins"]))
+    data_global.setdefault("admin_usernames", {})[str(user.id)] = {
+        "username": user.username,
+        "full_name": user.full_name or str(user.id),
+    }
+    pending.pop(username, None)
+    save_data()
+    try:
+        await set_command_scopes()
+    except Exception:
+        pass
+
+    try:
+        # Подтверждение только в личном чате, чтобы не засорять группу.
+        if getattr(user, "id", None):
+            # Telegram Bot API может отправить только если пользователь уже открыл чат с ботом.
+            await bot.send_message(user.id, "👑 Вы назначены администратором!")
+    except Exception:
+        pass
+    return True
+
+
+# =========================================================
+# ОТСЛЕЖИВАНИЕ УЧАСТНИКОВ ГРУППЫ
+# =========================================================
+
+class GroupMemberTrackerMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message):
+            try:
+                user = event.from_user
+                if user and not user.is_bot:
+                    # ВАЖНО: проверяем ожидающих админов для ВСЕХ сообщений,
+                    # включая личные сообщения боту. Раньше проверка была только
+                    # внутри группы, поэтому пользователь мог написать боту, а
+                    # username так и оставался в ожидании.
+                    await bind_pending_admin_for_user(user)
+
+                    if event.chat.id == GROUP_ID:
+                        uid = str(user.id)
+                        username = user.username or None
+                        full_name = user.full_name or str(user.id)
+                        old = data_global.get("group_members", {}).get(uid, {})
+                        new = {
+                            "id": user.id,
+                            "username": username,
+                            "full_name": full_name,
+                            "last_seen": datetime.now().isoformat(),
+                        }
+                        if (
+                            old.get("username") != username
+                            or old.get("full_name") != full_name
+                            or uid not in data_global.get("group_members", {})
+                        ):
+                            data_global.setdefault("group_members", {})[uid] = new
+                            save_data()
+                        else:
+                            data_global["group_members"][uid]["last_seen"] = new["last_seen"]
+            except Exception as e:
+                print(f"⚠️ Ошибка обработки пользователя: {e}")
+
+        return await handler(event, data)
+
+
+# data создаётся ниже; здесь используем ссылку, которая будет назначена до polling.
+data_global = {}
+dp.message.outer_middleware(GroupMemberTrackerMiddleware())
+
+
+@dp.chat_member()
+async def group_member_update(event: ChatMemberUpdated):
+    """Уведомляет владельца о входе/добавлении и выходе/кике."""
+    if event.chat.id != GROUP_ID:
+        return
+
+    member = event.new_chat_member.user
+    if member.is_bot:
+        return
+
+    old_status = event.old_chat_member.status
+    new_status = event.new_chat_member.status
+    joined_from = {"left", "kicked"}
+    active = {"member", "administrator", "creator", "restricted"}
+
+    if old_status in joined_from and new_status in active:
+        data_global.setdefault("group_members", {})[str(member.id)] = {
+            "id": member.id,
+            "username": member.username,
+            "full_name": member.full_name,
+            "joined_at": datetime.now().isoformat(),
+            "last_seen": datetime.now().isoformat(),
+            "status": new_status,
+        }
+        save_data()
+        actor = event.from_user
+        actor_text = f"@{actor.username}" if actor and actor.username else str(actor.id) if actor else "система"
+        user_text = f"@{member.username}" if member.username else member.full_name
         try:
-            key = int(value)
-        except (TypeError, ValueError):
-            key = str(value)
-        if key not in seen:
-            seen.add(key)
-            result.append(value)
-    return result
+            await bot.send_message(
+                SUPER_ADMIN,
+                "🟢 <b>Новый участник в группе</b>\n\n"
+                f"👤 {escape(user_text)}\n"
+                f"🆔 <code>{member.id}</code>\n"
+                f"➕ Добавил: {escape(actor_text)}"
+            )
+        except Exception:
+            pass
+        return
+
+    if new_status in {"left", "kicked"} and old_status in active:
+        info = data_global.setdefault("group_members", {}).setdefault(str(member.id), {})
+        info.update({
+            "id": member.id,
+            "username": member.username,
+            "full_name": member.full_name,
+            "left_at": datetime.now().isoformat(),
+            "status": new_status,
+        })
+        save_data()
+        action = "кикнут" if new_status == "kicked" else "вышел из группы"
+        actor = event.from_user
+        actor_text = f"@{actor.username}" if actor and actor.username else str(actor.id) if actor else "система"
+        user_text = f"@{member.username}" if member.username else member.full_name
+        try:
+            await bot.send_message(
+                SUPER_ADMIN,
+                f"🔴 <b>Участник {action}</b>\n\n"
+                f"👤 {escape(user_text)}\n"
+                f"🆔 <code>{member.id}</code>\n"
+                f"👮 Действие от: {escape(actor_text)}"
+            )
+        except Exception:
+            pass
+
 
 
 # =========================================================
-# POSTGRESQL
+# БАЗА ДАННЫХ
 # =========================================================
+
+DATA_FILE = "data.json"
+LOG_FILE = "bot_activity.log"
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+_db_warned = False
+
 
 def _db_connect():
     if psycopg2 is None:
-        raise RuntimeError("Не установлен psycopg2-binary.")
+        raise RuntimeError("Не установлен psycopg2-binary. Добавь его в requirements.txt.")
     if not DATABASE_URL:
-        raise RuntimeError("Не задан DATABASE_URL.")
+        raise RuntimeError("Не задан DATABASE_URL. Бот остановлен, чтобы не потерять данные.")
 
     conninfo = DATABASE_URL
     if "sslmode=" not in conninfo.lower():
         conninfo += ("&" if "?" in conninfo else "?") + "sslmode=require"
 
-    global _db_warned
     try:
-        conn = psycopg2.connect(conninfo, connect_timeout=10)
-        _db_warned = False
-        return conn
+        return psycopg2.connect(conninfo, connect_timeout=10)
     except Exception as e:
+        global _db_warned
         if not _db_warned:
             print(f"❌ PostgreSQL недоступен: {e}")
             _db_warned = True
@@ -226,13 +396,16 @@ def _db_get(key):
     if not conn:
         return None
     try:
+        _db_init()
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT state_value FROM staff_grand_state WHERE state_key = %s",
                 (key,),
             )
             row = cur.fetchone()
-            return row[0] if row else None
+            if row is None:
+                return None
+            return row[0]
     except Exception as e:
         print(f"⚠️ Ошибка чтения PostgreSQL ({key}): {e}")
         return None
@@ -245,6 +418,7 @@ def _db_set(key, value):
     if not conn:
         return False
     try:
+        _db_init()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -264,14 +438,33 @@ def _db_set(key, value):
         conn.close()
 
 
+def _db_delete(key):
+    conn = _db_connect()
+    if not conn:
+        return False
+    try:
+        _db_init()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM staff_grand_state WHERE state_key = %s",
+                    (key,),
+                )
+        return True
+    except Exception as e:
+        print(f"⚠️ Ошибка удаления PostgreSQL ({key}): {e}")
+        return False
+    finally:
+        conn.close()
+
+
 def _read_local_json(path, default=None):
     if not os.path.exists(path):
         return default
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception as e:
-        print(f"⚠️ Не удалось прочитать {path}: {e}")
+    except Exception:
         return default
 
 
@@ -279,97 +472,71 @@ def _write_local_json(path, value):
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(value, f, ensure_ascii=False, indent=2)
-        return True
     except Exception as e:
         print(f"⚠️ Не удалось сохранить {path}: {e}")
+
+
+def _has_real_local_data(local):
+    if not isinstance(local, dict):
         return False
-
-
-def _has_real_data(value):
-    if not isinstance(value, dict):
-        return False
-    keys = (
-        "users", "applications", "admins", "zam_data", "zam_stats",
-        "admin_usernames", "group_members", "pending_admin_usernames",
-        "survey_history", "event_history",
-    )
-    return any(value.get(k) for k in keys)
-
-
-def _merge_dicts_keep_db(db_value, local_value):
-    """Безопасно объединяет старый data.json с PostgreSQL.
-    Уже существующие значения PostgreSQL имеют приоритет.
-    Отсутствующие записи из локального файла добавляются, а не удаляются.
-    """
-    if not isinstance(db_value, dict):
-        return local_value if isinstance(local_value, dict) else {}
-    if not isinstance(local_value, dict):
-        return db_value
-
-    merged = dict(db_value)
-    dict_keys = {
-        "users", "applications", "zam_data", "zam_stats", "admin_usernames",
-        "group_members", "pending_admin_usernames", "survey_history",
-    }
-
-    for key in dict_keys:
-        db_part = merged.get(key)
-        local_part = local_value.get(key)
-        if isinstance(db_part, dict) and isinstance(local_part, dict):
-            copy_part = dict(db_part)
-            for item_key, item_value in local_part.items():
-                if item_key not in copy_part:
-                    copy_part[item_key] = item_value
-            merged[key] = copy_part
-        elif not db_part and isinstance(local_part, dict):
-            merged[key] = local_part
-
-    for key, value in local_value.items():
-        if key not in merged or merged.get(key) in (None, {}, [], ""):
-            merged[key] = value
-
-    if isinstance(db_value.get("admins"), list) or isinstance(local_value.get("admins"), list):
-        merged["admins"] = unique_list(
-            (db_value.get("admins") or []) + (local_value.get("admins") or [])
-        )
-
-    return merged
+    if local.get("users"):
+        return True
+    if local.get("applications"):
+        return True
+    if local.get("admins") and set(local.get("admins", [])) - set(ADMIN_IDS):
+        return True
+    if local.get("zam_data"):
+        return True
+    if local.get("zam_stats"):
+        return True
+    if local.get("admin_usernames"):
+        return True
+    if local.get("group_members"):
+        return True
+    if local.get("pending_admin_usernames"):
+        return True
+    return False
 
 
 def load_data():
-    local = _read_local_json(DATA_FILE, None)
-
+    # PostgreSQL — главный источник. Никогда не заменяем существующую
+    # непустую БД пустым локальным data.json после redeploy.
     if DATABASE_URL and psycopg2 is not None:
-        if not _db_init():
-            raise RuntimeError("PostgreSQL недоступен. Бот не запускается, чтобы не потерять данные.")
-
         existing = _db_get("data")
-        if isinstance(existing, dict) and isinstance(local, dict):
-            merged = _merge_dicts_keep_db(existing, local)
-            if merged != existing:
-                print("🔄 PostgreSQL + локальный data.json объединены без удаления существующих записей.")
-                _db_set("data", merged)
-            return merged
+        if isinstance(existing, dict) and _has_real_local_data(existing):
+            return existing
+
+        local = _read_local_json(DATA_FILE, None)
+        if isinstance(local, dict) and _has_real_local_data(local):
+            print("🔄 Найден локальный data.json — выполняю однократный импорт в PostgreSQL...")
+            if _db_set("data", local):
+                return local
+
         if isinstance(existing, dict):
             return existing
-        if isinstance(local, dict):
-            print("🔄 Первый импорт локального data.json в PostgreSQL.")
-            if not _db_set("data", local):
-                raise RuntimeError("Не удалось импортировать data.json в PostgreSQL.")
-            return local
-        return {}
 
+    local = _read_local_json(DATA_FILE, None)
     if isinstance(local, dict):
         return local
 
-    raise RuntimeError("DATABASE_URL не задан и data.json отсутствует. Запуск остановлен ради сохранности данных.")
+    return {
+        "users": {},
+        "applications": {},
+        "admins": list(ADMIN_IDS),
+        "zam_stats": {},
+        "zam_data": {},
+        "log_notify_enabled": False,
+        "admin_usernames": {},
+    }
 
 
 def save_data():
+    # Локальный файл оставляем как аварийную копию.
     _write_local_json(DATA_FILE, data)
+
+    # Основное постоянное хранилище.
     if DATABASE_URL and psycopg2 is not None:
-        if not _db_set("data", data):
-            print("⚠️ Данные сохранены локально, но PostgreSQL не принял запись.")
+        _db_set("data", data)
 
 
 def load_logs():
@@ -377,6 +544,17 @@ def load_logs():
         logs = _db_get("logs")
         if isinstance(logs, list):
             return [str(x) for x in logs]
+
+        if os.path.exists(LOG_FILE):
+            try:
+                with open(LOG_FILE, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                if lines:
+                    _db_set("logs", lines)
+                    return lines
+            except Exception:
+                pass
+        return []
 
     try:
         with open(LOG_FILE, "r", encoding="utf-8") as f:
@@ -389,6 +567,7 @@ def save_logs(lines):
     lines = [str(x) for x in lines]
     if DATABASE_URL and psycopg2 is not None:
         _db_set("logs", lines)
+
     try:
         with open(LOG_FILE, "w", encoding="utf-8") as f:
             f.writelines(lines)
@@ -399,263 +578,160 @@ def save_logs(lines):
 def append_log_line(line):
     lines = load_logs()
     lines.append(line)
-    # Ограничиваем журнал, чтобы JSONB не разрастался бесконечно.
-    lines = lines[-5000:]
     save_logs(lines)
 
 
-def create_backup(reason="manual"):
-    """Создаёт локальный и PostgreSQL backup без изменения основной базы."""
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    path = BACKUP_DIR / f"data_backup_{stamp}_{reason}.json"
-    ok_local = _write_local_json(path, data)
-
-    key = f"backup_{stamp}_{reason}"
-    ok_db = True
-    if DATABASE_URL and psycopg2 is not None:
-        ok_db = _db_set(key, data)
-
-    data["last_backup_at"] = now_iso()
-    save_data()
-    return ok_local and ok_db, str(path)
-
-
-# =========================================================
-# ЗАГРУЗКА И МИГРАЦИЯ
-# =========================================================
-
+# Загружаем базу после объявления функций.
 data = load_data()
 data_global = data
 
 
-def ensure_data_structure():
-    original_snapshot = json.loads(json.dumps(data, ensure_ascii=False))
-    changed = False
-    defaults = {
-        "users": {},
-        "applications": {},
-        "admins": list(ADMIN_IDS),
-        "zam_stats": {},
-        "zam_data": {},
-        "log_notify_enabled": False,
-        "admin_usernames": {},
-        "pending_admin_usernames": {},
-        "group_members": {},
-        "initial_zams_installed": False,
-        "survey_history": {},
-        "event_history": [],
-        "last_backup_at": None,
-    }
+defaults = {
+    "users": {},
+    "applications": {},
+    "admins": list(ADMIN_IDS),
+    "zam_stats": {},
+    "zam_data": {},
+    "log_notify_enabled": False,
+    "admin_usernames": {},
+    "pending_admin_usernames": {},
+    "group_members": {},
+    "initial_zams_installed": False,
+}
 
-    for key, default in defaults.items():
-        if key not in data:
-            data[key] = default
-            changed = True
+changed = False
 
-    for key in ("users", "applications", "zam_data", "zam_stats", "admin_usernames",
-                "pending_admin_usernames", "group_members", "survey_history"):
-        if not isinstance(data.get(key), dict):
-            data[key] = {}
-            changed = True
-
-    if not isinstance(data.get("event_history"), list):
-        data["event_history"] = []
+for key, default in defaults.items():
+    if key not in data:
+        data[key] = default
         changed = True
 
-    if not isinstance(data.get("admins"), list):
-        data["admins"] = []
+# Список участников группы, которых бот уже видел в сообщениях.
+if not isinstance(data.get("group_members"), dict):
+    data["group_members"] = {}
+    changed = True
+
+if not isinstance(data.get("pending_admin_usernames"), dict):
+    data["pending_admin_usernames"] = {}
+    changed = True
+
+if not data.get("admins"):
+    data["admins"] = list(ADMIN_IDS)
+    changed = True
+
+# Сохраняем SUPER_ADMIN в списке админов всегда.
+if SUPER_ADMIN not in data["admins"]:
+    data["admins"].append(SUPER_ADMIN)
+    changed = True
+
+# Миграция замов.
+for nick, info in list(data.get("zam_data", {}).items()):
+    if not isinstance(info, dict):
+        data["zam_data"][nick] = {
+            "tg_user_id": None,
+            "tg_username": None,
+        }
+        changed = True
+        continue
+
+    if "tg_user_id" not in info:
+        info["tg_user_id"] = None
         changed = True
 
-    old_admins = list(data["admins"])
-    data["admins"] = unique_list(data["admins"] + list(ADMIN_IDS) + [SUPER_ADMIN])
-    if data["admins"] != old_admins:
+    if "tg_username" not in info:
+        info["tg_username"] = None
         changed = True
 
-    # Миграция старых полей анкет без удаления данных.
-    for uid, user in data["users"].items():
-        if not isinstance(user, dict):
-            continue
-        user.setdefault("nickname", "—")
-        user.setdefault("tag", "—")
-        user.setdefault("rank_fam", "—")
-        user.setdefault("organization", "—")
-        if user.get("organization") == "Нету":
-            user["organization"] = "Не в организации"
-            changed = True
-        if user.get("organization") == "Не в организации":
-            if user.get("rank_org") != "/":
-                user["rank_org"] = "/"
-                changed = True
-        else:
-            user.setdefault("rank_org", "—")
-        user.setdefault("inviter", "—")
-
-    # Миграция замов.
-    for nick, info in list(data["zam_data"].items()):
-        if not isinstance(info, dict):
-            data["zam_data"][nick] = {"tg_user_id": None, "tg_username": None}
-            changed = True
-            continue
-        if "tg_user_id" not in info:
-            info["tg_user_id"] = None
-            changed = True
-        if "tg_username" not in info:
-            info["tg_username"] = None
-            changed = True
-        data["zam_stats"].setdefault(nick, {"count": 0, "withdrawn": 0, "history": []})
-
-    # Старые данные о замах из предыдущей версии.
-    initial_zams = [
-        "Vusal_Cantrell", "_Sinax_Agressor_", "K1LLER", "Milena_Guenot",
-        "Meglenes_Stemmust", "Sergey_Darknes", "Gleb_Maestro", "Ganka_Gankovich",
-        "Gosha_Pinkman", "Nikita_Pandemic", "Egor_Vendetta", "Victoria_Sergeevna",
-    ]
-    if not data.get("initial_zams_installed", False):
-        for nick in initial_zams:
-            if nick not in data["zam_data"]:
-                data["zam_data"][nick] = {"tg_user_id": None, "tg_username": None}
-                data["zam_stats"][nick] = {"count": 0, "withdrawn": 0, "history": []}
-                changed = True
-        data["initial_zams_installed"] = True
-        changed = True
-
-    if changed:
-        # Резервная копия исходного состояния ДО применения миграции.
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        _write_local_json(BACKUP_DIR / f"pre_update_{stamp}.json", original_snapshot)
-        if DATABASE_URL and psycopg2 is not None:
-            _db_set(f"pre_update_{stamp}", original_snapshot)
-        save_data()
-
-
-ensure_data_structure()
-
-
-# =========================================================
-# АДМИНЫ / ЗАМЫ
-# =========================================================
-
-def get_admins():
-    return set(int(x) for x in data.get("admins", []) if safe_int(x) is not None)
-
-
-def is_admin(user_id):
-    return user_id in get_admins()
-
-
-def is_super_admin(user_id):
-    return user_id == SUPER_ADMIN
-
-
-def save_admins(admins):
-    data["admins"] = unique_list(list(admins) + [SUPER_ADMIN])
-    save_data()
-
-
-def get_admin_display(admin_id):
-    info = data.get("admin_usernames", {}).get(str(admin_id), {})
-    if info.get("username"):
-        return f"@{info['username']}"
-    if info.get("full_name"):
-        return info["full_name"]
-    return str(admin_id)
-
-
-def get_zam_nicknames():
-    return list(data.get("zam_data", {}).keys())
-
-
-def add_zam_nick(game_nick, tg_user_id=None, tg_username=None):
-    game_nick = game_nick.strip()
-    if not game_nick:
-        return False, "Пустой ник."
-    if game_nick in data["zam_data"]:
-        return False, "Такой зам уже существует."
-
-    data["zam_data"][game_nick] = {
-        "tg_user_id": tg_user_id,
-        "tg_username": tg_username,
-        "created_at": now_iso(),
-    }
-    data["zam_stats"].setdefault(game_nick, {"count": 0, "withdrawn": 0, "history": []})
-    save_data()
-    return True, "Зам добавлен."
-
-
-def remove_zam_nick(game_nick):
-    if game_nick not in data["zam_data"]:
-        return False
-    del data["zam_data"][game_nick]
-    # Старую статистику сохраняем для истории, но активный список исчезает.
-    save_data()
-    return True
-
-
-def count_zam_answers(game_nick):
-    return sum(
-        1 for user in data.get("users", {}).values()
-        if str(user.get("inviter", "")).strip() == game_nick
+# Миграция статистики замов.
+for nick in data.get("zam_data", {}):
+    stat = data["zam_stats"].setdefault(
+        nick,
+        {"count": 0, "withdrawn": 0, "history": []},
     )
 
+    if "count" not in stat:
+        stat["count"] = 0
+        changed = True
 
-def get_all_zam_counts():
-    result = []
-    for nick in get_zam_nicknames():
-        result.append((nick, count_zam_answers(nick)))
-    result.sort(key=lambda x: (-x[1], x[0].lower()))
-    return result
+    if "withdrawn" not in stat:
+        stat["withdrawn"] = 0
+        changed = True
 
+    if "history" not in stat:
+        stat["history"] = []
+        changed = True
 
-def find_user_id_by_username(username):
-    wanted = normalize_username(username)
-    if not wanted:
-        return None
+# =========================================================
+# ИСХОДНЫЕ ЗАМЫ ИЗ ПРЕДЫДУЩЕГО СПИСКА
+# =========================================================
+# Добавляются только если их ещё нет. Если владелец удалит такого зама,
+# при следующем запуске он НЕ будет возвращён.
+INITIAL_ZAM_NICKS = [
+    "Vusal_Cantrell",
+    "_Sinax_Agressor_",
+    "K1LLER",
+    "Milena_Guenot",
+    "Meglenes_Stemmust",
+    "Sergey_Darknes",
+    "Gleb_Maestro",
+    "Ganka_Gankovich",
+    "Gosha_Pinkman",
+    "Nikita_Pandemic",
+    "Egor_Vendetta",
+    "Victoria_Sergeevna",
+]
 
-    for uid, info in data.get("group_members", {}).items():
-        if normalize_username(info.get("username")) == wanted:
-            return safe_int(uid)
+if not data.get("initial_zams_installed", False):
+    for initial_nick in INITIAL_ZAM_NICKS:
+        if initial_nick not in data["zam_data"]:
+            data["zam_data"][initial_nick] = {
+                "tg_user_id": None,
+                "tg_username": None,
+            }
+            data["zam_stats"].setdefault(
+                initial_nick,
+                {"count": 0, "withdrawn": 0, "history": []},
+            )
+            changed = True
+    data["initial_zams_installed"] = True
+    changed = True
 
-    for uid, info in data.get("admin_usernames", {}).items():
-        if normalize_username(info.get("username")) == wanted:
-            return safe_int(uid)
-
-    for nick, info in data.get("zam_data", {}).items():
-        if normalize_username(info.get("tg_username")) == wanted:
-            return safe_int(info.get("tg_user_id"))
-
-    for uid, user in data.get("users", {}).items():
-        if normalize_username(user.get("tag")) == wanted:
-            return safe_int(uid)
-
-    return None
+if changed:
+    save_data()
 
 
 # =========================================================
-# TELETHON — ЛИЧНЫЕ ДИАЛОГИ ВЛАДЕЛЬЦА
+# TELEGRAM-АККАУНТ ВЛАДЕЛЬЦА
 # =========================================================
 
 async def init_telegram_user_client():
+    """Подключает пользовательскую Telegram-сессию для чтения диалогов владельца."""
     global telegram_user_client, telegram_user_ready
 
     if TelegramClient is None:
-        print("⚠️ Telethon не установлен.")
+        print("⚠️ Telethon не установлен. Добавь telethon в requirements.txt")
         return False
+
     if not (TG_API_ID and TG_API_HASH and TG_SESSION_STRING):
         print("⚠️ TG_API_ID/TG_API_HASH/TG_SESSION_STRING не настроены.")
         return False
 
     try:
-        telegram_user_client = TelegramClient(StringSession(TG_SESSION_STRING), TG_API_ID, TG_API_HASH)
+        telegram_user_client = TelegramClient(
+            StringSession(TG_SESSION_STRING),
+            TG_API_ID,
+            TG_API_HASH,
+        )
         await telegram_user_client.connect()
+
         if not await telegram_user_client.is_user_authorized():
             print("⚠️ TG_SESSION_STRING не авторизован.")
             await telegram_user_client.disconnect()
             telegram_user_client = None
             return False
+
         me = await telegram_user_client.get_me()
-        print(f"✅ Telegram user-session: {getattr(me, 'username', None) or me.id}")
+        print(f"✅ Telegram user-session подключена: {getattr(me, 'username', None) or me.id}")
         telegram_user_ready = True
         return True
     except Exception as e:
@@ -669,7 +745,8 @@ def telegram_user_is_ready():
     return telegram_user_client is not None and telegram_user_ready
 
 
-async def get_owner_dialog_users(limit=200):
+async def get_owner_dialog_users(limit=100):
+    """Возвращает людей из личных диалогов владельца, включая тех, кто не запускал бота."""
     if not telegram_user_is_ready():
         return []
 
@@ -677,23 +754,32 @@ async def get_owner_dialog_users(limit=200):
     try:
         async for dialog in telegram_user_client.iter_dialogs(limit=limit):
             entity = dialog.entity
-            if TgUser is None or not isinstance(entity, TgUser):
-                continue
-            if getattr(entity, "self", False) or getattr(entity, "bot", False):
-                continue
+            if TgUser is not None and isinstance(entity, TgUser):
+                if getattr(entity, "self", False):
+                    continue
+                if getattr(entity, "bot", False):
+                    continue
 
-            first = getattr(entity, "first_name", None) or ""
-            last = getattr(entity, "last_name", None) or ""
-            full_name = f"{first} {last}".strip() or "Без имени"
-            result.append({
-                "id": int(entity.id),
-                "name": full_name,
-                "username": getattr(entity, "username", None),
-            })
+                first = getattr(entity, "first_name", None) or ""
+                last = getattr(entity, "last_name", None) or ""
+                full_name = f"{first} {last}".strip() or "Без имени"
+                username = getattr(entity, "username", None)
+                result.append({
+                    "id": int(entity.id),
+                    "name": full_name,
+                    "username": username,
+                    "phone": getattr(entity, "phone", None),
+                })
     except Exception as e:
-        print(f"⚠️ Ошибка чтения диалогов владельца: {e}")
+        print(f"⚠️ Ошибка чтения Telegram-диалогов: {e}")
 
     return result
+
+
+def owner_dialog_label(user):
+    name = escape(user.get("name") or "Без имени")
+    username = user.get("username")
+    return f"{name} — @{escape(username)}" if username else name
 
 
 def owner_dialog_short_label(user):
@@ -702,7 +788,7 @@ def owner_dialog_short_label(user):
     return f"{name} (@{username})" if username else name
 
 
-def owner_dialog_page_keyboard(users, page=0, page_size=15, prefix="select_admin"):
+def owner_dialog_page_keyboard(users, page=0, page_size=20, prefix="select_admin"):
     start = page * page_size
     chunk = users[start:start + page_size]
     rows = []
@@ -723,181 +809,189 @@ def owner_dialog_page_keyboard(users, page=0, page_size=15, prefix="select_admin
         nav.append(InlineKeyboardButton(text="➡️", callback_data=f"{prefix}_page:{page+1}"))
     if nav:
         rows.append(nav)
+
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="owner_select_cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+# =========================================================
+# АДМИНЫ
+# =========================================================
+
 async def init_admins():
-    changed = False
+    admin_info = data.get("admin_usernames", {})
+    changed_local = False
+
     for admin_id in get_admins():
         try:
             chat = await bot.get_chat(admin_id)
-            info = {
-                "username": chat.username,
-                "full_name": chat.full_name or str(admin_id),
-            }
-            if data["admin_usernames"].get(str(admin_id)) != info:
-                data["admin_usernames"][str(admin_id)] = info
-                changed = True
+
+            info = {}
+            if chat.username:
+                info["username"] = chat.username
+            if chat.full_name:
+                info["full_name"] = chat.full_name
+
+            if info and admin_info.get(str(admin_id)) != info:
+                admin_info[str(admin_id)] = info
+                changed_local = True
+
         except Exception:
-            data["admin_usernames"].setdefault(str(admin_id), {"full_name": str(admin_id)})
-    if changed:
+            if str(admin_id) not in admin_info:
+                admin_info[str(admin_id)] = {"full_name": str(admin_id)}
+                changed_local = True
+
+    if changed_local:
+        data["admin_usernames"] = admin_info
         save_data()
 
 
+def get_admin_display(admin_id):
+    info = data.get("admin_usernames", {}).get(str(admin_id))
+
+    if info:
+        if info.get("username"):
+            return f"@{info['username']}"
+
+        if info.get("full_name") and info["full_name"] != str(admin_id):
+            return info["full_name"]
+
+    return str(admin_id)
+
+
+def get_admins():
+    return set(data.get("admins", []))
+
+
+def save_admins(admins):
+    data["admins"] = list(admins)
+    save_data()
+
+
+def is_admin(user_id):
+    return user_id in get_admins()
+
+
+def is_super_admin(user_id):
+    return user_id == SUPER_ADMIN
+
+
 # =========================================================
-# ЛОГИ И УВЕДОМЛЕНИЯ
+# ЗАМЫ
 # =========================================================
 
-async def owner_notify(text):
-    try:
-        await bot.send_message(SUPER_ADMIN, text)
-        return True
-    except Exception as e:
-        print(f"⚠️ Не удалось отправить ЛС владельцу: {e}")
+def get_zam_nicknames():
+    return list(data.get("zam_data", {}).keys())
+
+
+def get_zam_user_id(game_nick):
+    info = data.get("zam_data", {}).get(game_nick)
+    if not info:
+        return None
+    return info.get("tg_user_id")
+
+
+def add_zam_nick(game_nick, tg_user_id=None, tg_username=None):
+    game_nick = game_nick.strip()
+
+    if not game_nick:
+        return False, "Пустой ник."
+
+    if game_nick in data["zam_data"]:
+        return False, "Такой зам уже существует."
+
+    data["zam_data"][game_nick] = {
+        "tg_user_id": tg_user_id,
+        "tg_username": tg_username,
+    }
+
+    if game_nick not in data["zam_stats"]:
+        data["zam_stats"][game_nick] = {
+            "count": 0,
+            "withdrawn": 0,
+            "history": [],
+        }
+
+    save_data()
+    return True, "Зам добавлен."
+
+
+def remove_zam_nick(game_nick):
+    if game_nick not in data["zam_data"]:
         return False
 
+    del data["zam_data"][game_nick]
+    data["zam_stats"].pop(game_nick, None)
+    save_data()
+    return True
 
-async def log_action(user_id, action, details="", notify=True):
+
+def count_zam_answers(game_nick):
+    # Актуальное число приглашённых:
+    # считаем только текущие анкеты пользователей.
+    return sum(
+        1
+        for user in data.get("users", {}).values()
+        if user.get("inviter") == game_nick
+    )
+
+
+def get_zam_withdrawn(game_nick):
+    stat = data.get("zam_stats", {}).get(game_nick, {})
+    try:
+        return int(stat.get("withdrawn", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_zam_available(game_nick):
+    return max(0, count_zam_answers(game_nick) - get_zam_withdrawn(game_nick))
+
+
+def get_all_zam_counts():
+    result = []
+
+    for nick in get_zam_nicknames():
+        current = count_zam_answers(nick)
+        withdrawn = get_zam_withdrawn(nick)
+        available = max(0, current - withdrawn)
+        result.append((nick, current, withdrawn, available))
+
+    result.sort(key=lambda x: (-x[3], x[0].lower()))
+    return result
+
+
+# =========================================================
+# ЛОГИ
+# =========================================================
+
+async def log_action(user_id, action, details=""):
     try:
         chat = await bot.get_chat(user_id)
-        username = f"@{chat.username}" if chat.username else (chat.full_name or str(user_id))
+        username = (
+            f"@{chat.username}"
+            if chat.username
+            else chat.full_name
+        )
     except Exception:
         username = str(user_id)
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    append_log_line(f"[{ts}] {username} -> {action} {details}\n")
 
-    if notify and data.get("log_notify_enabled"):
-        await owner_notify(
-            f"👤 <b>{escape(username)}</b> → {escape(action)} {escape(details)}\n🕐 {ts}"
-        )
+    append_log_line(
+        f"[{ts}] {username} -> {action} {details}\n"
+    )
 
-
-def add_event(event_type, user_id=None, name=None, details=""):
-    event = {
-        "type": event_type,
-        "user_id": user_id,
-        "name": name,
-        "details": details,
-        "created": now_iso(),
-    }
-    data.setdefault("event_history", []).append(event)
-    data["event_history"] = data["event_history"][-2000:]
-    save_data()
-
-
-# =========================================================
-# УЧАСТНИКИ ГРУППЫ — ДОБАВЛЕНИЕ / КИК / ЛС ВЛАДЕЛЬЦУ
-# =========================================================
-
-async def bind_pending_admin_for_user(user):
-    if not user or user.is_bot or not user.username:
-        return False
-    wanted = normalize_username(user.username)
-    pending = data.setdefault("pending_admin_usernames", {})
-    if wanted not in pending:
-        return False
-    if user.id in get_admins():
-        pending.pop(wanted, None)
-        save_data()
-        return False
-
-    admins = get_admins()
-    admins.add(user.id)
-    data["admins"] = unique_list(list(admins) + [SUPER_ADMIN])
-    data.setdefault("admin_usernames", {})[str(user.id)] = {
-        "username": user.username,
-        "full_name": user.full_name or str(user.id),
-    }
-    pending.pop(wanted, None)
-    save_data()
-    try:
-        await set_command_scopes()
-    except Exception:
-        pass
-    try:
-        await bot.send_message(user.id, "👑 Вы назначены администратором бота!\nИспользуйте /start для панели.")
-    except Exception:
-        pass
-    return True
-
-
-class GroupMemberTrackerMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event, data_context):
-        if isinstance(event, Message):
-            try:
-                user = event.from_user
-                if user and not user.is_bot:
-                    await bind_pending_admin_for_user(user)
-                    if event.chat.id == GROUP_ID:
-                        data.setdefault("group_members", {})[str(user.id)] = {
-                            "id": user.id,
-                            "username": user.username,
-                            "full_name": user.full_name or str(user.id),
-                            "last_seen": now_iso(),
-                        }
-                        save_data()
-            except Exception as e:
-                print(f"⚠️ Ошибка обработки участника: {e}")
-        return await handler(event, data_context)
-
-
-dp.message.outer_middleware(GroupMemberTrackerMiddleware())
-
-
-@dp.chat_member()
-async def group_member_update(event: ChatMemberUpdated):
-    if event.chat.id != GROUP_ID:
-        return
-
-    user = event.new_chat_member.user
-    if not user or user.is_bot:
-        return
-
-    old_status = event.old_chat_member.status
-    new_status = event.new_chat_member.status
-    joined_statuses = {"member", "administrator", "creator", "restricted"}
-    left_statuses = {"left", "kicked"}
-
-    was_member = old_status in joined_statuses
-    is_member = new_status in joined_statuses
-
-    uid = str(user.id)
-    member_info = {
-        "id": user.id,
-        "username": user.username,
-        "full_name": user.full_name or str(user.id),
-        "last_seen": now_iso(),
-    }
-
-    if not was_member and is_member:
-        data.setdefault("group_members", {})[uid] = member_info
-        save_data()
-        add_event("joined_group", user.id, user.full_name, f"@{user.username}" if user.username else "")
-        await owner_notify(
-            "🟢 <b>Человек добавлен/вошёл в группу</b>\n\n"
-            f"👤 {escape(user.full_name or 'Без имени')}\n"
-            f"🔗 {('@' + escape(user.username)) if user.username else 'без username'}\n"
-            f"🆔 <code>{user.id}</code>"
-        )
-
-    elif was_member and not is_member:
-        # Данные НЕ удаляем: история анкеты должна сохраниться.
-        if uid in data.get("group_members", {}):
-            data["group_members"][uid]["left_at"] = now_iso()
-            data["group_members"][uid]["left_status"] = new_status
-        else:
-            data.setdefault("group_members", {})[uid] = member_info
-        save_data()
-        add_event("kicked_from_group" if new_status == "kicked" else "left_group", user.id, user.full_name, new_status)
-        action = "🔴 <b>Человек кикнут из группы</b>" if new_status == "kicked" else "🔴 <b>Человек вышел из группы</b>"
-        await owner_notify(
-            f"{action}\n\n"
-            f"👤 {escape(user.full_name or 'Без имени')}\n"
-            f"🔗 {('@' + escape(user.username)) if user.username else 'без username'}\n"
-            f"🆔 <code>{user.id}</code>"
-        )
+    if data.get("log_notify_enabled"):
+        try:
+            await bot.send_message(
+                SUPER_ADMIN,
+                f"👤 <b>{escape(username)}</b> -> "
+                f"{escape(action)} {escape(details)}\n"
+                f"🕐 {ts}",
+            )
+        except Exception:
+            pass
 
 
 # =========================================================
@@ -906,444 +1000,113 @@ async def group_member_update(event: ChatMemberUpdated):
 
 def main_keyboard(has_survey=False):
     b = ReplyKeyboardBuilder()
-    b.row(KeyboardButton(text="📝 Заполнить анкету"))
+
+    b.row(
+        KeyboardButton(text="📝 Заполнить анкету"),
+    )
+
     if has_survey:
-        b.row(KeyboardButton(text="🔄 Перезаполнить анкету"))
-    b.row(KeyboardButton(text="👤 Мой профиль"))
+        b.row(
+            KeyboardButton(text="🔄 Перезаполнить анкету"),
+        )
+
+    b.row(
+        KeyboardButton(text="👤 Мой профиль"),
+    )
+
     return b.as_markup(resize_keyboard=True)
 
 
 def admin_keyboard(user_id, has_survey=False):
     b = ReplyKeyboardBuilder()
-    b.row(KeyboardButton(text="📋 Управление заявками"), KeyboardButton(text="⏳ Активные заявки"))
-    b.row(KeyboardButton(text="👥 Список участников"), KeyboardButton(text="🟢 Статус бота"))
-    b.row(KeyboardButton(text="🛠 Админка"))
+
+    b.row(
+        KeyboardButton(text="📋 Управление заявками"),
+        KeyboardButton(text="⏳ Активные заявки"),
+    )
+    b.row(
+        KeyboardButton(text="👥 Список участников"),
+        KeyboardButton(text="🟢 Статус бота"),
+    )
+    b.row(
+        KeyboardButton(text="🛠 Админка"),
+    )
+
     if has_survey:
-        b.row(KeyboardButton(text="🔄 Перезаполнить анкету"))
+        b.row(
+            KeyboardButton(text="🔄 Перезаполнить анкету"),
+        )
+
     if is_super_admin(user_id):
-        b.row(KeyboardButton(text="👑 Замы"), KeyboardButton(text="📜 Журнал действий"))
+        b.row(
+            KeyboardButton(text="👑 Замы"),
+            KeyboardButton(text="📜 Журнал действий"),
+        )
+
     return b.as_markup(resize_keyboard=True)
 
 
 def admin_panel_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить админа", callback_data="adm:add")],
-        [InlineKeyboardButton(text="➖ Удалить админа", callback_data="adm:remove")],
-        [InlineKeyboardButton(text="👑 Список админов", callback_data="adm:list")],
-    ])
-
-
-def survey_exists(user_id):
-    return str(user_id) in data.get("users", {})
-
-
-def survey_already_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Перезаполнить", callback_data="survey:refill")],
-        [InlineKeyboardButton(text="➡️ Пропустить", callback_data="survey:skip")],
-    ])
-
-
-# =========================================================
-# МЕНЮ
-# =========================================================
-
-@dp.message(CommandStart())
-async def start_command(message: Message):
-    await log_action(message.from_user.id, "start", "запустил бота")
-    await show_main_menu(message)
-
-
-async def show_main_menu(message: Message):
-    user_id = message.from_user.id
-    has_survey = survey_exists(user_id)
-    if is_admin(user_id):
-        await message.answer(
-            f"🛡️ <b>Панель управления</b>\nДобро пожаловать в <b>{BOT_NAME}</b>.",
-            reply_markup=admin_keyboard(user_id, has_survey),
-        )
-    else:
-        await message.answer(
-            f"👋 <b>Добро пожаловать в {BOT_NAME}!</b>\nЗаполните анкету для вступления в семью.",
-            reply_markup=main_keyboard(has_survey),
-        )
-
-
-# =========================================================
-# АНКЕТА
-# =========================================================
-
-user_surveys = {}
-gather_tasks = {}
-GATHER_DURATION_SECONDS = 90
-GATHER_INTERVAL_SECONDS = 20
-GATHER_CHUNK_SIZE = 25
-
-
-async def start_survey(message: Message, preserve_old=True):
-    uid = message.from_user.id
-    user_surveys[uid] = {"step": 0, "answers": {}, "preserve_old": preserve_old}
-    await log_action(uid, "анкета", "начал")
-    await message.answer(
-        "📋 <b>Заполнение анкеты</b>\n\n1️⃣ Ваш Nickname в игре?",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-async def begin_survey_or_offer_refill(message: Message):
-    if survey_exists(message.from_user.id):
-        await message.answer(
-            "ℹ️ <b>У вас уже есть заполненная анкета.</b>\n\nВыберите действие:",
-            reply_markup=survey_already_keyboard(),
-        )
-        return
-    await start_survey(message, preserve_old=False)
-
-
-@dp.message(F.text == "📝 Заполнить анкету")
-async def survey_button(message: Message):
-    await begin_survey_or_offer_refill(message)
-
-
-@dp.callback_query(F.data == "survey:refill")
-async def survey_refill_cb(cb: CallbackQuery):
-    await cb.answer()
-    await start_survey(cb.message, preserve_old=True)
-
-
-@dp.callback_query(F.data == "survey:skip")
-async def survey_skip_cb(cb: CallbackQuery):
-    await cb.answer()
-    await cb.message.answer("👍 Хорошо, оставляем текущую анкету.")
-    await show_main_menu(cb.message)
-
-
-@dp.message(F.text == "🔄 Перезаполнить анкету")
-async def reset_survey(message: Message):
-    if not survey_exists(message.from_user.id):
-        await message.answer("❌ У вас нет анкеты.")
-        return
-    await start_survey(message, preserve_old=True)
-
-
-@dp.message(lambda m: m.from_user.id in user_surveys)
-async def survey_handler(message: Message):
-    uid = message.from_user.id
-    s = user_surveys[uid]
-    step = s["step"]
-
-    if not message.text:
-        await message.answer("❌ Введите текст.")
-        return
-
-    if step == 0:
-        nickname = message.text.strip()
-        if not nickname:
-            await message.answer("❌ Nickname не может быть пустым.")
-            return
-        s["answers"]["nickname"] = nickname
-        u = message.from_user
-        s["answers"]["tag"] = f"@{u.username}" if u.username else str(u.id)
-        s["step"] = 1
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=r, callback_data=f"rank_{r}")] for r in RANK_LIST
-        ])
-        await message.answer("👤 Ваш ранг в фаме:", reply_markup=kb)
-
-    elif step == 3:
-        # Старые сценарии без организации-кнопки оставляем рабочими.
-        s["answers"]["rank_org"] = message.text.strip()
-        await ask_inviter(message, uid)
-
-
-async def ask_inviter(message: Message, uid: int):
-    user_surveys[uid]["step"] = 4
-    zams = get_zam_nicknames()
-    if not zams:
-        await message.answer("⚠️ Сейчас замов нет. Обратитесь к администрации.")
-        user_surveys.pop(uid, None)
-        await show_main_menu(message)
-        return
-
-    rows = []
-    for z in zams:
-        rows.append([InlineKeyboardButton(text=z, callback_data=f"zam_{z}")])
-    await message.answer("👤 Кто вас пригласил?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@dp.callback_query(F.data.startswith("rank_"))
-async def rank_selected(cb: CallbackQuery):
-    uid = cb.from_user.id
-    if uid not in user_surveys:
-        await cb.answer("❌ Анкета не найдена.")
-        return
-    rank = cb.data[5:]
-    if rank not in RANK_LIST:
-        await cb.answer("❌ Недопустимый ранг.", show_alert=True)
-        return
-    user_surveys[uid]["answers"]["rank_fam"] = rank
-    user_surveys[uid]["step"] = 2
-    await cb.answer(f"✅ {rank}")
-    rows = [[InlineKeyboardButton(text=o, callback_data=f"org_{o}")] for o in ORG_LIST]
-    await cb.message.answer("🏢 Ваша организация:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@dp.callback_query(F.data.startswith("org_"))
-async def org_selected(cb: CallbackQuery):
-    uid = cb.from_user.id
-    if uid not in user_surveys:
-        await cb.answer("❌ Анкета не найдена.")
-        return
-    org = cb.data[4:]
-    if org not in ORG_LIST:
-        await cb.answer("❌ Недопустимая организация.", show_alert=True)
-        return
-
-    user_surveys[uid]["answers"]["organization"] = org
-    await cb.answer(f"✅ {org}")
-
-    if org == "Не в организации":
-        user_surveys[uid]["answers"]["rank_org"] = "/"
-        await ask_inviter(cb.message, uid)
-    else:
-        user_surveys[uid]["step"] = 3
-        await cb.message.answer("📌 Ваш ранг в организации?")
-
-
-@dp.callback_query(F.data.startswith("zam_"))
-async def zam_selected(cb: CallbackQuery):
-    uid = cb.from_user.id
-    if uid not in user_surveys:
-        await cb.answer("❌ Анкета не найдена.")
-        return
-    zam = cb.data[4:]
-    if zam not in data["zam_data"]:
-        await cb.answer("❌ Этот зам больше не существует.", show_alert=True)
-        return
-    user_surveys[uid]["answers"]["inviter"] = zam
-    await cb.answer(f"✅ {zam}")
-    await finish_survey(cb.message, uid)
-
-
-async def finish_survey(message, uid):
-    s = user_surveys.pop(uid, None)
-    if not s:
-        return
-    a = s["answers"]
-    org = a.get("organization", "—")
-    rank_org = "/" if org == "Не в организации" else a.get("rank_org", "—")
-
-    user_data = {
-        "nickname": a.get("nickname", "—"),
-        "tag": a.get("tag", "—"),
-        "rank_fam": a.get("rank_fam", "—"),
-        "organization": org,
-        "rank_org": rank_org,
-        "inviter": a.get("inviter", "—"),
-        "updated_at": now_iso(),
-    }
-
-    uid_key = str(uid)
-    old_user = data["users"].get(uid_key)
-    if old_user:
-        data.setdefault("survey_history", {}).setdefault(uid_key, []).append({
-            "changed_at": now_iso(),
-            "previous": old_user,
-            "reason": "refill",
-        })
-        data["survey_history"][uid_key] = data["survey_history"][uid_key][-50:]
-
-        for app in data["applications"].values():
-            if str(app.get("user_id")) == uid_key and app.get("status") == "pending":
-                app["status"] = "cancelled"
-                app.setdefault("history", []).append({
-                    "action": "cancelled_by_refill",
-                    "created": now_iso(),
-                    "by": uid,
-                })
-
-    data["users"][uid_key] = user_data
-    app_id = f"app_{uid}_{int(datetime.now().timestamp())}"
-    data["applications"][app_id] = {
-        "user_id": uid,
-        "data": user_data.copy(),
-        "status": "pending",
-        "created": now_iso(),
-        "history": [],
-    }
-    save_data()
-
-    await message.answer("✅ <b>Анкета заполнена!</b>", reply_markup=main_keyboard(True) if not is_admin(uid) else admin_keyboard(uid, True))
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept:{app_id}")],
-        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{app_id}")],
-    ])
-    text = (
-        f"📩 <b>Новая заявка!</b>\n\n"
-        f"Nickname: {escape(user_data['nickname'])}\n"
-        f"Тег: {escape(user_data['tag'])}\n"
-        f"Ранг: {escape(user_data['rank_fam'])}\n"
-        f"Орг: {escape(user_data['organization'])}\n"
-        f"Ранг в орг: {escape(user_data['rank_org'])}\n"
-        f"Пригласитель: {escape(user_data['inviter'])}"
-    )
-    for admin in get_admins():
-        try:
-            await bot.send_message(admin, text, reply_markup=kb)
-        except Exception:
-            pass
-
-
-# =========================================================
-# ПРОФИЛЬ / КТО / ПОИСК
-# =========================================================
-
-@dp.message(F.text == "👤 Мой профиль")
-async def my_profile(message: Message):
-    uid = str(message.from_user.id)
-    u = data["users"].get(uid)
-    if not u:
-        await message.answer("ℹ️ Вы ещё не заполнили анкету.")
-        return
-    await message.answer(format_user_card(u, uid))
-
-
-def format_user_card(u, uid=None):
-    return (
-        "👤 <b>Профиль</b>\n"
-        f"Nickname: {escape(u.get('nickname', '—'))}\n"
-        f"Тег: {escape(u.get('tag', '—'))}\n"
-        f"Ранг: {escape(u.get('rank_fam', '—'))}\n"
-        f"Орг: {escape(u.get('organization', '—'))}\n"
-        f"Ранг в орг: {escape(u.get('rank_org', '—'))}\n"
-        f"Пригласил: {escape(u.get('inviter', '—'))}"
-        + (f"\n🆔 ID: <code>{uid}</code>" if uid else "")
-    )
-
-
-@dp.message(Command("кто"))
-@dp.message(Command("kto"))
-async def who_command(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Нет прав!")
-        return
-    if not message.reply_to_message:
-        await message.answer("❌ Ответьте на сообщение участника.")
-        return
-    uid = message.reply_to_message.from_user.id
-    u = data["users"].get(str(uid))
-    if not u:
-        await message.answer("❌ У этого пользователя нет анкеты.")
-        return
-    await message.answer(format_user_card(u, str(uid)))
-
-
-@dp.message(Command("поиск"))
-async def search_user_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Только админы!")
-        return
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("❌ Использование: <code>/поиск Nickname или @username</code>")
-        return
-    query = args[1].strip().lstrip("@").lower()
-    found = []
-    for uid, u in data.get("users", {}).items():
-        hay = " ".join(str(u.get(k, "")) for k in ("nickname", "tag", "organization", "inviter")).lower()
-        if query in hay or query == str(uid).lower():
-            found.append((uid, u))
-    for uid, info in data.get("group_members", {}).items():
-        hay = f"{info.get('username','')} {info.get('full_name','')} {uid}".lower()
-        if query in hay and str(uid) not in {x[0] for x in found}:
-            found.append((uid, {
-                "nickname": info.get("full_name", "—"),
-                "tag": f"@{info.get('username')}" if info.get('username') else "—",
-                "rank_fam": "—",
-                "organization": "—",
-                "rank_org": "—",
-                "inviter": "—",
-            }))
-    if not found:
-        await message.answer("🔎 Ничего не найдено.")
-        return
-    text = "🔎 <b>Результаты поиска</b>\n\n"
-    for uid, u in found[:20]:
-        text += f"<b>{escape(u.get('nickname','—'))}</b> — {escape(u.get('tag','—'))}\nID: <code>{uid}</code>\n\n"
-    await message.answer(text)
-
-
-@dp.message(Command("history"))
-async def history_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Только админы!")
-        return
-    target = None
-    args = message.text.split(maxsplit=1)
-    if len(args) > 1:
-        target = args[1].strip().lstrip("@")
-    elif message.reply_to_message:
-        target = str(message.reply_to_message.from_user.id)
-    if not target:
-        await message.answer("❌ Использование: <code>/history ID</code> или ответом на сообщение.")
-        return
-
-    uid = target if target.isdigit() else None
-    if uid is None:
-        uid = str(find_user_id_by_username(target) or "")
-    history = data.get("survey_history", {}).get(str(uid), [])
-    if not history:
-        await message.answer("📭 Истории перезаполнений нет.")
-        return
-    text = f"📜 <b>История анкеты {escape(str(uid))}</b>\n\n"
-    for item in history[-10:][::-1]:
-        prev = item.get("previous", {})
-        text += f"🕐 {escape(item.get('changed_at','—'))}\n"
-        text += f"Nickname: {escape(prev.get('nickname','—'))}\n"
-        text += f"Ранг: {escape(prev.get('rank_fam','—'))}\n"
-        text += f"Орг: {escape(prev.get('organization','—'))}\n"
-        text += f"Зам: {escape(prev.get('inviter','—'))}\n\n"
-    await message.answer(text[:4000])
-
-
-# =========================================================
-# ЗАЯВКИ
-# =========================================================
-
-def application_keyboard(app_id):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Принять", callback_data=f"accept:{app_id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{app_id}"),
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить админа",
+                    callback_data="adm:add",
+                ),
+                InlineKeyboardButton(
+                    text="➖ Удалить админа",
+                    callback_data="adm:remove",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👑 Список админов",
+                    callback_data="adm:list",
+                ),
+            ],
         ]
-    ])
-
-
-def application_text(app, idx=None):
-    u = app.get("data", {})
-    status = app.get("status", "pending")
-    status_text = {
-        "pending": "⏳ Ожидает решения",
-        "accepted": "✅ Принята",
-        "rejected": "❌ Отклонена",
-        "cancelled": "🚫 Отменена",
-    }.get(status, status)
-    prefix = f"<b>Заявка #{idx}</b>" if idx is not None else "<b>Заявка</b>"
-    return (
-        f"{prefix}\nСтатус: <b>{status_text}</b>\n\n"
-        f"Nickname: {escape(u.get('nickname','—'))}\n"
-        f"Тег: {escape(u.get('tag','—'))}\n"
-        f"Ранг: {escape(u.get('rank_fam','—'))}\n"
-        f"Орг: {escape(u.get('organization','—'))}\n"
-        f"Ранг в орг: {escape(u.get('rank_org','—'))}\n"
-        f"Пригласил: {escape(u.get('inviter','—'))}"
     )
 
+
+def zams_panel_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить зама",
+                    callback_data="zam:add",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="➖ Удалить зама",
+                    callback_data="zam:remove",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📊 Статистика",
+                    callback_data="zam:stats",
+                ),
+            ],
+        ]
+    )
+
+
+# =========================================================
+# ДОБАВЛЕНИЕ В ГРУППУ
+# =========================================================
 
 async def add_user_to_group(user_id):
+    # Используем только постоянную ссылку на нашу группу.
+    # Дополнительные invite-ссылки Telegram больше не создаём.
     try:
-        await bot.send_message(user_id, f"🔗 <b>Вы приняты в семью!</b>\n\nВступите в группу:\n{GROUP_LINK}")
+        await bot.send_message(
+            user_id,
+            f"🔗 <b>Вы приняты в семью!</b>\n\n"
+            f"Вступите в группу по ссылке:\n{GROUP_LINK}",
+        )
         return True
     except Exception:
         return False
@@ -1360,56 +1123,494 @@ async def remove_user_from_group(user_id):
 
 async def set_user_nickname(user_id, nickname):
     try:
-        await bot.set_chat_member_custom_title(chat_id=GROUP_ID, user_id=user_id, custom_title=nickname)
+        await bot.set_chat_member_custom_title(
+            chat_id=GROUP_ID,
+            user_id=user_id,
+            custom_title=nickname,
+        )
         return True
     except Exception:
         return False
 
 
+# =========================================================
+# МЕНЮ
+# =========================================================
+
+@dp.message(CommandStart())
+async def start_command(message: Message):
+    await log_action(
+        message.from_user.id,
+        "start",
+        "запустил бота",
+    )
+    await show_main_menu(message)
+
+
+async def show_main_menu(message: Message):
+    user_id = message.from_user.id
+    has_survey = str(user_id) in data["users"]
+
+    if is_admin(user_id):
+        await message.answer(
+            f"🛡️ <b>Панель управления</b>\n"
+            f"Добро пожаловать в <b>{BOT_NAME}</b>.",
+            reply_markup=admin_keyboard(user_id, has_survey),
+        )
+    else:
+        await message.answer(
+            f"👋 <b>Добро пожаловать в {BOT_NAME}!</b>\n"
+            f"Заполните анкету для вступления в семью.",
+            reply_markup=main_keyboard(has_survey),
+        )
+
+
+# =========================================================
+# /КТО
+# =========================================================
+
+@dp.message(Command("кто"))
+@dp.message(Command("kto"))
+async def who_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Нет прав!")
+        return
+
+    await log_action(message.from_user.id, "команда /кто")
+
+    if not message.reply_to_message:
+        await message.answer("❌ Ответьте на сообщение участника.")
+        return
+
+    uid = message.reply_to_message.from_user.id
+    u = data["users"].get(str(uid))
+
+    if not u:
+        await message.answer("❌ У этого пользователя нет анкеты.")
+        return
+
+    await message.answer(
+        f"📋 <b>Анкета:</b>\n"
+        f"Nickname: {escape(u.get('nickname', '—'))}\n"
+        f"Тег: {escape(u.get('tag', '—'))}\n"
+        f"Ранг: {escape(u.get('rank_fam', '—'))}\n"
+        f"Орг: {escape(u.get('organization', '—'))}\n"
+        f"Ранг в орг: {escape(u.get('rank_org', '—'))}\n"
+        f"Пригласитель: {escape(u.get('inviter', '—'))}"
+    )
+
+
+# =========================================================
+# ПЕРЕЗАПИСЬ АНКЕТЫ
+# =========================================================
+
+@dp.message(F.text == "🔄 Перезаполнить анкету")
+async def reset_survey(message: Message):
+    uid = str(message.from_user.id)
+
+    if uid not in data["users"]:
+        await message.answer("❌ У вас нет анкеты.")
+        return
+
+    # Старые ожидающие заявки больше не должны приниматься/отклоняться.
+    for app in data["applications"].values():
+        if (
+            str(app.get("user_id")) == uid
+            and app.get("status") == "pending"
+        ):
+            app["status"] = "cancelled"
+            app.setdefault("history", []).append(
+                {
+                    "action": "cancelled_by_user",
+                    "created": datetime.now().isoformat(),
+                }
+            )
+
+    data["users"].pop(uid, None)
+    save_data()
+
+    await log_action(
+        int(uid),
+        "сброс анкеты",
+        "перезаполнение",
+    )
+
+    await start_survey(message)
+
+
+# =========================================================
+# АНКЕТА
+# =========================================================
+
+user_surveys = {}
+admin_actions = {}
+
+# Активные созывы: для каждой группы только один одновременно.
+gather_tasks = {}
+pending_zam_users = {}
+
+
+async def start_survey(message: Message, user_id=None):
+    uid = user_id if user_id is not None else message.from_user.id
+
+    user_surveys[uid] = {
+        "step": 0,
+        "answers": {},
+    }
+
+    await log_action(uid, "анкета", "начал")
+
+    await message.answer(
+        "📋 <b>Заполнение анкеты</b>\n\n"
+        "1️⃣ Ваш Nickname в игре?",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(lambda m: m.from_user.id in user_surveys)
+async def survey_handler(message: Message):
+    uid = message.from_user.id
+    s = user_surveys[uid]
+    step = s["step"]
+
+    if not message.text:
+        await message.answer("❌ Введите текст.")
+        return
+
+    if step == 0:
+        s["answers"]["nickname"] = message.text.strip()
+
+        u = message.from_user
+        s["answers"]["tag"] = (
+            f"@{u.username}"
+            if u.username
+            else str(u.id)
+        )
+
+        s["step"] = 1
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=r,
+                        callback_data=f"rank_{r}",
+                    )
+                ]
+                for r in RANK_LIST
+            ]
+        )
+
+        await message.answer(
+            "👤 Ваш ранг в фаме:",
+            reply_markup=kb,
+        )
+
+    elif step == 3:
+        s["answers"]["rank_org"] = message.text.strip()
+        s["step"] = 4
+
+        zams = get_zam_nicknames()
+
+        if not zams:
+            await message.answer(
+                "⚠️ Сейчас замов нет. Обратитесь к администрации."
+            )
+            user_surveys.pop(uid, None)
+            return
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=z,
+                        callback_data=f"zam_{z}",
+                    )
+                ]
+                for z in zams
+            ]
+        )
+
+        await message.answer(
+            "👤 Кто вас пригласил?",
+            reply_markup=kb,
+        )
+
+
+# =========================================================
+# ВЫБОР РАНГА
+# =========================================================
+
+@dp.callback_query(F.data.startswith("rank_"))
+async def rank_selected(cb: CallbackQuery):
+    uid = cb.from_user.id
+
+    if uid not in user_surveys:
+        await cb.answer("❌ Анкета не найдена.")
+        return
+
+    rank = cb.data[5:]
+
+    user_surveys[uid]["answers"]["rank_fam"] = rank
+    user_surveys[uid]["step"] = 2
+
+    await cb.answer(f"✅ {rank}")
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=o,
+                    callback_data=f"org_{o}",
+                )
+            ]
+            for o in ORG_LIST
+        ]
+    )
+
+    await cb.message.answer(
+        "🏢 Ваша организация:",
+        reply_markup=kb,
+    )
+
+
+# =========================================================
+# ВЫБОР ОРГАНИЗАЦИИ
+# =========================================================
+
+@dp.callback_query(F.data.startswith("org_"))
+async def org_selected(cb: CallbackQuery):
+    uid = cb.from_user.id
+
+    if uid not in user_surveys:
+        await cb.answer("❌ Анкета не найдена.")
+        return
+
+    org = cb.data[4:]
+
+    user_surveys[uid]["answers"]["organization"] = org
+
+    await cb.answer(f"✅ {org}")
+
+    if org == "Не в организации":
+        user_surveys[uid]["answers"]["rank_org"] = "/"
+        user_surveys[uid]["step"] = 4
+        zams = get_zam_nicknames()
+        if not zams:
+            user_surveys.pop(uid, None)
+            await cb.message.answer("⚠️ Сейчас замов нет. Обратитесь к администрации.")
+            return
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=z, callback_data=f"zam_{z}")] for z in zams])
+        await cb.message.answer("👤 Кто вас пригласил?", reply_markup=kb)
+        return
+
+    user_surveys[uid]["step"] = 3
+    await cb.message.answer("📌 Ваш ранг в организации?")
+
+
+# =========================================================
+# ВЫБОР ЗАМА
+# =========================================================
+
+@dp.callback_query(F.data.startswith("zam_"))
+async def zam_selected(cb: CallbackQuery):
+    uid = cb.from_user.id
+
+    if uid not in user_surveys:
+        await cb.answer("❌ Анкета не найдена.")
+        return
+
+    zam = cb.data[4:]
+
+    if zam not in data["zam_data"]:
+        await cb.answer(
+            "❌ Этот зам больше не существует.",
+            show_alert=True,
+        )
+        return
+
+    user_surveys[uid]["answers"]["inviter"] = zam
+
+    await cb.answer(f"✅ {zam}")
+    await finish_survey(cb.message, uid)
+
+
+# =========================================================
+# ЗАВЕРШЕНИЕ АНКЕТЫ
+# =========================================================
+
+async def finish_survey(message, uid):
+    s = user_surveys.pop(uid, None)
+
+    if not s:
+        return
+
+    a = s["answers"]
+
+    user_data = {
+        "nickname": a.get("nickname", "—"),
+        "tag": a.get("tag", "—"),
+        "rank_fam": a.get("rank_fam", "—"),
+        "organization": a.get("organization", "—"),
+        "rank_org": a.get("rank_org", "—"),
+        "inviter": a.get("inviter", "—"),
+    }
+
+    data["users"][str(uid)] = user_data
+
+    app_id = f"app_{uid}_{int(datetime.now().timestamp())}"
+
+    data["applications"][app_id] = {
+        "user_id": uid,
+        "data": user_data,
+        "status": "pending",
+        "created": datetime.now().isoformat(),
+        "history": [],
+    }
+
+    save_data()
+
+    await message.answer("✅ <b>Анкета заполнена!</b>", reply_markup=main_keyboard(has_survey=True))
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Принять",
+                    callback_data=f"accept:{app_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=f"reject:{app_id}",
+                )
+            ],
+        ]
+    )
+
+    text = (
+        f"📩 <b>Новая заявка!</b>\n\n"
+        f"Nickname: {escape(user_data['nickname'])}\n"
+        f"Тег: {escape(user_data['tag'])}\n"
+        f"Ранг: {escape(user_data['rank_fam'])}\n"
+        f"Орг: {escape(user_data['organization'])}\n"
+        f"Ранг в орг: {escape(user_data['rank_org'])}\n"
+        f"Пригласитель: {escape(user_data['inviter'])}"
+    )
+
+    for admin in get_admins():
+        try:
+            await bot.send_message(
+                admin,
+                text,
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data == "survey_refill")
+async def survey_refill_cb(cb: CallbackQuery):
+    if str(cb.from_user.id) not in data.get("users", {}):
+        await cb.answer("Анкета не найдена.", show_alert=True); return
+    await cb.answer("Начинаем заново")
+    uid = str(cb.from_user.id)
+    for app in data["applications"].values():
+        if str(app.get("user_id")) == uid and app.get("status") == "pending":
+            app["status"] = "cancelled"
+            app.setdefault("history", []).append({"action": "cancelled_by_user", "created": datetime.now().isoformat()})
+    data["users"].pop(uid, None)
+    save_data()
+    await start_survey(cb.message, cb.from_user.id)
+
+
+@dp.callback_query(F.data == "survey_skip")
+async def survey_skip_cb(cb: CallbackQuery):
+    await cb.answer("Оставляем текущую анкету")
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await cb.message.answer("✅ Текущая анкета оставлена.", reply_markup=main_keyboard(has_survey=True) if not is_admin(cb.from_user.id) else admin_keyboard(cb.from_user.id, True))
+
+
+@dp.message(F.text == "📝 Заполнить анкету")
+async def survey_button(message: Message):
+    uid = message.from_user.id
+
+    if str(uid) in data["users"]:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔄 Перезаполнить", callback_data="survey_refill"),
+            InlineKeyboardButton(text="⏭ Пропустить", callback_data="survey_skip"),
+        ]])
+        await message.answer("ℹ️ У вас уже есть заполненная анкета. Хотите изменить её?", reply_markup=kb)
+        return
+
+    await start_survey(message)
+
+
+# =========================================================
+# ЗАЯВКИ
+# =========================================================
+
 async def change_application_verdict(app_id, new_status, admin_id):
     app = data["applications"].get(app_id)
     if not app:
         return False, "❌ Заявка не найдена."
+
     old_status = app.get("status", "pending")
     if old_status == new_status:
         return False, "ℹ️ Этот вердикт уже установлен."
 
     app["status"] = new_status
-    app["last_changed_by"] = admin_id
-    app["last_changed_at"] = now_iso()
-    app.setdefault("history", []).append({
-        "action": new_status,
-        "previous_status": old_status,
-        "by": admin_id,
-        "created": now_iso(),
-    })
+    app.setdefault("history", []).append(
+        {
+            "action": new_status,
+            "previous_status": old_status,
+            "by": admin_id,
+            "created": datetime.now().isoformat(),
+        }
+    )
     save_data()
 
-    user_id = safe_int(app.get("user_id"))
+    user_id = app.get("user_id")
     nickname = app.get("data", {}).get("nickname", "Участник")
 
     if new_status == "accepted":
         await add_user_to_group(user_id)
         await set_user_nickname(user_id, nickname)
         try:
-            await bot.send_message(user_id, "✅ Ваша заявка принята администрацией!")
+            await bot.send_message(
+                user_id,
+                "✅ Ваша заявка принята администрацией!",
+            )
         except Exception:
             pass
-    elif new_status == "rejected":
+        await log_action(
+            admin_id,
+            "изменил вердикт заявки",
+            f"{app_id}: {old_status} → accepted",
+        )
+        return True, "✅ Заявка отмечена как принята."
+
+    if new_status == "rejected":
         await remove_user_from_group(user_id)
         try:
-            await bot.send_message(user_id, "❌ Ваша заявка отклонена администрацией.")
+            await bot.send_message(
+                user_id,
+                "❌ Ваша заявка отклонена администрацией.",
+            )
         except Exception:
             pass
+        await log_action(
+            admin_id,
+            "изменил вердикт заявки",
+            f"{app_id}: {old_status} → rejected",
+        )
+        return True, "❌ Заявка отмечена как отклонённая."
 
-    await log_action(admin_id, "изменил вердикт заявки", f"{app_id}: {old_status} → {new_status}")
-    await owner_notify(
-        f"📋 <b>Изменён вердикт заявки</b>\n"
-        f"👤 {escape(nickname)}\n"
-        f"📝 {escape(old_status)} → <b>{escape(new_status)}</b>\n"
-        f"🛡 Админ: <code>{admin_id}</code>"
-    )
-    return True, "✅ Готово."
+    return False, "❌ Недопустимый вердикт."
 
 
 @dp.callback_query(F.data.startswith("accept:"))
@@ -1417,12 +1618,20 @@ async def accept_app(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("❌ Нет прав!", show_alert=True)
         return
+
     app_id = cb.data.split(":", 1)[1]
-    ok, text = await change_application_verdict(app_id, "accepted", cb.from_user.id)
+    ok, text = await change_application_verdict(
+        app_id,
+        "accepted",
+        cb.from_user.id,
+    )
     await cb.answer("✅ Принят" if ok else text, show_alert=not ok)
     if ok:
         try:
-            await cb.message.edit_text(application_text(data["applications"][app_id]), reply_markup=application_keyboard(app_id))
+            await cb.message.edit_text(
+                application_text(data["applications"][app_id], None),
+                reply_markup=application_keyboard(app_id),
+            )
         except Exception:
             pass
 
@@ -1432,14 +1641,116 @@ async def reject_app(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("❌ Нет прав!", show_alert=True)
         return
+
     app_id = cb.data.split(":", 1)[1]
-    ok, text = await change_application_verdict(app_id, "rejected", cb.from_user.id)
+    ok, text = await change_application_verdict(
+        app_id,
+        "rejected",
+        cb.from_user.id,
+    )
     await cb.answer("❌ Отклонён" if ok else text, show_alert=not ok)
     if ok:
         try:
-            await cb.message.edit_text(application_text(data["applications"][app_id]), reply_markup=application_keyboard(app_id))
+            await cb.message.edit_text(
+                application_text(data["applications"][app_id], None),
+                reply_markup=application_keyboard(app_id),
+            )
         except Exception:
             pass
+
+
+def application_keyboard(app_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Принять", callback_data=f"accept:{app_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{app_id}"),
+        ],
+    ])
+
+
+def application_text(app, idx=None):
+    u = app.get("data", {})
+    status = app.get("status", "pending")
+    status_text = {
+        "pending": "⏳ Ожидает решения",
+        "accepted": "✅ Принята",
+        "rejected": "❌ Отклонена",
+        "cancelled": "🚫 Отменена",
+    }.get(status, status)
+    prefix = f"<b>Заявка #{idx}</b>" if idx is not None else "<b>Заявка</b>"
+    return (
+        f"{prefix}\n"
+        f"Статус: <b>{status_text}</b>\n\n"
+        f"👤 Nickname: {escape(str(u.get('nickname', '—')))}\n"
+        f"📱 Тег: {escape(str(u.get('tag', '—')))}\n"
+        f"🎖 Ранг: {escape(str(u.get('rank_fam', '—')))}\n"
+        f"🏢 Орг: {escape(str(u.get('organization', '—')))}\n"
+        f"📌 Ранг в орг: {escape(str(u.get('rank_org', '—')))}\n"
+        f"👑 Пригласил: {escape(str(u.get('inviter', '—')))}"
+    )
+
+
+def apps_menu_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟠 Ожидают", callback_data="apps_filter:pending"),
+         InlineKeyboardButton(text="🟢 Приняты", callback_data="apps_filter:accepted")],
+        [InlineKeyboardButton(text="🔴 Отклонены", callback_data="apps_filter:rejected"),
+         InlineKeyboardButton(text="📋 Все", callback_data="apps_filter:all")],
+        [InlineKeyboardButton(text="🔎 Поиск", callback_data="apps_search")],
+    ])
+
+
+def filtered_applications(status="pending", query=""):
+    items = list(data.get("applications", {}).items())
+    if status != "all":
+        items = [(k, v) for k, v in items if v.get("status", "pending") == status]
+    q = query.strip().lower()
+    if q:
+        result = []
+        for app_id, app in items:
+            d = app.get("data", {})
+            hay = " ".join(str(d.get(x, "")) for x in ("nickname", "tag", "rank_fam", "organization", "inviter"))
+            if q in hay.lower() or q in str(app_id).lower():
+                result.append((app_id, app))
+        items = result
+    return items
+
+
+def apps_page_keyboard(status, page, pages):
+    rows = [
+        [InlineKeyboardButton(text="🟠", callback_data="apps_filter:pending"),
+         InlineKeyboardButton(text="🟢", callback_data="apps_filter:accepted"),
+         InlineKeyboardButton(text="🔴", callback_data="apps_filter:rejected"),
+         InlineKeyboardButton(text="📋", callback_data="apps_filter:all")],
+    ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"apps_page:{status}:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="apps_noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"apps_page:{status}:{page+1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔎 Поиск", callback_data="apps_search")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_apps_page(message, status="pending", page=0, query=""):
+    items = filtered_applications(status, query)
+    per = 1
+    pages = max(1, (len(items) + per - 1) // per)
+    page = max(0, min(page, pages - 1))
+    if not items:
+        text = "📭 Заявок в выбранной категории нет."
+        await message.answer(text, reply_markup=apps_menu_keyboard())
+        return
+    app_id, app = items[page]
+    total = len(items)
+    header = f"📋 <b>Управление заявками</b>\nКатегория: <b>{escape(status)}</b> | Найдено: <b>{total}</b>\n\n"
+    await message.answer(header + application_text(app, page + 1), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept:{app_id}"),
+         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{app_id}")],
+        *apps_page_keyboard(status, page, pages).inline_keyboard,
+    ]))
 
 
 @dp.message(F.text == "📋 Управление заявками")
@@ -1447,13 +1758,7 @@ async def all_apps(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌")
         return
-    if not data["applications"]:
-        await message.answer("📭 Заявок нет.")
-        return
-    for idx, (app_id, app) in enumerate(data["applications"].items(), 1):
-        status = app.get("status", "pending")
-        kb = application_keyboard(app_id) if status in {"pending", "accepted", "rejected"} else None
-        await message.answer(application_text(app, idx), reply_markup=kb)
+    await send_apps_page(message, "pending", 0)
 
 
 @dp.message(F.text == "⏳ Активные заявки")
@@ -1461,66 +1766,161 @@ async def active_apps(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌")
         return
-    pend = [(k, v) for k, v in data["applications"].items() if v.get("status") == "pending"]
-    if not pend:
-        await message.answer("📭 Нет активных.")
+    await send_apps_page(message, "pending", 0)
+
+
+@dp.callback_query(F.data.startswith("apps_filter:"))
+async def apps_filter_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("❌ Нет прав", show_alert=True); return
+    status = cb.data.split(":", 1)[1]
+    await send_apps_page(cb.message, status, 0)
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("apps_page:"))
+async def apps_page_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("❌ Нет прав", show_alert=True); return
+    _, status, page = cb.data.split(":")
+    await send_apps_page(cb.message, status, int(page))
+    await cb.answer()
+
+
+admin_search_mode = {}
+
+@dp.callback_query(F.data == "apps_search")
+async def apps_search_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("❌ Нет прав", show_alert=True); return
+    admin_search_mode[cb.from_user.id] = {"type": "apps"}
+    await cb.message.answer("🔎 Введите Nickname, @username или номер заявки для поиска:")
+    await cb.answer()
+
+
+# =========================================================
+# СПИСОК УЧАСТНИКОВ — единый стиль
+# =========================================================
+
+def participant_matches(uid, u, flt="all", query=""):
+    rank = str(u.get("rank_fam", ""))
+    org = str(u.get("organization", ""))
+    if flt == "org" and org in ("Не в организации", ""):
+        return False
+    if flt == "union" and rank != "Союз":
+        return False
+    if flt == "neutral" and rank != "Нейтраль":
+        return False
+    if flt == "noorg" and org != "Не в организации":
+        return False
+    if flt == "filled" and not u:
+        return False
+    q = query.strip().lower()
+    if q:
+        hay = " ".join(str(u.get(k, "")) for k in ("nickname", "tag", "rank_fam", "organization", "rank_org", "inviter")) + f" {uid}"
+        if q not in hay.lower():
+            return False
+    return True
+
+
+def participant_items(flt="all", query=""):
+    return [(uid, u) for uid, u in data.get("users", {}).items() if participant_matches(uid, u, flt, query)]
+
+
+def users_filter_keyboard(flt, page, pages):
+    rows = [
+        [InlineKeyboardButton(text="👥 Все", callback_data="users_filter:all"),
+         InlineKeyboardButton(text="🏢 Орг", callback_data="users_filter:org")],
+        [InlineKeyboardButton(text="🤝 Союз", callback_data="users_filter:union"),
+         InlineKeyboardButton(text="⚪ Нейтрал", callback_data="users_filter:neutral")],
+        [InlineKeyboardButton(text="🚫 Не в орг", callback_data="users_filter:noorg"),
+         InlineKeyboardButton(text="🔎 Поиск", callback_data="users_search")],
+    ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"users_page:{flt}:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="users_noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"users_page:{flt}:{page+1}"))
+    rows.append(nav)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_users_page(message, users=None, page=0, flt="all", query=""):
+    items = participant_items(flt, query) if users is None else users
+    per = 5
+    pages = max(1, (len(items) + per - 1) // per)
+    page = max(0, min(page, pages - 1))
+    if not items:
+        await message.answer("📭 Участников по этому фильтру нет.", reply_markup=users_filter_keyboard(flt, 0, 1))
         return
-    for idx, (app_id, app) in enumerate(pend, 1):
-        await message.answer(application_text(app, idx), reply_markup=application_keyboard(app_id))
+    start = page * per
+    chunk = items[start:start+per]
+    text = f"👥 <b>Список участников</b>\nФильтр: <b>{escape(flt)}</b> | Найдено: <b>{len(items)}</b>\n\n"
+    for n, (uid, u) in enumerate(chunk, start + 1):
+        text += (
+            f"<b>{n}. {escape(str(u.get('nickname', '—')))}</b>\n"
+            f"   📱 {escape(str(u.get('tag', uid)))}\n"
+            f"   🎖 {escape(str(u.get('rank_fam', '—')))} | 🏢 {escape(str(u.get('organization', '—')))}\n"
+            f"   👑 {escape(str(u.get('inviter', '—')))}\n\n"
+        )
+    await message.answer(text, reply_markup=users_filter_keyboard(flt, page, pages))
 
-
-# =========================================================
-# СПИСОК УЧАСТНИКОВ
-# =========================================================
 
 @dp.message(F.text == "👥 Список участников")
 async def list_users(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌")
         return
-    users = list(data["users"].items())
-    if not users:
-        await message.answer("📭 Нет анкет.")
-        return
-    await send_users_page(message, users, 0)
+    await send_users_page(message)
 
 
-async def send_users_page(message, users, page):
-    per = 5
-    total = len(users)
-    pages = max(1, (total + per - 1) // per)
-    if page < 0 or page >= pages:
-        return
-    start = page * per
-    end = min(start + per, total)
-    text = "👥 <b>Список участников</b>\n\n"
-    for i in range(start, end):
-        uid, u = users[i]
-        text += (
-            f"<b>{i + 1}.</b> {escape(u.get('nickname','—'))} — {escape(u.get('tag', uid))}\n"
-            f"   Ранг: {escape(u.get('rank_fam','—'))} | Орг: {escape(u.get('organization','—'))}\n"
-            f"   Пригласил: {escape(u.get('inviter','—'))}\n\n"
-        )
-    text += f"Стр. {page + 1} из {pages}"
-    rows = []
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"up_{page-1}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"up_{page+1}"))
-    if nav:
-        rows.append(nav)
-    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
-
-
-@dp.callback_query(F.data.startswith("up_"))
-async def up_cb(cb: CallbackQuery):
+@dp.callback_query(F.data.startswith("users_filter:"))
+async def users_filter_cb(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
-        await cb.answer("❌")
-        return
-    await send_users_page(cb.message, list(data["users"].items()), int(cb.data.split("_")[1]))
+        await cb.answer("❌ Нет прав", show_alert=True); return
+    flt = cb.data.split(":", 1)[1]
+    await send_users_page(cb.message, page=0, flt=flt)
     await cb.answer()
 
+
+@dp.callback_query(F.data.startswith("users_page:"))
+async def users_page_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("❌ Нет прав", show_alert=True); return
+    _, flt, page = cb.data.split(":")
+    await send_users_page(cb.message, page=int(page), flt=flt)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "users_search")
+async def users_search_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("❌ Нет прав", show_alert=True); return
+    admin_search_mode[cb.from_user.id] = {"type": "users"}
+    await cb.message.answer("🔎 Введите Nickname, @username или Telegram ID:")
+    await cb.answer()
+
+
+@dp.callback_query(F.data.in_({"apps_noop", "users_noop"}))
+async def pagination_noop(cb: CallbackQuery):
+    await cb.answer()
+
+
+@dp.message(lambda m: m.from_user.id in admin_search_mode and bool(m.text))
+async def admin_search_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    state = admin_search_mode.pop(message.from_user.id, None)
+    if not state:
+        return
+    query = message.text.strip()
+    if state["type"] == "apps":
+        await send_apps_page(message, "all", 0, query)
+    elif state["type"] == "users":
+        await send_users_page(message, page=0, flt="all", query=query)
+    elif state["type"] == "zams":
+        await send_zam_stats(message, 0, query)
 
 # =========================================================
 # СТАТУС
@@ -1531,65 +1931,149 @@ async def status_btn(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌")
         return
+
     total = len(data["users"])
-    pend = sum(1 for a in data["applications"].values() if a.get("status") == "pending")
-    rej = sum(1 for a in data["applications"].values() if a.get("status") == "rejected")
-    acc = sum(1 for a in data["applications"].values() if a.get("status") == "accepted")
-    admins = "\n".join(escape(get_admin_display(i)) for i in sorted(get_admins()))
-    await message.answer(
-        f"🟢 <b>Бот работает!</b>\n\n👥 Всего анкет: {total}\n📩 Ожидают: {pend}\n"
-        f"✅ Принято: {acc}\n❌ Отклонено: {rej}\n\n👑 <b>Админы:</b>\n{admins}"
+    pend = sum(
+        1
+        for a in data["applications"].values()
+        if a.get("status") == "pending"
     )
+    rej = sum(
+        1
+        for a in data["applications"].values()
+        if a.get("status") == "rejected"
+    )
+    acc = sum(
+        1
+        for a in data["applications"].values()
+        if a.get("status") == "accepted"
+    )
+
+    admins = "\n".join(
+        escape(get_admin_display(i))
+        for i in sorted(get_admins())
+    )
+
+    await message.answer(
+        f"🟢 <b>Бот работает!</b>\n\n"
+        f"👥 Всего анкет: {total}\n"
+        f"📩 Ожидают: {pend}\n"
+        f"✅ Принято: {acc}\n"
+        f"❌ Отклонено: {rej}\n\n"
+        f"👑 <b>Админы:</b>\n{admins}"
+    )
+
+
+# =========================================================
+# ПРОФИЛЬ
+# =========================================================
+
+@dp.message(F.text == "👤 Мой профиль")
+async def my_profile(message: Message):
+    uid = str(message.from_user.id)
+
+    if uid in data["users"]:
+        u = data["users"][uid]
+
+        await message.answer(
+            f"👤 <b>Профиль:</b>\n"
+            f"Nickname: {escape(u.get('nickname', '—'))}\n"
+            f"Тег: {escape(u.get('tag', '—'))}\n"
+            f"Ранг: {escape(u.get('rank_fam', '—'))}\n"
+            f"Орг: {escape(u.get('organization', '—'))}\n"
+            f"Ранг в орг: {escape(u.get('rank_org', '—'))}\n"
+            f"Пригласитель: {escape(u.get('inviter', '—'))}"
+        )
+    else:
+        await message.answer("ℹ️ Вы ещё не заполнили анкету.")
 
 
 # =========================================================
 # АДМИНКА
 # =========================================================
 
-async def assign_admin(user_id, username=None, full_name=None, by=None):
-    if user_id == SUPER_ADMIN:
-        return False, "Это владелец — права уже есть."
-    admins = get_admins()
-    if user_id in admins:
-        return False, "Этот пользователь уже администратор."
-    admins.add(user_id)
-    save_admins(admins)
-    data["admin_usernames"][str(user_id)] = {
-        "username": username,
-        "full_name": full_name or str(user_id),
-    }
-    if username:
-        data["pending_admin_usernames"].pop(normalize_username(username), None)
-    save_data()
-    await set_command_scopes()
-    if by:
-        await log_action(by, "добавил администратора", f"{full_name or ''} / @{username or ''}")
-    try:
-        await bot.send_message(user_id, "👑 Вы назначены администратором бота!\nИспользуйте /start для панели.")
-    except Exception:
-        pass
-    return True, "Администратор назначен."
-
-
-async def show_admin_selector(message, mode="add", page=0):
-    users = await get_owner_dialog_users()
-    if not users:
-        if not telegram_user_is_ready():
-            await message.answer(
-                "⚠️ Список личных диалогов пока недоступен.\n\n"
-                "Для этого нужны TG_API_ID, TG_API_HASH и TG_SESSION_STRING в Render.\n"
-                "Либо используй команду ответом на сообщение: <code>/add admin</code>."
-            )
-        else:
-            await message.answer("📭 В личных диалогах не найдено подходящих пользователей.")
+async def add_admin_by_username(message: Message, username: str):
+    username = username.strip().lstrip("@")
+    if not username:
+        await message.answer("❌ Укажи username: <code>/add_admin @username</code>")
         return
 
-    prefix = "select_admin" if mode == "add" else "select_remove_admin"
+    user_id = find_user_id_by_username(username)
+    if user_id is not None:
+        if user_id in get_admins():
+            await message.answer("❌ Этот пользователь уже администратор.")
+            return
+        admins = get_admins()
+        admins.add(user_id)
+        save_admins(admins)
+        try:
+            chat = await bot.get_chat(user_id)
+            data["admin_usernames"][str(user_id)] = {
+                "username": chat.username or username,
+                "full_name": chat.full_name or str(user_id),
+            }
+        except Exception:
+            data["admin_usernames"][str(user_id)] = {
+                "username": username,
+                "full_name": username,
+            }
+        save_data()
+        await set_command_scopes()
+        await log_action(message.from_user.id, "добавил администратора", f"@{username}")
+        await message.answer(f"✅ <b>@{escape(username)}</b> назначен администратором.")
+        try:
+            await bot.send_message(user_id, "👑 Вы назначены администратором!")
+        except Exception:
+            pass
+        return
+
+    pending = data.setdefault("pending_admin_usernames", {})
+    pending[normalize_username(username)] = {
+        "username": username,
+        "added_by": message.from_user.id,
+        "created": datetime.now().isoformat(),
+    }
+    save_data()
+    await log_action(message.from_user.id, "добавил администратора в ожидание", f"@{username}")
     await message.answer(
-        "👑 <b>Выбери пользователя</b>\n"
-        f"Действие: {'выдать админку' if mode == 'add' else 'забрать админку'}",
-        reply_markup=owner_dialog_page_keyboard(users, page, prefix=prefix),
+        f"⏳ <b>@{escape(username)}</b> добавлен в ожидание.\n\n"
+        "Telegram пока не дал боту его ID.\n"
+        "Как только этот пользователь напишет боту или сообщение от него будет замечено в группе,\n"
+        "бот автоматически привяжет его ID и выдаст права администратора."
     )
+
+
+async def remove_admin_by_username(message: Message, username: str):
+    username = username.strip().lstrip("@")
+    if not username:
+        await message.answer("❌ Укажи username: <code>/remove_admin @username</code>")
+        return
+
+    wanted = normalize_username(username)
+    data.setdefault("pending_admin_usernames", {}).pop(wanted, None)
+    user_id = find_user_id_by_username(username)
+    if user_id is None:
+        save_data()
+        await message.answer(f"ℹ️ @<b>{escape(username)}</b> не найден среди текущих админов.")
+        return
+
+    if user_id == SUPER_ADMIN:
+        await message.answer("❌ Владельца удалить нельзя.")
+        return
+
+    admins = get_admins()
+    if user_id not in admins:
+        await message.answer("❌ Этот пользователь не является администратором.")
+        return
+
+    admins.remove(user_id)
+    save_admins(admins)
+    display = get_admin_display(user_id)
+    data["admin_usernames"].pop(str(user_id), None)
+    save_data()
+    await set_command_scopes()
+    await log_action(message.from_user.id, "удалил администратора", display)
+    await message.answer(f"✅ Админ <b>{escape(display)}</b> удалён.")
 
 
 @dp.message(F.text == "🛠 Админка")
@@ -1599,230 +2083,14 @@ async def admin_panel(message: Message):
         return
     await message.answer(
         "👑 <b>Управление администраторами</b>\n\n"
-        "Можно выбрать человека из твоих личных Telegram-диалогов, даже если он никогда не пользовался ботом.",
-        reply_markup=admin_panel_keyboard(),
+        "<code>/add_admin @username</code> — добавить\n"
+        "<code>/remove_admin @username</code> — удалить\n\n"
+        "Также работают:\n"
+        "<code>/add admin @username</code>\n"
+        "<code>/remove admin @username</code>\n\n"
+        "Если Telegram ещё не сообщает ID пользователя, бот поставит его в ожидание и "
+        "автоматически выдаст админку при первом замеченном сообщении этого пользователя."
     )
-
-
-@dp.callback_query(F.data == "adm:add")
-async def adm_add_cb(cb: CallbackQuery):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("❌ Только владелец!", show_alert=True)
-        return
-    await cb.answer()
-    await show_admin_selector(cb.message, "add")
-
-
-@dp.callback_query(F.data == "adm:remove")
-async def adm_remove_cb(cb: CallbackQuery):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("❌ Только владелец!", show_alert=True)
-        return
-    admins = []
-    for uid in sorted(get_admins()):
-        if uid == SUPER_ADMIN:
-            continue
-        info = data["admin_usernames"].get(str(uid), {})
-        admins.append({"id": uid, "name": info.get("full_name", str(uid)), "username": info.get("username")})
-    if not admins:
-        await cb.answer("Админов для удаления нет.", show_alert=True)
-        return
-    await cb.answer()
-    await cb.message.answer(
-        "➖ <b>Выбери админа:</b>",
-        reply_markup=owner_dialog_page_keyboard(admins, 0, prefix="remove_known_admin"),
-    )
-
-
-@dp.callback_query(F.data == "adm:list")
-async def adm_list_cb(cb: CallbackQuery):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("❌ Только владелец!", show_alert=True)
-        return
-    text = "👑 <b>Админы</b>\n\n"
-    for i, uid in enumerate(sorted(get_admins()), 1):
-        text += f"{i}. {escape(get_admin_display(uid))} — <code>{uid}</code>\n"
-    await cb.message.answer(text)
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("select_admin_page:"))
-async def select_admin_page_cb(cb: CallbackQuery):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("❌", show_alert=True)
-        return
-    page = int(cb.data.split(":", 1)[1])
-    users = await get_owner_dialog_users()
-    await cb.message.edit_reply_markup(reply_markup=owner_dialog_page_keyboard(users, page, prefix="select_admin"))
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("select_admin:"))
-async def select_admin_cb(cb: CallbackQuery):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("❌", show_alert=True)
-        return
-    uid = int(cb.data.split(":", 1)[1])
-    users = await get_owner_dialog_users()
-    selected = next((x for x in users if x["id"] == uid), None)
-    if not selected:
-        await cb.answer("Пользователь не найден.", show_alert=True)
-        return
-    ok, result = await assign_admin(uid, selected.get("username"), selected.get("name"), cb.from_user.id)
-    await cb.answer("✅ Готово" if ok else result, show_alert=not ok)
-    await cb.message.answer(("✅ " if ok else "❌ ") + escape(result))
-
-
-@dp.callback_query(F.data.startswith("select_remove_admin_page:"))
-async def select_remove_admin_page_cb(cb: CallbackQuery):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("❌", show_alert=True)
-        return
-    page = int(cb.data.split(":", 1)[1])
-    users = await get_owner_dialog_users()
-    await cb.message.edit_reply_markup(reply_markup=owner_dialog_page_keyboard(users, page, prefix="select_remove_admin"))
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("select_remove_admin:"))
-async def select_remove_admin_cb(cb: CallbackQuery):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("❌", show_alert=True)
-        return
-    uid = int(cb.data.split(":", 1)[1])
-    if uid == SUPER_ADMIN:
-        await cb.answer("Владельца удалить нельзя.", show_alert=True)
-        return
-    if uid not in get_admins():
-        await cb.answer("Уже не админ.", show_alert=True)
-        return
-    display = get_admin_display(uid)
-    admins = get_admins()
-    admins.remove(uid)
-    save_admins(admins)
-    data["admin_usernames"].pop(str(uid), None)
-    save_data()
-    await set_command_scopes()
-    await log_action(cb.from_user.id, "удалил администратора", display)
-    await cb.answer("✅ Удалён")
-    await cb.message.answer(f"✅ Админ <b>{escape(display)}</b> удалён.")
-
-
-@dp.callback_query(F.data == "owner_select_cancel")
-async def owner_select_cancel(cb: CallbackQuery):
-    await cb.answer("Отменено")
-    try:
-        await cb.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-
-@dp.message(Command("add"))
-async def add_command(message: Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("❌ Только владелец!")
-        return
-    args = message.text.split(maxsplit=2)
-    if len(args) < 2:
-        await message.answer("❌ Использование: <code>/add admin</code> или <code>/add zam @username Game_Nick</code>")
-        return
-    mode = args[1].lower()
-    if mode == "admin":
-        if message.reply_to_message and message.reply_to_message.from_user:
-            u = message.reply_to_message.from_user
-            ok, result = await assign_admin(u.id, u.username, u.full_name, message.from_user.id)
-            await message.answer(("✅ " if ok else "❌ ") + escape(result))
-            return
-        if len(args) == 2:
-            await show_admin_selector(message, "add")
-            return
-        value = args[2].strip()
-        if value.isdigit():
-            uid = int(value)
-            ok, result = await assign_admin(uid, None, str(uid), message.from_user.id)
-            await message.answer(("✅ " if ok else "❌ ") + escape(result))
-            return
-        uid = find_user_id_by_username(value)
-        if uid:
-            ok, result = await assign_admin(uid, value.lstrip("@"), value, message.from_user.id)
-            await message.answer(("✅ " if ok else "❌ ") + escape(result))
-            return
-        pending = data["pending_admin_usernames"]
-        pending[normalize_username(value)] = {"username": value.lstrip("@"), "added_by": message.from_user.id, "created": now_iso()}
-        save_data()
-        await message.answer(
-            f"⏳ <b>@{escape(value.lstrip('@'))}</b> добавлен в ожидание.\n"
-            "Если пользователь напишет боту или его сообщение попадёт боту, ID будет привязан автоматически."
-        )
-        return
-    if mode == "zam":
-        if len(args) < 3:
-            await message.answer("❌ <code>/add zam @username Game_Nick</code>")
-            return
-        parts = args[2].split(maxsplit=1)
-        if len(parts) < 2:
-            await message.answer("❌ <code>/add zam @username Game_Nick</code>")
-            return
-        await add_zam_by_username(message, parts[0], parts[1])
-        return
-    await message.answer("❌ Доступно: <code>admin</code> или <code>zam</code>.")
-
-
-@dp.message(Command("remove"))
-async def remove_command(message: Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("❌ Только владелец!")
-        return
-    args = message.text.split(maxsplit=2)
-    if len(args) < 2:
-        await message.answer("❌ <code>/remove admin</code> или <code>/remove zam Game_Nick</code>")
-        return
-    mode = args[1].lower()
-    if mode == "admin":
-        if message.reply_to_message and message.reply_to_message.from_user:
-            uid = message.reply_to_message.from_user.id
-            if uid == SUPER_ADMIN:
-                await message.answer("❌ Владельца удалить нельзя.")
-                return
-            if uid not in get_admins():
-                await message.answer("❌ Это не админ.")
-                return
-            display = get_admin_display(uid)
-            admins = get_admins(); admins.remove(uid); save_admins(admins)
-            data["admin_usernames"].pop(str(uid), None); save_data(); await set_command_scopes()
-            await message.answer(f"✅ Админ <b>{escape(display)}</b> удалён.")
-            return
-        if len(args) == 2:
-            await show_admin_selector(message, "remove")
-            return
-        value = args[2].strip()
-        uid = int(value) if value.isdigit() else find_user_id_by_username(value)
-        if uid is None:
-            await message.answer("❌ Админ не найден.")
-            return
-        if uid == SUPER_ADMIN:
-            await message.answer("❌ Владельца удалить нельзя.")
-            return
-        if uid not in get_admins():
-            await message.answer("❌ Это не админ.")
-            return
-        display = get_admin_display(uid)
-        admins = get_admins(); admins.remove(uid); save_admins(admins)
-        data["admin_usernames"].pop(str(uid), None); save_data(); await set_command_scopes()
-        await message.answer(f"✅ Админ <b>{escape(display)}</b> удалён.")
-        return
-    if mode == "zam":
-        if len(args) < 3:
-            await message.answer("❌ <code>/remove zam Game_Nick</code>")
-            return
-        nick = args[2].strip()
-        if remove_zam_nick(nick):
-            await log_action(message.from_user.id, "удалил зама", nick)
-            await message.answer(f"✅ Зам <b>{escape(nick)}</b> удалён.")
-        else:
-            await message.answer("❌ Такой зам не найден.")
-        return
-    await message.answer("❌ Доступно: <code>admin</code> или <code>zam</code>.")
 
 
 @dp.message(Command("add_admin"))
@@ -1830,50 +2098,83 @@ async def add_admin_legacy(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только владелец!")
         return
-    args = message.text.split(maxsplit=1)
-    if len(args) == 1 and message.reply_to_message and message.reply_to_message.from_user:
+
+    # Самый надёжный вариант: ответить на сообщение человека командой /add_admin.
+    if message.reply_to_message and message.reply_to_message.from_user:
         u = message.reply_to_message.from_user
-        ok, result = await assign_admin(u.id, u.username, u.full_name, message.from_user.id)
-        await message.answer(("✅ " if ok else "❌ ") + escape(result))
-        return
-    if len(args) == 1:
-        await show_admin_selector(message, "add")
-        return
-    value = args[1].strip()
-    uid = int(value) if value.isdigit() else find_user_id_by_username(value)
-    if uid:
-        ok, result = await assign_admin(uid, value.lstrip("@"), value, message.from_user.id)
-        await message.answer(("✅ " if ok else "❌ ") + escape(result))
-    else:
-        data["pending_admin_usernames"][normalize_username(value)] = {"username": value.lstrip("@"), "added_by": message.from_user.id, "created": now_iso()}
+        user_id = u.id
+        if user_id == SUPER_ADMIN:
+            await message.answer("ℹ️ Это владелец — права уже есть.")
+            return
+        admins = get_admins()
+        if user_id in admins:
+            await message.answer("❌ Этот пользователь уже администратор.")
+            return
+        admins.add(user_id)
+        save_admins(admins)
+        data.setdefault("admin_usernames", {})[str(user_id)] = {
+            "username": u.username,
+            "full_name": u.full_name or str(user_id),
+        }
+        data.setdefault("pending_admin_usernames", {}).pop(
+            normalize_username(u.username), None
+        ) if u.username else None
         save_data()
-        await message.answer(f"⏳ @{escape(value.lstrip('@'))} добавлен в ожидание.")
-
-
-@dp.message(Command("remove_admin"))
-async def remove_admin_legacy(message: Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("❌ Только владелец!")
+        await set_command_scopes()
+        await log_action(message.from_user.id, "добавил администратора", f"{u.full_name} / @{u.username}" if u.username else u.full_name)
+        display = f"@{u.username}" if u.username else (u.full_name or str(user_id))
+        await message.answer(f"✅ <b>{escape(display)}</b> назначен администратором.\n🆔 ID: <code>{user_id}</code>")
+        try:
+            await bot.send_message(user_id, "👑 Вы назначены администратором бота!\nИспользуйте /start для панели.")
+        except Exception:
+            pass
         return
+
     args = message.text.split(maxsplit=1)
     if len(args) == 1:
-        await show_admin_selector(message, "remove")
+        await message.answer(
+            "❌ Используй один из вариантов:\n\n"
+            "1) Ответь на сообщение человека: <code>/add_admin</code>\n"
+            "2) <code>/add_admin @username</code>\n"
+            "3) <code>/add_admin 123456789</code>"
+        )
         return
+
     value = args[1].strip()
-    uid = int(value) if value.isdigit() else find_user_id_by_username(value)
-    if uid is None:
-        await message.answer("❌ Админ не найден.")
+    if value.isdigit():
+        user_id = int(value)
+        if user_id == SUPER_ADMIN:
+            await message.answer("ℹ️ Это владелец — права уже есть.")
+            return
+        if user_id in get_admins():
+            await message.answer("❌ Этот пользователь уже администратор.")
+            return
+        # ID достаточно для выдачи внутренних прав бота.
+        admins = get_admins()
+        admins.add(user_id)
+        save_admins(admins)
+        try:
+            chat = await bot.get_chat(user_id)
+            username = chat.username
+            full_name = chat.full_name
+        except Exception:
+            username = None
+            full_name = str(user_id)
+        data.setdefault("admin_usernames", {})[str(user_id)] = {
+            "username": username,
+            "full_name": full_name or str(user_id),
+        }
+        save_data()
+        await set_command_scopes()
+        await log_action(message.from_user.id, "добавил администратора", str(user_id))
+        await message.answer(f"✅ Администратор выдан.\n🆔 ID: <code>{user_id}</code>")
+        try:
+            await bot.send_message(user_id, "👑 Вы назначены администратором бота!\nИспользуйте /start для панели.")
+        except Exception:
+            pass
         return
-    if uid == SUPER_ADMIN:
-        await message.answer("❌ Владельца удалить нельзя.")
-        return
-    if uid not in get_admins():
-        await message.answer("❌ Это не админ.")
-        return
-    display = get_admin_display(uid)
-    admins = get_admins(); admins.remove(uid); save_admins(admins)
-    data["admin_usernames"].pop(str(uid), None); save_data(); await set_command_scopes()
-    await message.answer(f"✅ Админ <b>{escape(display)}</b> удалён.")
+
+    await add_admin_by_username(message, value)
 
 
 @dp.message(Command("pending_admins"))
@@ -1885,51 +2186,164 @@ async def pending_admins_command(message: Message):
     if not pending:
         await message.answer("📭 Ожидающих админов нет.")
         return
-    text = "⏳ <b>Ожидают привязки:</b>\n\n" + "\n".join(f"• @{escape(v.get('username', k))}" for k, v in pending.items())
+    text = "⏳ <b>Ожидают привязки:</b>\n\n"
+    for key, item in pending.items():
+        text += f"• @{escape(item.get('username', key))}\n"
     await message.answer(text)
 
 
+@dp.message(Command("remove_admin"))
+async def remove_admin_legacy(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец!")
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) > 1:
+        await remove_admin_by_username(message, args[1])
+    elif message.reply_to_message and message.reply_to_message.from_user:
+        u = message.reply_to_message.from_user
+        if u.username:
+            await remove_admin_by_username(message, u.username)
+        else:
+            await message.answer(f"❌ У пользователя нет username. Его ID: <code>{u.id}</code>")
+    else:
+        await message.answer("❌ Использование: <code>/remove_admin @username</code>")
+
+
+@dp.message(Command("add"))
+async def add_command(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец!")
+        return
+    args = message.text.split(maxsplit=2)
+    if len(args) < 2:
+        await message.answer(
+            "❌ Использование:\n"
+            "<code>/add admin @username</code>\n"
+            "или ответом на сообщение: <code>/add admin</code>\n"
+            "или <code>/add admin 123456789</code>\n"
+            "<code>/add zam @username Game_Nick</code>"
+        )
+        return
+    mode = args[1].lower()
+    if mode == "admin":
+        if message.reply_to_message and message.reply_to_message.from_user:
+            u = message.reply_to_message.from_user
+            admins = get_admins()
+            if u.id == SUPER_ADMIN:
+                await message.answer("ℹ️ Это владелец — права уже есть.")
+                return
+            if u.id in admins:
+                await message.answer("❌ Этот пользователь уже администратор.")
+                return
+            admins.add(u.id)
+            save_admins(admins)
+            data.setdefault("admin_usernames", {})[str(u.id)] = {"username": u.username, "full_name": u.full_name or str(u.id)}
+            save_data()
+            await set_command_scopes()
+            display = f"@{u.username}" if u.username else (u.full_name or str(u.id))
+            await log_action(message.from_user.id, "добавил администратора", display)
+            await message.answer(f"✅ <b>{escape(display)}</b> назначен администратором.\n🆔 ID: <code>{u.id}</code>")
+            return
+        if len(args) < 3:
+            await message.answer("❌ Укажи @username/ID или ответь на сообщение пользователя.")
+            return
+        value = args[2].strip()
+        if value.isdigit():
+            # Повторно используем основной обработчик через синтетический вызов не нужен.
+            uid = int(value)
+            if uid in get_admins():
+                await message.answer("❌ Уже администратор.")
+                return
+            admins = get_admins(); admins.add(uid); save_admins(admins)
+            data.setdefault("admin_usernames", {})[str(uid)] = {"username": None, "full_name": str(uid)}
+            save_data(); await set_command_scopes()
+            await log_action(message.from_user.id, "добавил администратора", str(uid))
+            await message.answer(f"✅ Администратор выдан. ID: <code>{uid}</code>")
+            return
+        await add_admin_by_username(message, value)
+    elif mode == "zam":
+        if len(args) < 3:
+            await message.answer("❌ <code>/add zam @username Game_Nick</code>")
+            return
+        parts = args[2].split(maxsplit=1)
+        if len(parts) < 2:
+            await message.answer("❌ <code>/add zam @username Game_Nick</code>")
+            return
+        await add_zam_by_username(message, parts[0], parts[1])
+    else:
+        await message.answer("❌ Доступно: <code>admin</code> или <code>zam</code>.")
+
+
+@dp.message(Command("remove"))
+async def remove_command(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец!")
+        return
+    args = message.text.split(maxsplit=2)
+    if len(args) < 2:
+        await message.answer("❌ <code>/remove admin @username</code> или <code>/remove zam Game_Nick</code>")
+        return
+    mode = args[1].lower()
+    if mode == "admin":
+        if message.reply_to_message and message.reply_to_message.from_user:
+            await remove_admin_by_username(message, str(message.reply_to_message.from_user.id))
+        elif len(args) >= 3:
+            await remove_admin_by_username(message, args[2])
+        else:
+            await message.answer("❌ Укажи @username/ID или ответь на сообщение админа.")
+    elif mode == "zam":
+        if len(args) < 3:
+            await message.answer("❌ <code>/remove zam Game_Nick</code>")
+            return
+        nick = args[2].strip()
+        if remove_zam_nick(nick):
+            await log_action(message.from_user.id, "удалил зама", nick)
+            await message.answer(f"✅ Зам <b>{escape(nick)}</b> удалён.")
+        else:
+            await message.answer("❌ Такой зам не найден.")
+    else:
+        await message.answer("❌ Доступно: <code>admin</code> или <code>zam</code>.")
+
+
 # =========================================================
-# ЗАМЫ — БЕЗ БАНКА ЗАМОВ
+# УПРАВЛЕНИЕ ЗАМАМИ
 # =========================================================
+
 
 @dp.message(F.text == "👑 Замы")
 async def zams_button(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только владелец!")
         return
-    await send_zams_table(message)
+    await send_zams_panel(message)
 
 
-async def send_zams_table(message):
-    zams = get_all_zam_counts()
-    if not zams:
-        await message.answer("👑 <b>Замы</b>\n\n📭 Замов нет.")
-        return
-    text = "👑 <b>Замы</b>\n\n"
-    text += "<pre>№  Nickname              @username        Пригласил</pre>"
-    for i, (nick, count) in enumerate(zams, 1):
-        info = data["zam_data"].get(nick, {})
-        username = info.get("tg_username")
-        nick_s = nick[:18]
-        user_s = ("@" + username)[:15] if username else "—"
-        text += f"<pre>{i:<3}{nick_s:<20}{user_s:<17}{count}</pre>"
-    text += "\n📌 Количество приглашений считается автоматически по заполненным анкетам."
-    text += "\n\n➕ <code>/add zam @username Game_Nick</code>\n➖ <code>/remove zam Game_Nick</code>"
-    await message.answer(text)
+async def send_zams_panel(message: Message):
+    await send_zam_stats(message)
 
 
 async def add_zam_by_username(message: Message, username: str, game_nick: str):
     username = username.strip().lstrip("@")
     game_nick = game_nick.strip()
     if not username or not game_nick:
-        await message.answer("❌ Использование: <code>/add zam @username Game_Nick</code>")
+        await message.answer("❌ Использование: <code>/add_zam @username Game_Nick</code>")
         return
+
     user_id = find_user_id_by_username(username)
-    ok, result = add_zam_nick(game_nick, user_id, username)
+    tg_username = username
+    if user_id is not None:
+        try:
+            chat = await bot.get_chat(user_id)
+            tg_username = chat.username or username
+        except Exception:
+            pass
+
+    ok, result = add_zam_nick(game_nick, user_id, tg_username)
     if not ok:
         await message.answer(f"❌ {escape(result)}")
         return
+
     await log_action(message.from_user.id, "добавил зама", f"{game_nick} / @{username}")
     if user_id:
         try:
@@ -1938,9 +2352,26 @@ async def add_zam_by_username(message: Message, username: str, game_nick: str):
             pass
     await message.answer(
         f"✅ Зам <b>{escape(game_nick)}</b> назначен.\n"
-        f"Telegram: @{escape(username)}" +
-        (f"\nID: <code>{user_id}</code>" if user_id else "\n⏳ ID пока не найден.")
+        f"Telegram: @{escape(username)}" + (f"\nID: <code>{user_id}</code>" if user_id else "\n⏳ ID пока не найден, но Telegram username сохранён.")
     )
+
+
+@dp.callback_query(F.data == "zam:add")
+async def zam_add_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌ Только владелец!", show_alert=True)
+        return
+    await cb.message.answer("➕ Используй: <code>/add_zam @username Game_Nick</code>")
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "zam:remove")
+async def zam_remove_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌ Только владелец!", show_alert=True)
+        return
+    await cb.message.answer("➖ Используй: <code>/remove_zam Game_Nick</code>")
+    await cb.answer()
 
 
 @dp.message(Command("add_zam"))
@@ -1973,7 +2404,100 @@ async def remove_zam_command(message: Message):
 
 
 # =========================================================
-# ЛОГИ / УВЕДОМЛЕНИЯ / BACKUP
+# ЗАМЫ — единый стиль: страницы, поиск и фильтр
+# =========================================================
+
+def zam_items(query=""):
+    q = query.strip().lower()
+    items = []
+    for nick in get_zam_nicknames():
+        info = data.get("zam_data", {}).get(nick, {})
+        tg = info.get("tg_username") or ""
+        hay = f"{nick} {tg}".lower()
+        if q and q not in hay:
+            continue
+        items.append((nick, info, count_zam_answers(nick)))
+    items.sort(key=lambda x: (-x[2], x[0].lower()))
+    return items
+
+
+def zams_keyboard(page, pages):
+    rows = [[InlineKeyboardButton(text="🔎 Поиск", callback_data="zams_search")]]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"zams_page:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="zams_noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"zams_page:{page+1}"))
+    rows.append(nav)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_zam_stats(message: Message, page=0, query=""):
+    items = zam_items(query)
+    per = 8
+    pages = max(1, (len(items) + per - 1) // per)
+    page = max(0, min(page, pages - 1))
+    if not items:
+        await message.answer("📭 Замов по этому запросу нет.", reply_markup=zams_keyboard(0, 1))
+        return
+    chunk = items[page*per:(page+1)*per]
+    text = f"👑 <b>Список замов</b>\nНайдено: <b>{len(items)}</b>\n\n"
+    text += "<b>№ | Nickname | @username | Приглашений</b>\n"
+    for i, (nick, info, count) in enumerate(chunk, page*per + 1):
+        username = info.get("tg_username")
+        username = f"@{username}" if username else "—"
+        text += f"<b>{i}</b> | {escape(nick)} | {escape(username)} | <b>{count}</b>\n"
+    await message.answer(text, reply_markup=zams_keyboard(page, pages))
+
+
+@dp.callback_query(F.data == "zam:stats")
+async def zam_stats_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌ Только владелец!", show_alert=True)
+        return
+    await send_zam_stats(cb.message)
+    await cb.answer()
+
+
+@dp.message(Command("zam_stats"))
+async def zam_stats_cmd(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец!")
+        return
+    await send_zam_stats(message)
+
+
+@dp.callback_query(F.data.startswith("zams_page:"))
+async def zams_page_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌ Только владелец!", show_alert=True); return
+    await send_zam_stats(cb.message, int(cb.data.split(":")[1]))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "zams_search")
+async def zams_search_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌ Только владелец!", show_alert=True); return
+    admin_search_mode[cb.from_user.id] = {"type": "zams"}
+    await cb.message.answer("🔎 Введите Nickname или @username зама:")
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "zams_noop")
+async def zams_noop_cb(cb: CallbackQuery):
+    await cb.answer()
+
+# =========================================================
+# ВЫВОД
+# =========================================================
+
+# Старый вывод из банка замов отключён. Исторические поля в data.json сохраняются для совместимости.
+
+
+# =========================================================
+# ЛОГИ
 # =========================================================
 
 @dp.message(Command("logs"))
@@ -1981,29 +2505,63 @@ async def logs_cmd(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только владелец!")
         return
+
     lines = load_logs()
+
     if not lines:
         await message.answer("📭 Пусто.")
         return
+
     await send_logs_page(message, lines, 0)
 
 
 async def send_logs_page(message, lines, page):
     per = 10
-    pages = max(1, (len(lines) + per - 1) // per)
+    total = len(lines)
+    pages = max(1, (total + per - 1) // per)
+
     if page < 0 or page >= pages:
         return
+
     start = page * per
-    text = f"📋 <b>Журнал ({page+1}/{pages})</b>\n\n" + "".join(lines[start:start+per])
+    end = min(page * per + per, total)
+
+    text = (
+        f"📋 <b>Журнал (стр. {page + 1}/{pages})</b>\n\n"
+        + "".join(lines[start:end])
+    )
+
+    if len(text) > 4000:
+        text = text[:3900] + "\n... (обрезано)"
+
     rows = []
-    nav = []
+
     if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"lp_{page-1}"))
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="⬅️",
+                    callback_data=f"lp_{page - 1}",
+                )
+            ]
+        )
+
     if page < pages - 1:
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"lp_{page+1}"))
-    if nav:
-        rows.append(nav)
-    await message.answer(text[:4000], reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="➡️",
+                    callback_data=f"lp_{page + 1}",
+                )
+            ]
+        )
+
+    await message.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=rows
+        ) if rows else None,
+    )
 
 
 @dp.callback_query(F.data.startswith("lp_"))
@@ -2011,7 +2569,14 @@ async def lp_cb(cb: CallbackQuery):
     if not is_super_admin(cb.from_user.id):
         await cb.answer("❌")
         return
-    await send_logs_page(cb.message, load_logs(), int(cb.data.split("_")[1]))
+
+    lines = load_logs()
+
+    await send_logs_page(
+        cb.message,
+        lines,
+        int(cb.data.split("_")[1]),
+    )
     await cb.answer()
 
 
@@ -2025,18 +2590,26 @@ async def clear_logs(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только владелец!")
         return
+
     save_logs([])
+
     await message.answer("✅ Логи очищены.")
 
+
+# =========================================================
+# УВЕДОМЛЕНИЯ
+# =========================================================
 
 @dp.message(Command("log_on"))
 async def log_on(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только владелец!")
         return
+
     data["log_notify_enabled"] = True
     save_data()
-    await message.answer("✅ Уведомления о действиях включены.")
+
+    await message.answer("✅ Уведомления включены.")
 
 
 @dp.message(Command("log_off"))
@@ -2044,45 +2617,41 @@ async def log_off(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только владелец!")
         return
+
     data["log_notify_enabled"] = False
     save_data()
-    await message.answer("❌ Уведомления о действиях выключены.")
+
+    await message.answer("❌ Уведомления выключены.")
 
 
-@dp.message(Command("backup"))
-async def backup_cmd(message: Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("❌ Только владелец!")
-        return
-    ok, path = create_backup("manual")
-    await message.answer(
-        ("✅ Резервная копия создана." if ok else "⚠️ Резервная копия создана частично.") +
-        f"\n📁 <code>{escape(path)}</code>"
-    )
-
+# =========================================================
+# СТАТУС БАЗЫ
+# =========================================================
 
 @dp.message(Command("db_status"))
 async def db_status_cmd(message: Message):
     if not is_super_admin(message.from_user.id):
         await message.answer("❌ Только владелец!")
         return
+
     if DATABASE_URL and psycopg2 is not None and _db_init():
         saved = _db_get("data")
         logs = _db_get("logs")
         await message.answer(
-            "✅ <b>PostgreSQL подключён</b>\n\n"
-            f"👥 Пользователей: <b>{len(saved.get('users', {})) if isinstance(saved, dict) else len(data['users'])}</b>\n"
-            f"📋 Заявок: <b>{len(saved.get('applications', {})) if isinstance(saved, dict) else len(data['applications'])}</b>\n"
-            f"👑 Замов: <b>{len(saved.get('zam_data', {})) if isinstance(saved, dict) else len(data['zam_data'])}</b>\n"
-            f"📜 Логов: <b>{len(logs) if isinstance(logs, list) else 0}</b>\n"
-            f"💾 Последний backup: <b>{escape(str(data.get('last_backup_at') or 'ещё не создавался'))}</b>"
+            "✅ <b>Постоянная база подключена</b>\n\n"
+            f"👥 Пользователей: <b>{len(saved.get('users', {})) if isinstance(saved, dict) else len(data.get('users', {}))}</b>\n"
+            f"📋 Заявок: <b>{len(saved.get('applications', {})) if isinstance(saved, dict) else len(data.get('applications', {}))}</b>\n"
+            f"📜 Логов: <b>{len(logs) if isinstance(logs, list) else 0}</b>"
         )
     else:
-        await message.answer("⚠️ PostgreSQL не подключён.")
+        await message.answer(
+            "⚠️ <b>PostgreSQL не подключён.</b>\n\n"
+            "Добавь DATABASE_URL в Render, иначе локальная база может исчезнуть после redeploy/restart."
+        )
 
 
 # =========================================================
-# PING / HELP
+# ПИНГ
 # =========================================================
 
 @dp.message(Command("ping"))
@@ -2090,56 +2659,251 @@ async def ping(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌ Только админы!")
         return
+
     start = datetime.now()
+
     m = await message.answer("🏓 ...")
-    ms = (datetime.now() - start).total_seconds() * 1000
+
+    d = (datetime.now() - start).total_seconds() * 1000
     up = datetime.now() - BOT_START_TIME
-    h, rem = divmod(up.seconds, 3600)
+
+    days = up.days
+    sec = up.seconds
+
+    h, rem = divmod(sec, 3600)
     mn, sc = divmod(rem, 60)
-    await m.edit_text(f"🏓 Понг! {ms:.1f} мс\n⏱ Аптайм: {up.days}д {h}ч {mn}м {sc}с")
+
+    await m.edit_text(
+        f"🏓 Понг! {d:.1f} мс\n"
+        f"⏱ Аптайм: {days}д {h}ч {mn}м {sc}с"
+    )
 
 
 @dp.message(Command("myid"))
 async def myid_cmd(message: Message):
-    await message.answer(f"🆔 Твой Telegram ID: <code>{message.from_user.id}</code>")
+    await message.answer(
+        f"🆔 Твой Telegram ID: <code>{message.from_user.id}</code>\n\n"
+        "Для владельца этот ID должен быть указан в переменной <code>SUPER_ADMIN_ID</code>."
+    )
 
 
-@dp.message(Command("admins"))
-async def admins_cmd(message: Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("❌ Только владелец!")
-        return
-    text = "👑 <b>Админы</b>\n\n"
-    for i, uid in enumerate(sorted(get_admins()), 1):
-        text += f"{i}. {escape(get_admin_display(uid))} — <code>{uid}</code>\n"
-    await message.answer(text)
-
+# =========================================================
+# HELP
+# =========================================================
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
     if is_super_admin(message.from_user.id):
         text = (
-            "📋 <b>Команды владельца</b>\n\n"
-            "/start — меню\n/help — справка\n/ping — пинг\n/all текст — объявление\n"
-            "/кто — информация об участнике\n/поиск — поиск участника\n/history — история анкеты\n"
-            "/add admin — выбрать админа из личных диалогов\n/remove admin — убрать админа\n"
-            "/add zam @username Game_Nick — добавить зама\n/remove zam Game_Nick — убрать зама\n"
-            "/admins — список админов\n/logs — журнал\n/backup — резервная копия\n/db_status — статус БД\n"
-            "/log_on /log_off — уведомления о действиях\n/sbor — общий сбор\n/stopsbor — остановить сбор\n/topic_id — ID темы"
+            "📋 <b>Команды владельца:</b>\n\n"
+            "/start — меню\n"
+            "/help — справка\n"
+            "/ping — пинг\n"
+            "/all — объявление\n"
+            "/add admin — выдать админа\n"
+            "/add zam — добавить зама\n"
+            "/remove admin — удалить админа\n"
+            "/remove zam — удалить зама\n"
+            "/add_zam — добавить зама\n"
+            "/remove_zam — удалить зама\n"
+            "/admins — список админов\n"
+            "/zam_stats — статистика замов\n"
+            "/logs — журнал\n"
+            "/clearlogs — очистить журнал\n"
+            "/log_on — уведомления вкл\n"
+            "/log_off — уведомления выкл\n"
+            "/topic_id — ID темы\n"
+            "/sbor — общий сбор\n"
+            "/stopsbor — остановить сбор\n"
+            "/set_token — смена токена\n"
         )
     elif is_admin(message.from_user.id):
         text = (
-            "📋 <b>Команды администратора</b>\n\n"
-            "/start\n/help\n/ping\n/all текст\n/кто\n/поиск\n/history\n/topic_id\n/sbor\n/stopsbor"
+            "📋 <b>Команды администратора:</b>\n\n"
+            "/start — меню\n"
+            "/help — справка\n"
+            "/ping — пинг\n"
+            "/all — объявление\n"
+            "/кто — информация об участнике\n"
+            "/topic_id — ID темы\n"
+            "/sbor — общий сбор\n"
+            "/stopsbor — остановить сбор\n"
         )
     else:
-        text = "📋 <b>Команды</b>\n\n/start — меню\n/help — справка"
+        text = (
+            "📋 <b>Команды:</b>\n\n"
+            "/start — меню\n"
+            "/help — справка\n"
+        )
+
     await message.answer(text)
 
 
 # =========================================================
 # ОБЩИЙ СБОР
 # =========================================================
+
+GATHER_DURATION_SECONDS = 90
+GATHER_INTERVAL_SECONDS = 20
+GATHER_CHUNK_SIZE = 25
+
+
+def _is_known_group_member(user_id):
+    uid = str(user_id)
+    if uid in data.get("group_members", {}):
+        return True
+
+    # Пользователи с заполненной анкетой считаются кандидатами для созыва
+    # только после того, как бот видел их в группе. Это не даёт тегать людей,
+    # которых мог уже не быть в чате.
+    return False
+
+
+async def get_gather_members():
+    """
+    Получает АКТУАЛЬНЫЙ полный список участников группы через
+    пользовательскую Telegram-сессию Telethon.
+
+    Bot API не умеет выдавать полный список участников супергруппы,
+    поэтому для команды «общий сбор» используется именно user-session.
+    Если Telethon не подключен, используем сохранённых участников как
+    безопасный fallback и явно сообщаем об этом в логи.
+    """
+    members = []
+
+    if telegram_user_is_ready():
+        try:
+            entity = None
+
+            # Сначала пытаемся найти группу среди диалогов пользовательской сессии.
+            async for dialog in telegram_user_client.iter_dialogs():
+                try:
+                    peer_id = utils.get_peer_id(dialog.entity)
+                    if peer_id == GROUP_ID:
+                        entity = dialog.entity
+                        break
+                except Exception:
+                    continue
+
+            # Если в диалогах не нашли — пробуем получить сущность напрямую.
+            if entity is None:
+                try:
+                    entity = await telegram_user_client.get_entity(GROUP_ID)
+                except Exception:
+                    entity = None
+
+            if entity is not None:
+                seen = set()
+
+                async for user in telegram_user_client.iter_participants(entity):
+                    try:
+                        user_id = int(user.id)
+                    except (TypeError, ValueError):
+                        continue
+
+                    if user_id in seen:
+                        continue
+                    seen.add(user_id)
+
+                    if getattr(user, "bot", False):
+                        continue
+                    if getattr(user, "deleted", False):
+                        continue
+
+                    first = getattr(user, "first_name", None) or ""
+                    last = getattr(user, "last_name", None) or ""
+                    full_name = f"{first} {last}".strip()
+                    username = getattr(user, "username", None)
+
+                    if not full_name:
+                        full_name = username or str(user_id)
+
+                    member = {
+                        "id": user_id,
+                        "name": full_name,
+                        "username": username,
+                    }
+                    members.append(member)
+
+                    # Обновляем локальный кэш тоже: тогда /список участников
+                    # и другие функции знают актуальных людей.
+                    data.setdefault("group_members", {})[str(user_id)] = {
+                        "id": user_id,
+                        "username": username,
+                        "full_name": full_name,
+                        "last_seen": datetime.now().isoformat(),
+                    }
+
+                save_data()
+                print(f"✅ Общий сбор: Telethon получил {len(members)} участников группы.")
+                return members
+
+            print("⚠️ Telethon подключен, но группа не найдена в пользовательской сессии.")
+
+        except Exception as e:
+            print(f"⚠️ Не удалось получить полный список участников через Telethon: {e}")
+
+    # Fallback — только ранее известных боту участников.
+    # Это не является полным списком, поэтому без user-session полный созыв
+    # сделать технически невозможно.
+    for uid, info in data.get("group_members", {}).items():
+        try:
+            user_id = int(uid)
+        except (TypeError, ValueError):
+            continue
+
+        full_name = (
+            info.get("full_name")
+            or info.get("username")
+            or str(user_id)
+        ).strip()
+
+        members.append({
+            "id": user_id,
+            "name": full_name,
+            "username": info.get("username"),
+        })
+
+    # Дополнительно подтягиваем принятых участников из анкет — если Bot API
+    # может подтвердить, что конкретный пользователь сейчас в группе.
+    known_ids = {m["id"] for m in members}
+    for app in data.get("applications", {}).values():
+        if app.get("status") != "accepted":
+            continue
+        try:
+            user_id = int(app.get("user_id"))
+        except (TypeError, ValueError):
+            continue
+        if user_id in known_ids:
+            continue
+
+        try:
+            member = await bot.get_chat_member(GROUP_ID, user_id)
+            status = getattr(member, "status", "")
+            is_member = status in {"member", "administrator", "creator"}
+            if status == "restricted":
+                is_member = bool(getattr(member, "is_member", False))
+            if not is_member:
+                continue
+
+            user = getattr(member, "user", None)
+            if not user or user.is_bot:
+                continue
+
+            members.append({
+                "id": user.id,
+                "name": user.full_name or user.username or str(user.id),
+                "username": user.username or None,
+            })
+            known_ids.add(user.id)
+        except Exception:
+            continue
+
+    unique = {}
+    for member in members:
+        unique[member["id"]] = member
+
+    return list(unique.values())
 
 def mention_html(member):
     name = member.get("name") or member.get("username") or str(member["id"])
@@ -2148,74 +2912,57 @@ def mention_html(member):
 
 def chunk_mentions(members, size=GATHER_CHUNK_SIZE):
     for i in range(0, len(members), size):
-        yield members[i:i+size]
-
-
-async def get_gather_members():
-    members = []
-    if telegram_user_is_ready():
-        try:
-            entity = None
-            async for dialog in telegram_user_client.iter_dialogs():
-                try:
-                    if utils.get_peer_id(dialog.entity) == GROUP_ID:
-                        entity = dialog.entity
-                        break
-                except Exception:
-                    pass
-            if entity is None:
-                try:
-                    entity = await telegram_user_client.get_entity(GROUP_ID)
-                except Exception:
-                    entity = None
-            if entity is not None:
-                async for user in telegram_user_client.iter_participants(entity):
-                    if getattr(user, "bot", False) or getattr(user, "deleted", False):
-                        continue
-                    name = f"{getattr(user,'first_name',None) or ''} {getattr(user,'last_name',None) or ''}".strip()
-                    username = getattr(user, "username", None)
-                    members.append({"id": int(user.id), "name": name or username or str(user.id), "username": username})
-                # Обновляем кэш, не удаляя старых людей.
-                for member in members:
-                    data["group_members"][str(member["id"])] = {
-                        "id": member["id"], "username": member.get("username"),
-                        "full_name": member.get("name"), "last_seen": now_iso()
-                    }
-                save_data()
-                return members
-        except Exception as e:
-            print(f"⚠️ Telethon общий сбор: {e}")
-
-    # Без Telethon используем только тех, кого бот уже видел.
-    for uid, info in data.get("group_members", {}).items():
-        iid = safe_int(uid)
-        if iid:
-            members.append({"id": iid, "name": info.get("full_name") or info.get("username") or uid, "username": info.get("username")})
-    return list({m["id"]: m for m in members}.values())
+        yield members[i:i + size]
 
 
 async def send_gather_wave(members, wave_no, total_waves):
-    if not members:
+    header = (
+        f"📢 <b>ОБЩИЙ СБОР</b>\n\n"
+        f"Созыв: <b>{wave_no}/{total_waves}</b>\n"
+        f"⏱️ Необходимо собраться всем участникам.\n\n"
+    )
+
+    chunks = list(chunk_mentions(members))
+    if not chunks:
         return False
-    for index, chunk in enumerate(chunk_mentions(members)):
-        header = f"📢 <b>ОБЩИЙ СБОР</b>\nСозыв: <b>{wave_no}/{total_waves}</b>\n\n" if index == 0 else "📢 <b>ОБЩИЙ СБОР — продолжение</b>\n\n"
+
+    for index, chunk in enumerate(chunks):
+        body = " ".join(mention_html(member) for member in chunk)
+        text = header if index == 0 else "📢 <b>ОБЩИЙ СБОР — продолжение</b>\n\n"
+        text += body
+
         try:
-            await bot.send_message(GROUP_ID, header + " ".join(mention_html(m) for m in chunk))
+            await bot.send_message(
+                GROUP_ID,
+                text,
+            )
         except Exception as e:
             print(f"⚠️ Ошибка общего сбора: {e}")
+
     return True
 
 
 async def run_gather():
     try:
+        members = await get_gather_members()
+        if not members:
+            print("⚠️ Общий сбор: нет известных участников для упоминания.")
+            return
+
         total_waves = (GATHER_DURATION_SECONDS // GATHER_INTERVAL_SECONDS) + 1
+
         for wave in range(total_waves):
+            # Заново собираем список перед каждой волной: новые люди, написавшие
+            # в чат во время сбора, автоматически попадут в следующую волну.
             members = await get_gather_members()
             if not members:
                 break
+
             await send_gather_wave(members, wave + 1, total_waves)
+
             if wave < total_waves - 1:
                 await asyncio.sleep(GATHER_INTERVAL_SECONDS)
+
     finally:
         gather_tasks.pop(GROUP_ID, None)
 
@@ -2225,15 +2972,27 @@ async def gather_command(message: Message):
     if message.chat.id != GROUP_ID:
         await message.answer("❌ Команду «сбор» нужно запускать в группе.")
         return
+
     if not is_admin(message.from_user.id):
-        await message.answer("❌ Только админы!")
+        await message.answer("❌ Только админы могут объявлять общий сбор!")
         return
+
     current = gather_tasks.get(GROUP_ID)
     if current and not current.done():
-        await message.answer("📢 <b>Общий сбор уже идёт.</b>")
+        await message.answer(
+            "📢 <b>Общий сбор уже идёт.</b>\n"
+            "Участники продолжают получать призывы в течение ближайшей минуты."
+        )
         return
-    gather_tasks[GROUP_ID] = asyncio.create_task(run_gather())
-    await message.answer("🚨 <b>ОБЩИЙ СБОР ЗАПУЩЕН!</b>")
+
+    task = asyncio.create_task(run_gather())
+    gather_tasks[GROUP_ID] = task
+
+    await message.answer(
+        "🚨 <b>ОБЩИЙ СБОР ЗАПУЩЕН!</b>\n\n"
+        "Всех известных боту участников начну повторно призывать каждые "
+        f"{GATHER_INTERVAL_SECONDS} сек. в течение {GATHER_DURATION_SECONDS} сек."
+    )
 
 
 @dp.message(Command("stopsbor"))
@@ -2241,67 +3000,130 @@ async def stop_gather_command(message: Message):
     if message.chat.id != GROUP_ID:
         await message.answer("❌ Команду нужно запускать в группе.")
         return
+
     if not is_admin(message.from_user.id):
         await message.answer("❌ Только админы!")
         return
+
     task = gather_tasks.get(GROUP_ID)
     if not task or task.done():
         await message.answer("ℹ️ Сейчас общий сбор не идёт.")
         return
+
     task.cancel()
     gather_tasks.pop(GROUP_ID, None)
     await message.answer("🛑 <b>Общий сбор остановлен.</b>")
 
 
+# Команда без слеша: «общий сбор» или «Общий сбор».
 @dp.message(F.chat.id == GROUP_ID, F.text.func(lambda text: bool(text and text.strip().lower() == "общий сбор")))
 async def gather_phrase(message: Message):
     await gather_command(message)
 
 
 # =========================================================
-# ЗАЩИТА ТЕМЫ / ALL / TOPIC
+# ЗАЩИТА ТЕМЫ НОВОСТИ
 # =========================================================
 
 @dp.message(F.chat.id == GROUP_ID)
 async def protect_topic(message: Message):
-    if message.message_thread_id == ANNOUNCE_TOPIC_ID and not is_admin(message.from_user.id):
-        try:
-            await message.delete()
-            await bot.send_message(
-                GROUP_ID,
-                f"❌ {escape(message.from_user.full_name)}, только админы могут писать здесь!",
-                reply_to_message_id=message.message_id,
-            )
-        except Exception:
-            pass
+    if message.message_thread_id == ANNOUNCE_TOPIC_ID:
+        if not is_admin(message.from_user.id):
+            try:
+                await message.delete()
 
+                await bot.send_message(
+                    GROUP_ID,
+                    f"❌ {escape(message.from_user.full_name)}, "
+                    f"только админы могут писать здесь!",
+                    reply_to_message_id=message.message_id,
+                )
+            except Exception:
+                pass
+
+
+# =========================================================
+# /ALL
+# =========================================================
 
 @dp.message(Command("all"))
 async def all_cmd(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("❌ Только админы!")
         return
+
     args = message.text.split(maxsplit=1)
+
     if len(args) < 2:
-        await message.answer("❌ Использование: <code>/all текст</code>")
+        await message.answer("❌ Использование: <code>/all</code> <code>текст</code>")
         return
+
     try:
-        await bot.send_message(GROUP_ID, f"⚠️ <b>ВАЖНОЕ ОБЪЯВЛЕНИЕ</b>\n\n{escape(args[1])}\n\n@all", message_thread_id=ANNOUNCE_TOPIC_ID)
+        await bot.send_message(
+            GROUP_ID,
+            f"⚠️ <b>ВАЖНОЕ ОБЪЯВЛЕНИЕ</b>\n\n"
+            f"{escape(args[1])}\n\n"
+            f"@all",
+            message_thread_id=ANNOUNCE_TOPIC_ID,
+        )
+
         await message.answer("✅ Отправлено.")
+
     except Exception as e:
         await message.answer(f"❌ {escape(str(e))}")
 
 
+# =========================================================
+# /TOPIC_ID
+# =========================================================
+
 @dp.message(Command("topic_id"))
 async def topic_id(message: Message):
     if message.chat.id == GROUP_ID and message.message_thread_id:
-        await message.answer(f"ID: {message.message_thread_id}")
+        await message.answer(
+            f"ID: {message.message_thread_id}"
+        )
     else:
         await message.answer("❌ Не в теме.")
 
 
 # =========================================================
-# TELEGRAM COMMAND SCOPES
+# /ADMINS
+# =========================================================
+
+@dp.message(Command("admins"))
+async def admins_cmd(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец!")
+        return
+
+    text = "👑 <b>Админы</b>\n\n"
+
+    for i in sorted(get_admins()):
+        text += f"• {escape(get_admin_display(i))}\n"
+
+    await message.answer(text)
+
+
+# =========================================================
+# /SET_TOKEN
+# =========================================================
+
+@dp.message(Command("set_token"))
+async def set_token(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец!")
+        return
+
+    await message.answer(
+        "🔐 Смена токена отключена в этой версии.\n"
+        "Токен должен храниться только в Render → Environment → BOT_TOKEN.\n\n"
+        "После изменения BOT_TOKEN в Render перезапусти сервис."
+    )
+
+
+# =========================================================
+# КОМАНДЫ TELEGRAM ПО РОЛЯМ
 # =========================================================
 
 DEFAULT_COMMANDS = [
@@ -2310,12 +3132,12 @@ DEFAULT_COMMANDS = [
     BotCommand(command="myid", description="🆔 Мой Telegram ID"),
 ]
 
-ADMIN_COMMANDS = DEFAULT_COMMANDS + [
+ADMIN_COMMANDS = [
+    BotCommand(command="start", description="🏠 Меню"),
+    BotCommand(command="help", description="📖 Справка"),
     BotCommand(command="ping", description="📡 Пинг"),
     BotCommand(command="all", description="📢 Объявление"),
     BotCommand(command="кто", description="👤 Информация об участнике"),
-    BotCommand(command="поиск", description="🔎 Поиск участника"),
-    BotCommand(command="history", description="📜 История анкеты"),
     BotCommand(command="topic_id", description="🆔 ID темы"),
     BotCommand(command="sbor", description="📢 Общий сбор"),
     BotCommand(command="stopsbor", description="🛑 Остановить сбор"),
@@ -2324,32 +3146,48 @@ ADMIN_COMMANDS = DEFAULT_COMMANDS + [
 OWNER_COMMANDS = ADMIN_COMMANDS + [
     BotCommand(command="add", description="➕ Выдать админа/зама"),
     BotCommand(command="remove", description="➖ Убрать админа/зама"),
-    BotCommand(command="add_admin", description="➕ Админ"),
-    BotCommand(command="remove_admin", description="➖ Админ"),
+    BotCommand(command="add_admin", description="➕ Админ (алиас)"),
+    BotCommand(command="remove_admin", description="➖ Админ (алиас)"),
     BotCommand(command="pending_admins", description="⏳ Ожидающие админы"),
+    BotCommand(command="db_status", description="🗄️ Статус базы"),
     BotCommand(command="add_zam", description="👤 Добавить зама"),
     BotCommand(command="remove_zam", description="❌ Удалить зама"),
     BotCommand(command="admins", description="👑 Админы"),
+    BotCommand(command="zam_stats", description="📊 Статистика замов"),
     BotCommand(command="logs", description="📜 Журнал"),
     BotCommand(command="clearlogs", description="🧹 Очистить журнал"),
-    BotCommand(command="log_on", description="🔔 Уведомления вкл"),
-    BotCommand(command="log_off", description="🔕 Уведомления выкл"),
-    BotCommand(command="backup", description="💾 Резервная копия"),
-    BotCommand(command="db_status", description="🗄️ Статус базы"),
+    BotCommand(command="log_on", description="🔔 Логи вкл"),
+    BotCommand(command="log_off", description="🔕 Логи выкл"),
+    BotCommand(command="set_token", description="🔑 Информация о токене"),
 ]
 
 
 async def set_command_scopes():
-    await bot.set_my_commands(DEFAULT_COMMANDS, scope=BotCommandScopeDefault())
+    # Обычным игрокам — только базовые команды.
+    await bot.set_my_commands(
+        DEFAULT_COMMANDS,
+        scope=BotCommandScopeDefault(),
+    )
+
+    # Админам — админские команды.
     for admin_id in get_admins():
         if admin_id == SUPER_ADMIN:
             continue
+
         try:
-            await bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id))
+            await bot.set_my_commands(
+                ADMIN_COMMANDS,
+                scope=BotCommandScopeChat(chat_id=admin_id),
+            )
         except Exception:
             pass
+
+    # Владельцу — полный набор.
     try:
-        await bot.set_my_commands(OWNER_COMMANDS, scope=BotCommandScopeChat(chat_id=SUPER_ADMIN))
+        await bot.set_my_commands(
+            OWNER_COMMANDS,
+            scope=BotCommandScopeChat(chat_id=SUPER_ADMIN),
+        )
     except Exception:
         pass
 
@@ -2360,26 +3198,35 @@ async def set_command_scopes():
 
 async def main():
     print("🤖 Бот запускается...")
+
     if not DATABASE_URL:
-        raise RuntimeError("❌ DATABASE_URL не задан. Бот намеренно не запускается без постоянной базы.")
+        raise RuntimeError(
+            "❌ DATABASE_URL не задан. Добавь URL Supabase в Render Environment. "
+            "Бот намеренно не запускается без постоянной базы, чтобы не потерять данные."
+        )
+
     if not _db_init():
-        raise RuntimeError("❌ Не удалось подключиться к PostgreSQL. Проверь DATABASE_URL.")
+        raise RuntimeError(
+            "❌ Не удалось подключиться к постоянной PostgreSQL базе. "
+            "Проверь DATABASE_URL в Render Environment."
+        )
+
+    print("✅ Постоянная база PostgreSQL подключена. Локальный data.json больше не является источником истины.")
 
     await init_telegram_user_client()
     await init_admins()
     await set_command_scopes()
+
     await bot.delete_webhook(drop_pending_updates=True)
 
     print("🤖 Бот запущен!")
     print("📌 Основная группа:", GROUP_LINK)
-    print("📌 Постоянная база PostgreSQL подключена.")
-    print("📌 Уведомления о входе/выходе настроены на владельца:", SUPER_ADMIN)
 
-    allowed_updates = dp.resolve_used_update_types()
-    if "chat_member" not in allowed_updates:
-        allowed_updates.append("chat_member")
-    await dp.start_polling(bot, allowed_updates=allowed_updates)
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("🛑 Бот остановлен.")
