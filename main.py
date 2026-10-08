@@ -596,13 +596,47 @@ def load_data():
     }
 
 
-def save_data():
-    # Локальный файл оставляем как аварийную копию.
-    _write_local_json(DATA_FILE, data)
+_db_save_task = None
+_db_save_pending = False
 
-    # Основное постоянное хранилище.
+async def _flush_db_save():
+    global _db_save_task, _db_save_pending
+    try:
+        while _db_save_pending:
+            _db_save_pending = False
+            await asyncio.sleep(0.25)
+            snapshot = json.loads(json.dumps(data, ensure_ascii=False))
+            if DATABASE_URL and psycopg2 is not None:
+                await asyncio.to_thread(_db_set, "data", snapshot)
+    except Exception as e:
+        print(f"⚠️ Ошибка фонового сохранения PostgreSQL: {e}")
+    finally:
+        _db_save_task = None
+
+def save_data():
+    """Быстро сохраняет локальную копию, а PostgreSQL обновляет в фоне.
+    Это убирает задержки на каждом нажатии кнопки/записи журнала.
+    """
+    global _db_save_task, _db_save_pending
+    _write_local_json(DATA_FILE, data)
+    if not (DATABASE_URL and psycopg2 is not None):
+        return
+    _db_save_pending = True
+    try:
+        loop = asyncio.get_running_loop()
+        if _db_save_task is None or _db_save_task.done():
+            _db_save_task = loop.create_task(_flush_db_save())
+    except RuntimeError:
+        # Вне event loop (например, при старте/миграции) сохраняем сразу.
+        _db_set("data", json.loads(json.dumps(data, ensure_ascii=False)))
+
+async def save_data_now():
+    """Принудительно дождаться записи текущего состояния в PostgreSQL."""
+    global _db_save_pending
+    _db_save_pending = False
     if DATABASE_URL and psycopg2 is not None:
-        _db_set("data", data)
+        snapshot = json.loads(json.dumps(data, ensure_ascii=False))
+        await asyncio.to_thread(_db_set, "data", snapshot)
 
 
 def load_logs():
@@ -1156,12 +1190,6 @@ def zams_panel_keyboard():
                     callback_data="zam:remove",
                 ),
             ],
-            [
-                InlineKeyboardButton(
-                    text="📊 Статистика",
-                    callback_data="zam:stats",
-                ),
-            ],
         ]
     )
 
@@ -1690,46 +1718,74 @@ async def accept_app(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("❌ Нет прав!", show_alert=True)
         return
-
     app_id = cb.data.split(":", 1)[1]
-    ok, text = await change_application_verdict(
-        app_id,
-        "accepted",
-        cb.from_user.id,
-    )
-    await cb.answer("✅ Принят" if ok else text, show_alert=not ok)
-    if ok:
-        try:
-            await cb.message.edit_text(
-                application_text(data["applications"][app_id], None),
-                reply_markup=application_keyboard(app_id),
-            )
-        except Exception:
-            pass
-
+    app = data.get("applications", {}).get(app_id)
+    if not app:
+        await cb.answer("❌ Заявка не найдена.", show_alert=True)
+        return
+    if app.get("status") != "pending":
+        await cb.answer("ℹ️ Заявка уже обработана.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, принять", callback_data=f"accept_confirm:{app_id}")],
+        [InlineKeyboardButton(text="↩️ Отмена", callback_data=f"app_back:{app_id}")],
+    ])
+    await cb.message.edit_reply_markup(reply_markup=kb)
+    await cb.answer("Подтвердите принятие")
 
 @dp.callback_query(F.data.startswith("reject:"))
 async def reject_app(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("❌ Нет прав!", show_alert=True)
         return
-
     app_id = cb.data.split(":", 1)[1]
-    ok, text = await change_application_verdict(
-        app_id,
-        "rejected",
-        cb.from_user.id,
-    )
-    await cb.answer("❌ Отклонён" if ok else text, show_alert=not ok)
-    if ok:
-        try:
-            await cb.message.edit_text(
-                application_text(data["applications"][app_id], None),
-                reply_markup=application_keyboard(app_id),
-            )
-        except Exception:
-            pass
+    app = data.get("applications", {}).get(app_id)
+    if not app:
+        await cb.answer("❌ Заявка не найдена.", show_alert=True)
+        return
+    if app.get("status") != "pending":
+        await cb.answer("ℹ️ Заявка уже обработана.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Да, отклонить", callback_data=f"reject_confirm:{app_id}")],
+        [InlineKeyboardButton(text="↩️ Отмена", callback_data=f"app_back:{app_id}")],
+    ])
+    await cb.message.edit_reply_markup(reply_markup=kb)
+    await cb.answer("Подтвердите отклонение")
 
+@dp.callback_query(F.data.startswith("app_back:"))
+async def app_back_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("❌ Нет прав!", show_alert=True)
+        return
+    app_id = cb.data.split(":", 1)[1]
+    if app_id not in data.get("applications", {}):
+        await cb.answer("❌ Заявка не найдена.", show_alert=True)
+        return
+    await cb.message.edit_reply_markup(reply_markup=application_keyboard(app_id))
+    await cb.answer("Отменено")
+
+@dp.callback_query(F.data.startswith("accept_confirm:"))
+async def accept_confirm_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("❌ Нет прав!", show_alert=True)
+        return
+    app_id = cb.data.split(":", 1)[1]
+    ok, text = await change_application_verdict(app_id, "accepted", cb.from_user.id)
+    await cb.answer("✅ Принято" if ok else text, show_alert=not ok)
+    if ok:
+        await cb.message.edit_reply_markup(reply_markup=application_keyboard(app_id))
+
+@dp.callback_query(F.data.startswith("reject_confirm:"))
+async def reject_confirm_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("❌ Нет прав!", show_alert=True)
+        return
+    app_id = cb.data.split(":", 1)[1]
+    ok, text = await change_application_verdict(app_id, "rejected", cb.from_user.id)
+    await cb.answer("❌ Отклонено" if ok else text, show_alert=not ok)
+    if ok:
+        await cb.message.edit_reply_markup(reply_markup=application_keyboard(app_id))
 
 def application_keyboard(app_id):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1846,8 +1902,8 @@ async def apps_filter_cb(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("❌ Нет прав", show_alert=True); return
     status = cb.data.split(":", 1)[1]
-    await send_apps_page(cb.message, status, 0)
     await cb.answer()
+    await send_apps_page(cb.message, status, 0)
 
 
 @dp.callback_query(F.data.startswith("apps_page:"))
@@ -1855,8 +1911,8 @@ async def apps_page_cb(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("❌ Нет прав", show_alert=True); return
     _, status, page = cb.data.split(":")
-    await send_apps_page(cb.message, status, int(page))
     await cb.answer()
+    await send_apps_page(cb.message, status, int(page))
 
 
 admin_search_mode = {}
@@ -1955,8 +2011,8 @@ async def users_filter_cb(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("❌ Нет прав", show_alert=True); return
     flt = cb.data.split(":", 1)[1]
-    await send_users_page(cb.message, page=0, flt=flt)
     await cb.answer()
+    await send_users_page(cb.message, page=0, flt=flt)
 
 
 @dp.callback_query(F.data.startswith("users_page:"))
@@ -1964,8 +2020,8 @@ async def users_page_cb(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("❌ Нет прав", show_alert=True); return
     _, flt, page = cb.data.split(":")
-    await send_users_page(cb.message, page=int(page), flt=flt)
     await cb.answer()
+    await send_users_page(cb.message, page=int(page), flt=flt)
 
 
 @dp.callback_query(F.data == "users_search")
@@ -2340,6 +2396,163 @@ async def admin_panel(message: Message):
     )
 
 
+# Быстрый кэш диалогов владельца: не обращаемся к Telethon при каждом открытии.
+owner_dialog_cache = {"time": 0.0, "users": []}
+
+async def cached_owner_dialog_users():
+    now = asyncio.get_running_loop().time()
+    if owner_dialog_cache["users"] and now - owner_dialog_cache["time"] < 60:
+        return owner_dialog_cache["users"]
+    users = await get_owner_dialog_users(limit=100)
+    owner_dialog_cache["time"] = now
+    owner_dialog_cache["users"] = users
+    return users
+
+@dp.callback_query(F.data == "adm:add")
+async def admin_add_button_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌ Только владелец!", show_alert=True)
+        return
+    await cb.answer()
+    users = await cached_owner_dialog_users()
+    if not users:
+        await cb.message.answer(
+            "📭 Не удалось получить список личных диалогов.\n\n"
+            "Проверь TG_API_ID, TG_API_HASH и TG_SESSION_STRING в Render."
+        )
+        return
+    admins = get_admins()
+    users = [u for u in users if int(u["id"]) not in admins and int(u["id"]) != SUPER_ADMIN]
+    if not users:
+        await cb.message.answer("📭 В доступных диалогах нет пользователей без админки.")
+        return
+    await cb.message.answer(
+        "👑 <b>Выберите пользователя для выдачи админки</b>",
+        reply_markup=owner_dialog_page_keyboard(users, 0, prefix="select_admin")
+    )
+
+@dp.callback_query(F.data.startswith("select_admin_page:"))
+async def select_admin_page_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌", show_alert=True); return
+    users = await cached_owner_dialog_users()
+    page = int(cb.data.split(":", 1)[1])
+    await cb.answer()
+    await cb.message.edit_reply_markup(reply_markup=owner_dialog_page_keyboard(users, page, prefix="select_admin"))
+
+@dp.callback_query(F.data.startswith("select_admin:"))
+async def select_admin_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌", show_alert=True); return
+    uid = int(cb.data.split(":", 1)[1])
+    users = await cached_owner_dialog_users()
+    user = next((u for u in users if int(u["id"]) == uid), None)
+    if not user:
+        await cb.answer("❌ Пользователь не найден", show_alert=True); return
+    label = owner_dialog_short_label(user)
+    await cb.message.edit_text(
+        f"⚠️ Выдать админку пользователю:\n\n👤 <b>{escape(label)}</b>\n🆔 <code>{uid}</code>?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, выдать", callback_data=f"admin_grant_confirm:{uid}")],
+            [InlineKeyboardButton(text="↩️ Отмена", callback_data="owner_select_cancel")],
+        ])
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("admin_grant_confirm:"))
+async def admin_grant_confirm_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌", show_alert=True); return
+    uid = int(cb.data.split(":", 1)[1])
+    admins = get_admins()
+    if uid in admins:
+        await cb.answer("ℹ️ Уже администратор", show_alert=True); return
+    admins.add(uid)
+    save_admins(admins)
+    users = await cached_owner_dialog_users()
+    user = next((u for u in users if int(u["id"]) == uid), None)
+    if user:
+        data.setdefault("admin_usernames", {})[str(uid)] = {
+            "username": user.get("username"),
+            "full_name": user.get("name") or str(uid),
+        }
+    save_data()
+    await set_command_scopes()
+    display = owner_dialog_short_label(user) if user else str(uid)
+    audit_record(cb.from_user.id, "admins", "выдал админку", f"{display} / ID {uid}")
+    await cb.message.edit_text(f"✅ <b>Админка выдана</b>\n\n👤 {escape(display)}\n🆔 <code>{uid}</code>")
+    await cb.answer("Готово")
+    try:
+        await bot.send_message(uid, "👑 Вы назначены администратором бота!\nИспользуйте /start для панели.")
+    except Exception:
+        pass
+
+@dp.callback_query(F.data == "adm:remove")
+async def admin_remove_button_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌ Только владелец!", show_alert=True); return
+    rows=[]
+    for uid in sorted(get_admins()):
+        if uid == SUPER_ADMIN: continue
+        rows.append([InlineKeyboardButton(text=f"🛡 {get_admin_display(uid)[:35]}", callback_data=f"admin_remove_confirm:{uid}")])
+    rows.append([InlineKeyboardButton(text="↩️ Назад", callback_data="adm:list")])
+    await cb.answer()
+    await cb.message.edit_text("➖ <b>Выберите администратора для удаления:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows or [[InlineKeyboardButton(text="📭 Удалять некого", callback_data="adm:list")]]))
+
+@dp.callback_query(F.data.startswith("admin_remove_confirm:"))
+async def admin_remove_confirm_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌", show_alert=True); return
+    uid = int(cb.data.split(":", 1)[1])
+    if uid == SUPER_ADMIN:
+        await cb.answer("❌ Владельца удалить нельзя", show_alert=True); return
+    await cb.message.edit_text(
+        f"⚠️ Удалить админку у <b>{escape(get_admin_display(uid))}</b>?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Да, удалить", callback_data=f"admin_remove_do:{uid}")],
+            [InlineKeyboardButton(text="↩️ Отмена", callback_data="adm:list")],
+        ])
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("admin_remove_do:"))
+async def admin_remove_do_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌", show_alert=True); return
+    uid = int(cb.data.split(":", 1)[1])
+    if uid == SUPER_ADMIN:
+        await cb.answer("❌ Владельца удалить нельзя", show_alert=True); return
+    admins = get_admins()
+    if uid not in admins:
+        await cb.answer("ℹ️ Уже удалён", show_alert=True); return
+    display = get_admin_display(uid)
+    admins.remove(uid)
+    save_admins(admins)
+    data.setdefault("admin_usernames", {}).pop(str(uid), None)
+    save_data()
+    await set_command_scopes()
+    audit_record(cb.from_user.id, "admins", "снял админку", f"{display} / ID {uid}")
+    await cb.message.edit_text(f"✅ Админка снята с <b>{escape(display)}</b>.")
+    await cb.answer("Готово")
+
+@dp.callback_query(F.data == "adm:list")
+async def admin_list_button_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌", show_alert=True); return
+    text="👑 <b>Администраторы</b>\n\n"
+    for uid in sorted(get_admins()):
+        mark="👑" if uid == SUPER_ADMIN else "🛡"
+        text += f"{mark} {escape(get_admin_display(uid))}\n🆔 <code>{uid}</code>\n\n"
+    await cb.answer()
+    await cb.message.edit_text(text, reply_markup=admin_panel_keyboard())
+
+@dp.callback_query(F.data == "owner_select_cancel")
+async def owner_select_cancel_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌", show_alert=True); return
+    await cb.message.edit_text("❌ Выбор отменён.", reply_markup=admin_panel_keyboard())
+    await cb.answer()
+
 @dp.message(Command("add_admin"))
 async def add_admin_legacy(message: Message):
     if not is_super_admin(message.from_user.id):
@@ -2701,29 +2914,12 @@ async def send_zam_stats(message: Message, page=0, query=""):
     await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows+base))
 
 
-@dp.callback_query(F.data == "zam:stats")
-async def zam_stats_cb(cb: CallbackQuery):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("❌ Только владелец!", show_alert=True)
-        return
-    await send_zam_stats(cb.message)
-    await cb.answer()
-
-
-@dp.message(Command("zam_stats"))
-async def zam_stats_cmd(message: Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("❌ Только владелец!")
-        return
-    await send_zam_stats(message)
-
-
 @dp.callback_query(F.data.startswith("zams_page:"))
 async def zams_page_cb(cb: CallbackQuery):
     if not is_super_admin(cb.from_user.id):
         await cb.answer("❌ Только владелец!", show_alert=True); return
-    await send_zam_stats(cb.message, int(cb.data.split(":")[1]))
     await cb.answer()
+    await send_zam_stats(cb.message, int(cb.data.split(":")[1]))
 
 
 @dp.callback_query(F.data == "zams_search")
@@ -2882,12 +3078,12 @@ async def logs_btn(message: Message):
 @dp.callback_query(F.data.startswith("audit_cat:"))
 async def audit_cat_cb(cb: CallbackQuery):
     if not is_super_admin(cb.from_user.id): await cb.answer("❌",show_alert=True); return
-    cat=cb.data.split(":",1)[1]; await send_audit_page(cb.message,cat,0); await cb.answer()
+    cat=cb.data.split(":",1)[1]; await cb.answer(); await send_audit_page(cb.message,cat,0)
 
 @dp.callback_query(F.data.startswith("audit_page:"))
 async def audit_page_cb(cb: CallbackQuery):
     if not is_super_admin(cb.from_user.id): await cb.answer("❌",show_alert=True); return
-    _,cat,page=cb.data.split(":"); await send_audit_page(cb.message,cat,int(page)); await cb.answer()
+    _,cat,page=cb.data.split(":"); await cb.answer(); await send_audit_page(cb.message,cat,int(page))
 
 @dp.callback_query(F.data=="audit_noop")
 async def audit_noop_cb(cb: CallbackQuery): await cb.answer()
