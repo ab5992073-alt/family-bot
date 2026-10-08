@@ -599,44 +599,45 @@ def load_data():
 _db_save_task = None
 _db_save_pending = False
 
+def _persist_snapshot(snapshot):
+    """Тяжёлая запись выполняется вне event loop, чтобы Telegram не ждал диск/БД."""
+    _write_local_json(DATA_FILE, snapshot)
+    if DATABASE_URL and psycopg2 is not None:
+        _db_set("data", snapshot)
+
 async def _flush_db_save():
     global _db_save_task, _db_save_pending
     try:
         while _db_save_pending:
             _db_save_pending = False
-            await asyncio.sleep(0.25)
+            # Небольшой debounce: несколько кликов/аудит-событий объединяются в одну запись.
+            await asyncio.sleep(0.15)
             snapshot = json.loads(json.dumps(data, ensure_ascii=False))
-            if DATABASE_URL and psycopg2 is not None:
-                await asyncio.to_thread(_db_set, "data", snapshot)
+            await asyncio.to_thread(_persist_snapshot, snapshot)
     except Exception as e:
-        print(f"⚠️ Ошибка фонового сохранения PostgreSQL: {e}")
+        print(f"⚠️ Ошибка фонового сохранения данных: {e}")
     finally:
         _db_save_task = None
 
 def save_data():
-    """Быстро сохраняет локальную копию, а PostgreSQL обновляет в фоне.
-    Это убирает задержки на каждом нажатии кнопки/записи журнала.
-    """
+    """Неблокирующее сохранение. Диск и PostgreSQL никогда не тормозят обработчик Telegram."""
     global _db_save_task, _db_save_pending
-    _write_local_json(DATA_FILE, data)
-    if not (DATABASE_URL and psycopg2 is not None):
-        return
     _db_save_pending = True
     try:
         loop = asyncio.get_running_loop()
         if _db_save_task is None or _db_save_task.done():
             _db_save_task = loop.create_task(_flush_db_save())
     except RuntimeError:
-        # Вне event loop (например, при старте/миграции) сохраняем сразу.
-        _db_set("data", json.loads(json.dumps(data, ensure_ascii=False)))
+        # Вне event loop сохраняем синхронно — это только старт/служебные операции.
+        snapshot = json.loads(json.dumps(data, ensure_ascii=False))
+        _persist_snapshot(snapshot)
 
 async def save_data_now():
-    """Принудительно дождаться записи текущего состояния в PostgreSQL."""
+    """Принудительно дождаться записи текущего состояния в PostgreSQL и файл."""
     global _db_save_pending
     _db_save_pending = False
-    if DATABASE_URL and psycopg2 is not None:
-        snapshot = json.loads(json.dumps(data, ensure_ascii=False))
-        await asyncio.to_thread(_db_set, "data", snapshot)
+    snapshot = json.loads(json.dumps(data, ensure_ascii=False))
+    await asyncio.to_thread(_persist_snapshot, snapshot)
 
 
 def load_logs():
