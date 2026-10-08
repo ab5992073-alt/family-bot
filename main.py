@@ -272,6 +272,72 @@ data_global = {}
 dp.message.outer_middleware(GroupMemberTrackerMiddleware())
 
 
+# =========================================================
+# РАСШИРЕННЫЙ ЖУРНАЛ ДЕЙСТВИЙ
+# =========================================================
+
+def audit_category_for_text(text: str) -> str:
+    t = (text or "").lower().strip()
+    if t.startswith("/all"):
+        return "commands"
+    if "зам" in t or "👑" in t:
+        return "zams"
+    if "админ" in t or "🛠" in t or "👑 админ" in t:
+        return "admins"
+    if "заяв" in t or "📋" in t:
+        return "applications"
+    if "участ" in t or "👥" in t:
+        return "users"
+    if "анк" in t or "📝" in t:
+        return "surveys"
+    return "commands" if t.startswith("/") else "other"
+
+
+def audit_record(actor_id, category, action, details="", command=""):
+    try:
+        events = data.setdefault("audit_events", [])
+        events.append({
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "actor_id": int(actor_id) if actor_id is not None else None,
+            "category": category,
+            "action": action,
+            "details": str(details or ""),
+            "command": str(command or ""),
+        })
+        if len(events) > 5000:
+            del events[:-5000]
+        save_data()
+    except Exception as e:
+        print(f"⚠️ Не удалось записать audit: {e}")
+
+
+class AuditMessageMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data_ctx):
+        if isinstance(event, Message) and event.from_user and is_admin(event.from_user.id):
+            text = event.text or event.caption or ""
+            if text:
+                category = audit_category_for_text(text)
+                action = "нажал кнопку" if not text.startswith("/") else "выполнил команду"
+                audit_record(event.from_user.id, category, action, text, text if text.startswith("/") else "")
+        return await handler(event, data_ctx)
+
+
+class AuditCallbackMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data_ctx):
+        if isinstance(event, CallbackQuery) and event.from_user and is_admin(event.from_user.id):
+            cd = event.data or ""
+            category = "zams" if cd.startswith("zam") or cd.startswith("zams") else (
+                "applications" if cd.startswith("accept:") or cd.startswith("reject:") or cd.startswith("apps") else (
+                "users" if cd.startswith("users") or cd.startswith("user_") else (
+                "admins" if cd.startswith("adm") else "other")))
+            audit_record(event.from_user.id, category, "нажал inline-кнопку", cd, cd)
+        return await handler(event, data_ctx)
+
+
+dp.message.outer_middleware(AuditMessageMiddleware())
+dp.callback_query.outer_middleware(AuditCallbackMiddleware())
+
+
 @dp.chat_member()
 async def group_member_update(event: ChatMemberUpdated):
     """Уведомляет владельца о входе/добавлении и выходе/кике."""
@@ -597,6 +663,7 @@ defaults = {
     "pending_admin_usernames": {},
     "group_members": {},
     "initial_zams_installed": False,
+    "audit_events": [],
 }
 
 changed = False
@@ -981,6 +1048,11 @@ async def log_action(user_id, action, details=""):
     append_log_line(
         f"[{ts}] {username} -> {action} {details}\n"
     )
+    category = "zams" if "зам" in action.lower() else (
+        "admins" if "админ" in action.lower() else (
+        "applications" if "заяв" in action.lower() or "вердикт" in action.lower() else (
+        "surveys" if "анк" in action.lower() else "other")))
+    audit_record(user_id, category, action, details)
 
     if data.get("log_notify_enabled"):
         try:
@@ -1857,6 +1929,7 @@ async def send_users_page(message, users=None, page=0, flt="all", query=""):
     start = page * per
     chunk = items[start:start+per]
     text = f"👥 <b>Список участников</b>\nФильтр: <b>{escape(flt)}</b> | Найдено: <b>{len(items)}</b>\n\n"
+    rows=[]
     for n, (uid, u) in enumerate(chunk, start + 1):
         text += (
             f"<b>{n}. {escape(str(u.get('nickname', '—')))}</b>\n"
@@ -1864,7 +1937,9 @@ async def send_users_page(message, users=None, page=0, flt="all", query=""):
             f"   🎖 {escape(str(u.get('rank_fam', '—')))} | 🏢 {escape(str(u.get('organization', '—')))}\n"
             f"   👑 {escape(str(u.get('inviter', '—')))}\n\n"
         )
-    await message.answer(text, reply_markup=users_filter_keyboard(flt, page, pages))
+        rows.append([InlineKeyboardButton(text=f"👤 {str(u.get('nickname','—'))[:24]}", callback_data=f"user_view:{uid}")])
+    base=users_filter_keyboard(flt,page,pages).inline_keyboard
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows+base))
 
 
 @dp.message(F.text == "👥 Список участников")
@@ -1921,6 +1996,178 @@ async def admin_search_handler(message: Message):
         await send_users_page(message, page=0, flt="all", query=query)
     elif state["type"] == "zams":
         await send_zam_stats(message, 0, query)
+
+# =========================================================
+# РЕДАКТИРОВАНИЕ УЧАСТНИКОВ
+# =========================================================
+
+participant_edit_mode = {}
+
+def user_card_keyboard(uid):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"user_edit:{uid}")],
+        [InlineKeyboardButton(text="📜 История", callback_data=f"user_history:{uid}")],
+    ])
+
+
+def user_edit_keyboard(uid):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎖 Ранг фама", callback_data=f"user_edit_rank:{uid}"), InlineKeyboardButton(text="🏢 Организация", callback_data=f"user_edit_org:{uid}")],
+        [InlineKeyboardButton(text="📌 Ранг в орг", callback_data=f"user_edit_rankorg:{uid}"), InlineKeyboardButton(text="👑 Пригласил", callback_data=f"user_edit_inviter:{uid}")],
+        [InlineKeyboardButton(text="👤 Nickname", callback_data=f"user_edit_nick:{uid}"), InlineKeyboardButton(text="📱 @username", callback_data=f"user_edit_tag:{uid}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"user_view:{uid}")],
+    ])
+
+
+def user_text(uid):
+    u=data.get("users",{}).get(str(uid), {})
+    return (f"👤 <b>{escape(str(u.get('nickname','—')))}</b>\n\n"
+            f"🆔 <code>{uid}</code>\n"
+            f"📱 {escape(str(u.get('tag','—')))}\n"
+            f"🎖 Ранг: <b>{escape(str(u.get('rank_fam','—')))}</b>\n"
+            f"🏢 Организация: {escape(str(u.get('organization','—')))}\n"
+            f"📌 Ранг в орг: {escape(str(u.get('rank_org','—')))}\n"
+            f"👑 Пригласил: {escape(str(u.get('inviter','—')))}")
+
+
+@dp.callback_query(F.data.startswith("user_view:"))
+async def user_view_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("❌ Нет прав", show_alert=True); return
+    uid=cb.data.split(":",1)[1]
+    if uid not in data.get("users",{}):
+        await cb.answer("❌ Участник не найден", show_alert=True); return
+    await cb.message.edit_text(user_text(uid), reply_markup=user_card_keyboard(uid))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("user_edit:"))
+async def user_edit_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("❌ Нет прав", show_alert=True); return
+    uid=cb.data.split(":",1)[1]
+    if uid not in data.get("users",{}):
+        await cb.answer("❌ Участник не найден", show_alert=True); return
+    await cb.message.edit_text("✏️ <b>Редактирование анкеты</b>\n\nВыберите поле:", reply_markup=user_edit_keyboard(uid))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("user_edit_rank:"))
+async def user_edit_rank_cb(cb: CallbackQuery):
+    uid=cb.data.split(":",1)[1]
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=r, callback_data=f"user_set_rank:{uid}:{i}")] for i,r in enumerate(RANK_LIST)])
+    await cb.message.edit_text("🎖 <b>Выберите новый ранг:</b>", reply_markup=kb)
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("user_set_rank:"))
+async def user_set_rank_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("❌", show_alert=True); return
+    _,uid,idx=cb.data.split(":")
+    if uid not in data["users"]: await cb.answer("❌", show_alert=True); return
+    new=RANK_LIST[int(idx)]; old=data["users"][uid].get("rank_fam","—")
+    data["users"][uid]["rank_fam"]=new
+    for app in data.get("applications",{}).values():
+        if str(app.get("user_id"))==uid and app.get("status") in ("pending","accepted"):
+            app.setdefault("data",{})["rank_fam"]=new
+    save_data(); audit_record(cb.from_user.id,"users","изменил ранг участника",f"{uid}: {old} → {new}")
+    await cb.message.edit_text(user_text(uid), reply_markup=user_card_keyboard(uid)); await cb.answer("✅ Ранг изменён")
+
+
+@dp.callback_query(F.data.startswith("user_edit_org:"))
+async def user_edit_org_cb(cb: CallbackQuery):
+    uid=cb.data.split(":",1)[1]
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=o, callback_data=f"user_set_org:{uid}:{i}")] for i,o in enumerate(ORG_LIST)])
+    await cb.message.edit_text("🏢 <b>Выберите организацию:</b>", reply_markup=kb); await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("user_set_org:"))
+async def user_set_org_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id): await cb.answer("❌",show_alert=True); return
+    _,uid,idx=cb.data.split(":")
+    if uid not in data["users"]: await cb.answer("❌",show_alert=True); return
+    new=ORG_LIST[int(idx)]; old=data["users"][uid].get("organization","—")
+    data["users"][uid]["organization"]=new
+    if new=="Не в организации": data["users"][uid]["rank_org"]="/"
+    for app in data.get("applications",{}).values():
+        if str(app.get("user_id"))==uid and app.get("status") in ("pending","accepted"):
+            app.setdefault("data",{})["organization"]=new; app["data"]["rank_org"]=data["users"][uid].get("rank_org","/")
+    save_data(); audit_record(cb.from_user.id,"users","изменил организацию",f"{uid}: {old} → {new}")
+    await cb.message.edit_text(user_text(uid), reply_markup=user_card_keyboard(uid)); await cb.answer("✅ Изменено")
+
+
+@dp.callback_query(F.data.startswith("user_edit_rankorg:"))
+async def user_edit_rankorg_cb(cb: CallbackQuery):
+    uid=cb.data.split(":",1)[1]
+    participant_edit_mode[cb.from_user.id]={"uid":uid,"field":"rank_org"}
+    await cb.message.answer("📌 Введите новый ранг в организации (для «Не в организации» используйте /):")
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("user_edit_inviter:"))
+async def user_edit_inviter_cb(cb: CallbackQuery):
+    uid=cb.data.split(":",1)[1]
+    zams=get_zam_nicknames()
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=z,callback_data=f"user_set_inv:{uid}:{i}")] for i,z in enumerate(zams)])
+    await cb.message.edit_text("👑 <b>Кто пригласил?</b>", reply_markup=kb); await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("user_set_inv:"))
+async def user_set_inv_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id): await cb.answer("❌",show_alert=True); return
+    _,uid,idx=cb.data.split(":")
+    zams=get_zam_nicknames()
+    if uid not in data["users"] or int(idx)>=len(zams): await cb.answer("❌",show_alert=True); return
+    old=data["users"][uid].get("inviter","—"); new=zams[int(idx)]
+    data["users"][uid]["inviter"]=new
+    for app in data.get("applications",{}).values():
+        if str(app.get("user_id"))==uid and app.get("status") in ("pending","accepted"): app.setdefault("data",{})["inviter"]=new
+    save_data(); audit_record(cb.from_user.id,"users","изменил пригласившего",f"{uid}: {old} → {new}")
+    await cb.message.edit_text(user_text(uid),reply_markup=user_card_keyboard(uid)); await cb.answer("✅ Изменено")
+
+
+@dp.callback_query(F.data.startswith("user_edit_nick:"))
+async def user_edit_nick_cb(cb: CallbackQuery):
+    uid=cb.data.split(":",1)[1]; participant_edit_mode[cb.from_user.id]={"uid":uid,"field":"nickname"}
+    await cb.message.answer("👤 Введите новый игровой Nickname:"); await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("user_edit_tag:"))
+async def user_edit_tag_cb(cb: CallbackQuery):
+    uid=cb.data.split(":",1)[1]; participant_edit_mode[cb.from_user.id]={"uid":uid,"field":"tag"}
+    await cb.message.answer("📱 Введите новый @username (или —):"); await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("user_history:"))
+async def user_history_cb(cb: CallbackQuery):
+    uid=cb.data.split(":",1)[1]
+    hist=[]
+    for aid,app in data.get("applications",{}).items():
+        if str(app.get("user_id"))==uid:
+            for h in app.get("history",[]): hist.append((h.get("created",""),h.get("action",""),h.get("by","")))
+    hist.sort(reverse=True)
+    text="📜 <b>История участника</b>\n\n"
+    text += "\n".join(f"• {escape(str(t))[:19]} — {escape(str(a))} — {escape(str(b))}" for t,a,b in hist[-20:]) or "Нет истории."
+    await cb.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад",callback_data=f"user_view:{uid}")]])); await cb.answer()
+
+
+@dp.message(lambda m: m.from_user.id in participant_edit_mode and bool(m.text))
+async def participant_edit_text(message: Message):
+    if not is_admin(message.from_user.id): return
+    state=participant_edit_mode.pop(message.from_user.id,None)
+    if not state: return
+    uid=state["uid"]; field=state["field"]
+    if uid not in data.get("users",{}): await message.answer("❌ Участник не найден."); return
+    val=message.text.strip()
+    if field=="tag" and val=="—": val="—"
+    old=data["users"][uid].get(field,"—"); data["users"][uid][field]=val
+    for app in data.get("applications",{}).values():
+        if str(app.get("user_id"))==uid and app.get("status") in ("pending","accepted"): app.setdefault("data",{})[field]=val
+    save_data(); audit_record(message.from_user.id,"users",f"изменил {field}",f"{uid}: {old} → {val}")
+    await message.answer("✅ Сохранено.")
+    await message.answer(user_text(uid),reply_markup=user_card_keyboard(uid))
+
 
 # =========================================================
 # СТАТУС
@@ -2444,11 +2691,14 @@ async def send_zam_stats(message: Message, page=0, query=""):
     chunk = items[page*per:(page+1)*per]
     text = f"👑 <b>Список замов</b>\nНайдено: <b>{len(items)}</b>\n\n"
     text += "<b>№ | Nickname | @username | Приглашений</b>\n"
+    rows=[]
     for i, (nick, info, count) in enumerate(chunk, page*per + 1):
         username = info.get("tg_username")
         username = f"@{username}" if username else "—"
         text += f"<b>{i}</b> | {escape(nick)} | {escape(username)} | <b>{count}</b>\n"
-    await message.answer(text, reply_markup=zams_keyboard(page, pages))
+        rows.append([InlineKeyboardButton(text=f"👑 {nick[:24]}",callback_data=f"zam_view:{nick}")])
+    base=zams_keyboard(page,pages).inline_keyboard
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows+base))
 
 
 @dp.callback_query(F.data == "zam:stats")
@@ -2490,6 +2740,85 @@ async def zams_noop_cb(cb: CallbackQuery):
     await cb.answer()
 
 # =========================================================
+# РЕДАКТИРОВАНИЕ ЗАМОВ
+# =========================================================
+
+zam_edit_mode = {}
+
+def zam_card_keyboard(nick):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"zam_viewedit:{nick}")],
+        [InlineKeyboardButton(text="🗑 Убрать из замов", callback_data=f"zam_confirmremove:{nick}")],
+    ])
+
+@dp.callback_query(F.data.startswith("zam_view:"))
+async def zam_view_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id): await cb.answer("❌ Только владелец",show_alert=True); return
+    nick=cb.data.split(":",1)[1]; info=data.get("zam_data",{}).get(nick)
+    if not info: await cb.answer("❌ Не найден",show_alert=True); return
+    username=info.get("tg_username") or "—"
+    uid=info.get("tg_user_id") or "—"
+    await cb.message.edit_text(f"👑 <b>{escape(nick)}</b>\n\n📱 @{escape(str(username).lstrip('@')) if username!='—' else '—'}\n🆔 <code>{escape(str(uid))}</code>\n📊 Приглашений: <b>{count_zam_answers(nick)}</b>",reply_markup=zam_card_keyboard(nick)); await cb.answer()
+
+@dp.callback_query(F.data.startswith("zam_viewedit:"))
+async def zam_viewedit_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id): await cb.answer("❌",show_alert=True); return
+    nick=cb.data.split(":",1)[1]
+    await cb.message.edit_text("✏️ <b>Редактирование зама</b>",reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Nickname",callback_data=f"zam_editnick:{nick}")],
+        [InlineKeyboardButton(text="📱 @username",callback_data=f"zam_edituser:{nick}")],
+        [InlineKeyboardButton(text="◀️ Назад",callback_data=f"zam_view:{nick}")],
+    ])); await cb.answer()
+
+@dp.callback_query(F.data.startswith("zam_edituser:"))
+async def zam_edituser_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id): await cb.answer("❌",show_alert=True); return
+    nick=cb.data.split(":",1)[1]; zam_edit_mode[cb.from_user.id]={"old_nick":nick,"field":"tg_username"}
+    await cb.message.answer("📱 Введите новый @username зама или —:"); await cb.answer()
+
+@dp.callback_query(F.data.startswith("zam_editnick:"))
+async def zam_editnick_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id): await cb.answer("❌",show_alert=True); return
+    nick=cb.data.split(":",1)[1]; zam_edit_mode[cb.from_user.id]={"old_nick":nick,"field":"nickname"}
+    await cb.message.answer("👤 Введите новый игровой Nickname зама:"); await cb.answer()
+
+@dp.callback_query(F.data.startswith("zam_confirmremove:"))
+async def zam_confirmremove_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id): await cb.answer("❌",show_alert=True); return
+    nick=cb.data.split(":",1)[1]
+    await cb.message.edit_text(f"⚠️ Удалить <b>{escape(nick)}</b> из замов?",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Да, удалить",callback_data=f"zam_doremove:{nick}")],[InlineKeyboardButton(text="↩️ Отмена",callback_data=f"zam_view:{nick}")]])); await cb.answer()
+
+@dp.callback_query(F.data.startswith("zam_doremove:"))
+async def zam_doremove_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id): await cb.answer("❌",show_alert=True); return
+    nick=cb.data.split(":",1)[1]
+    if remove_zam_nick(nick):
+        save_data(); await log_action(cb.from_user.id,"удалил зама",nick); await cb.message.edit_text("✅ Зам удалён."); await cb.answer()
+    else: await cb.answer("❌ Не найден",show_alert=True)
+
+@dp.message(lambda m: m.from_user.id in zam_edit_mode and bool(m.text))
+async def zam_edit_text(message: Message):
+    if not is_super_admin(message.from_user.id): return
+    state=zam_edit_mode.pop(message.from_user.id,None)
+    if not state: return
+    old=state["old_nick"]; field=state["field"]
+    if old not in data.get("zam_data",{}): await message.answer("❌ Зам не найден."); return
+    val=message.text.strip()
+    if field=="tg_username":
+        val=val.lstrip("@").strip() if val!="—" else None
+        data["zam_data"][old]["tg_username"]=val
+        audit_record(message.from_user.id,"zams","изменил @username зама",f"{old} → @{val}" if val else f"{old} → —")
+        save_data(); await message.answer("✅ @username обновлён.")
+    else:
+        if not val: await message.answer("❌ Nickname не может быть пустым."); return
+        if val!=old and val in data.get("zam_data",{}): await message.answer("❌ Такой зам уже существует."); return
+        info=data["zam_data"].pop(old); stat=data.get("zam_stats",{}).pop(old,{"count":0,"withdrawn":0,"history":[]})
+        data["zam_data"][val]=info; data["zam_stats"][val]=stat
+        save_data(); await log_action(message.from_user.id,"изменил nickname зама",f"{old} → {val}"); await message.answer("✅ Nickname зама изменён.")
+    await send_zam_stats(message,0)
+
+
+# =========================================================
 # ВЫВОД
 # =========================================================
 
@@ -2497,103 +2826,77 @@ async def zams_noop_cb(cb: CallbackQuery):
 
 
 # =========================================================
-# ЛОГИ
+# ЛОГИ / АУДИТ
 # =========================================================
+
+AUDIT_CATEGORIES = [
+    ("all", "📋 Все"),
+    ("zams", "👑 Замы"),
+    ("admins", "🛡 Админка"),
+    ("applications", "📝 Заявки"),
+    ("users", "👥 Участники"),
+    ("surveys", "📋 Анкеты"),
+    ("commands", "⌨️ Команды"),
+]
+
+def audit_name(actor_id):
+    return get_admin_display(actor_id) if actor_id else "система"
+
+def audit_keyboard(category, page, pages):
+    rows=[]
+    rows.append([InlineKeyboardButton(text=label,callback_data=f"audit_cat:{key}") for key,label in AUDIT_CATEGORIES[:4]])
+    rows.append([InlineKeyboardButton(text=label,callback_data=f"audit_cat:{key}") for key,label in AUDIT_CATEGORIES[4:]])
+    nav=[]
+    if page>0: nav.append(InlineKeyboardButton(text="⬅️",callback_data=f"audit_page:{category}:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}",callback_data="audit_noop"))
+    if page<pages-1: nav.append(InlineKeyboardButton(text="➡️",callback_data=f"audit_page:{category}:{page+1}"))
+    rows.append(nav)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def filtered_audit(category):
+    events=data.get("audit_events",[])
+    if category=="all": return list(reversed(events))
+    return list(reversed([e for e in events if e.get("category")==category]))
+
+async def send_audit_page(message, category="all", page=0):
+    events=filtered_audit(category); per=8; pages=max(1,(len(events)+per-1)//per); page=max(0,min(page,pages-1))
+    chunk=events[page*per:(page+1)*per]
+    label=dict(AUDIT_CATEGORIES).get(category,"📋 Все")
+    text=f"📜 <b>Журнал действий</b>\nКатегория: <b>{label}</b>\nВсего: <b>{len(events)}</b>\n\n"
+    if not chunk: text += "📭 Записей нет."
+    for e in chunk:
+        t=str(e.get("time","")); actor=escape(audit_name(e.get("actor_id"))); action=escape(str(e.get("action",""))); details=escape(str(e.get("details","")))
+        text += f"🕐 <b>{escape(t.replace('T',' '))}</b>\n👤 {actor}\n➡️ {action}\n{details}\n\n"
+    await message.answer(text[:4000],reply_markup=audit_keyboard(category,page,pages))
 
 @dp.message(Command("logs"))
 async def logs_cmd(message: Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("❌ Только владелец!")
-        return
-
-    lines = load_logs()
-
-    if not lines:
-        await message.answer("📭 Пусто.")
-        return
-
-    await send_logs_page(message, lines, 0)
-
-
-async def send_logs_page(message, lines, page):
-    per = 10
-    total = len(lines)
-    pages = max(1, (total + per - 1) // per)
-
-    if page < 0 or page >= pages:
-        return
-
-    start = page * per
-    end = min(page * per + per, total)
-
-    text = (
-        f"📋 <b>Журнал (стр. {page + 1}/{pages})</b>\n\n"
-        + "".join(lines[start:end])
-    )
-
-    if len(text) > 4000:
-        text = text[:3900] + "\n... (обрезано)"
-
-    rows = []
-
-    if page > 0:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="⬅️",
-                    callback_data=f"lp_{page - 1}",
-                )
-            ]
-        )
-
-    if page < pages - 1:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="➡️",
-                    callback_data=f"lp_{page + 1}",
-                )
-            ]
-        )
-
-    await message.answer(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=rows
-        ) if rows else None,
-    )
-
-
-@dp.callback_query(F.data.startswith("lp_"))
-async def lp_cb(cb: CallbackQuery):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("❌")
-        return
-
-    lines = load_logs()
-
-    await send_logs_page(
-        cb.message,
-        lines,
-        int(cb.data.split("_")[1]),
-    )
-    await cb.answer()
-
+    if not is_super_admin(message.from_user.id): await message.answer("❌ Только владелец!"); return
+    await send_audit_page(message)
 
 @dp.message(F.text == "📜 Журнал действий")
 async def logs_btn(message: Message):
-    await logs_cmd(message)
+    if not is_super_admin(message.from_user.id): await message.answer("❌ Только владелец!"); return
+    await send_audit_page(message)
 
+@dp.callback_query(F.data.startswith("audit_cat:"))
+async def audit_cat_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id): await cb.answer("❌",show_alert=True); return
+    cat=cb.data.split(":",1)[1]; await send_audit_page(cb.message,cat,0); await cb.answer()
+
+@dp.callback_query(F.data.startswith("audit_page:"))
+async def audit_page_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id): await cb.answer("❌",show_alert=True); return
+    _,cat,page=cb.data.split(":"); await send_audit_page(cb.message,cat,int(page)); await cb.answer()
+
+@dp.callback_query(F.data=="audit_noop")
+async def audit_noop_cb(cb: CallbackQuery): await cb.answer()
 
 @dp.message(Command("clearlogs"))
 async def clear_logs(message: Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("❌ Только владелец!")
-        return
-
-    save_logs([])
-
-    await message.answer("✅ Логи очищены.")
+    if not is_super_admin(message.from_user.id): await message.answer("❌ Только владелец!"); return
+    save_logs([]); data["audit_events"]=[]; save_data(); audit_record(message.from_user.id,"commands","очистил журнал")
+    await message.answer("✅ Журнал очищен.")
 
 
 # =========================================================
@@ -3053,6 +3356,7 @@ async def all_cmd(message: Message):
         return
 
     args = message.text.split(maxsplit=1)
+    audit_record(message.from_user.id, "commands", "выполнил /all", message.text or "", message.text or "")
 
     if len(args) < 2:
         await message.answer("❌ Использование: <code>/all</code> <code>текст</code>")
@@ -3146,19 +3450,8 @@ ADMIN_COMMANDS = [
 OWNER_COMMANDS = ADMIN_COMMANDS + [
     BotCommand(command="add", description="➕ Выдать админа/зама"),
     BotCommand(command="remove", description="➖ Убрать админа/зама"),
-    BotCommand(command="add_admin", description="➕ Админ (алиас)"),
-    BotCommand(command="remove_admin", description="➖ Админ (алиас)"),
-    BotCommand(command="pending_admins", description="⏳ Ожидающие админы"),
-    BotCommand(command="db_status", description="🗄️ Статус базы"),
-    BotCommand(command="add_zam", description="👤 Добавить зама"),
-    BotCommand(command="remove_zam", description="❌ Удалить зама"),
     BotCommand(command="admins", description="👑 Админы"),
-    BotCommand(command="zam_stats", description="📊 Статистика замов"),
-    BotCommand(command="logs", description="📜 Журнал"),
-    BotCommand(command="clearlogs", description="🧹 Очистить журнал"),
-    BotCommand(command="log_on", description="🔔 Логи вкл"),
-    BotCommand(command="log_off", description="🔕 Логи выкл"),
-    BotCommand(command="set_token", description="🔑 Информация о токене"),
+    BotCommand(command="logs", description="📜 Журнал действий"),
 ]
 
 
