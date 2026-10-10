@@ -30,6 +30,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from flask import Flask
 
+# Google Sheets (optional until configured in Render)
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -101,14 +102,6 @@ GROUP_LINK = "https://t.me/+DIWXSbc93A41YTA6"
 BOT_NAME = "@Staff_Grand_Bot"
 ANNOUNCE_TOPIC_ID = 126387
 BOT_START_TIME = datetime.now()
-
-# Google Sheets (необязательно). Для включения добавь в Render:
-# GOOGLE_SERVICE_ACCOUNT_JSON — JSON сервисного аккаунта Google
-# GOOGLE_SHEET_ID — ID существующей таблицы (необязательно: бот может создать новую)
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
-GOOGLE_SHEET_TITLE = os.environ.get("GOOGLE_SHEET_TITLE", "Staff Grand — База семьи").strip()
-
 
 RANK_LIST = [
     "НОВИЧОК",
@@ -713,9 +706,6 @@ defaults = {
     "group_members": {},
     "initial_zams_installed": False,
     "audit_events": [],
-    "notify_settings": {},
-    "bot_settings": {"reminders_enabled": False, "pin_announcements": False},
-    "last_reminders": {},
 }
 
 changed = False
@@ -732,16 +722,6 @@ if not isinstance(data.get("group_members"), dict):
 
 if not isinstance(data.get("pending_admin_usernames"), dict):
     data["pending_admin_usernames"] = {}
-    changed = True
-
-if not isinstance(data.get("notify_settings"), dict):
-    data["notify_settings"] = {}
-    changed = True
-if not isinstance(data.get("bot_settings"), dict):
-    data["bot_settings"] = {"reminders_enabled": False, "pin_announcements": False}
-    changed = True
-if not isinstance(data.get("last_reminders"), dict):
-    data["last_reminders"] = {}
     changed = True
 
 if not data.get("admins"):
@@ -975,6 +955,109 @@ async def init_admins():
         save_data()
 
 
+# =========================================================
+# GOOGLE SHEETS: ручная синхронизация командой /sync_sheets
+# =========================================================
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
+GOOGLE_SPREADSHEET_NAME = os.environ.get("GOOGLE_SPREADSHEET_NAME", "staff-grand-bot").strip()
+
+
+def _google_sheet_client():
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise RuntimeError("В Render отсутствует GOOGLE_SERVICE_ACCOUNT_JSON")
+    if gspread is None or Credentials is None:
+        raise RuntimeError("Не установлены gspread и google-auth. Добавь их в requirements.txt")
+    try:
+        service_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    except Exception as exc:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON должен содержать полный JSON сервисного аккаунта") from exc
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(service_info, scopes=scopes)
+    client = gspread.authorize(creds)
+    if GOOGLE_SHEET_ID:
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+    else:
+        spreadsheet = client.open(GOOGLE_SPREADSHEET_NAME)
+    return spreadsheet
+
+
+def _sheet_rows_from_mapping(mapping, first_col="ID"):
+    rows = []
+    if not isinstance(mapping, dict):
+        return rows
+    for key, value in mapping.items():
+        if isinstance(value, dict):
+            row = {first_col: str(key)}
+            for k, v in value.items():
+                if isinstance(v, (dict, list)):
+                    v = json.dumps(v, ensure_ascii=False, default=str)
+                row[str(k)] = "" if v is None else str(v)
+            rows.append(row)
+        else:
+            rows.append({first_col: str(key), "Значение": json.dumps(value, ensure_ascii=False, default=str) if isinstance(value, (dict, list)) else str(value)})
+    return rows
+
+
+def _sync_one_worksheet(spreadsheet, title, rows, preferred_headers=None):
+    try:
+        worksheet = spreadsheet.worksheet(title)
+    except Exception:
+        worksheet = spreadsheet.add_worksheet(title=title, rows=max(100, len(rows) + 5), cols=30)
+    if not rows:
+        rows = [{"Информация": "Нет данных"}]
+    headers = list(preferred_headers or [])
+    for row in rows:
+        for key in row:
+            if key not in headers:
+                headers.append(key)
+    if not headers:
+        headers = ["Информация"]
+    values = [headers]
+    for row in rows:
+        values.append([str(row.get(header, ""))[:45000] for header in headers])
+    worksheet.clear()
+    worksheet.update(values, value_input_option="RAW")
+
+
+def _google_sync_all():
+    spreadsheet = _google_sheet_client()
+    # Не удаляем данные из PostgreSQL; таблица — экспорт/зеркало данных бота.
+    users = data.get("users", {})
+    applications = data.get("applications", {})
+    zams = data.get("zam_data", {})
+    stats = data.get("zam_stats", {})
+    logs = load_logs()
+    _sync_one_worksheet(spreadsheet, "Участники", _sheet_rows_from_mapping(users, "Telegram ID"))
+    _sync_one_worksheet(spreadsheet, "Заявки", _sheet_rows_from_mapping(applications, "ID заявки"))
+    _sync_one_worksheet(spreadsheet, "Замы", _sheet_rows_from_mapping(zams, "Игровой ник"))
+    _sync_one_worksheet(spreadsheet, "Статистика замов", _sheet_rows_from_mapping(stats, "Игровой ник"))
+    _sync_one_worksheet(spreadsheet, "Журнал", [{"Запись": str(line)} for line in logs[-5000:]], ["Запись"])
+    return spreadsheet.title
+
+
+@dp.message(Command("sync_sheets"))
+async def sync_google_sheets_command(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Эта команда доступна только владельцу бота.")
+        return
+    await message.answer("⏳ Подключаю Google Таблицу и синхронизирую данные…")
+    try:
+        title = await asyncio.to_thread(_google_sync_all)
+        await message.answer(
+            f"✅ Google Таблица подключена: <b>{escape(title)}</b>\n"
+            "Обновлены листы: Участники, Заявки, Замы, Статистика замов и Журнал."
+        )
+    except Exception as exc:
+        print(f"❌ Google Sheets sync error: {type(exc).__name__}: {exc}")
+        await message.answer(
+            "❌ Не удалось подключить Google Таблицу.\n"
+            "Проверь GOOGLE_SERVICE_ACCOUNT_JSON, наличие gspread/google-auth в requirements.txt, "
+            "а также доступ сервисного аккаунта к таблице.\n\n"
+            f"Причина: <code>{escape(str(exc)[:700])}</code>"
+        )
+
+
 def get_admin_display(admin_id):
     info = data.get("admin_usernames", {}).get(str(admin_id))
 
@@ -1163,19 +1246,7 @@ def admin_keyboard(user_id, has_survey=False):
         KeyboardButton(text="🟢 Статус бота"),
     )
     b.row(
-        KeyboardButton(text="📢 Объявление"),
-        KeyboardButton(text="📢 Общий сбор"),
-    )
-    b.row(
-        KeyboardButton(text="🏠 Панель управления"),
-        KeyboardButton(text="📊 Статистика"),
-    )
-    if is_super_admin(user_id):
-        b.row(
-            KeyboardButton(text="🛠 Админка"),
-        )
-    b.row(
-        KeyboardButton(text="🛑 Остановить сбор"),
+        KeyboardButton(text="🛠 Админка"),
     )
 
     if has_survey:
@@ -1188,7 +1259,6 @@ def admin_keyboard(user_id, has_survey=False):
             KeyboardButton(text="👑 Замы"),
             KeyboardButton(text="📜 Журнал действий"),
         )
-        b.row(KeyboardButton(text="☁️ Google Таблица"), KeyboardButton(text="⚙️ Настройки"))
 
     return b.as_markup(resize_keyboard=True)
 
@@ -1465,7 +1535,7 @@ async def survey_handler(message: Message):
                 [
                     InlineKeyboardButton(
                         text=z,
-                        callback_data=f"survey_zam:{z}",
+                        callback_data=f"zam_{z}",
                     )
                 ]
                 for z in zams
@@ -1541,7 +1611,7 @@ async def org_selected(cb: CallbackQuery):
             user_surveys.pop(uid, None)
             await cb.message.answer("⚠️ Сейчас замов нет. Обратитесь к администрации.")
             return
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=z, callback_data=f"survey_zam:{z}")] for z in zams])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=z, callback_data=f"zam_{z}")] for z in zams])
         await cb.message.answer("👤 Кто вас пригласил?", reply_markup=kb)
         return
 
@@ -1553,7 +1623,7 @@ async def org_selected(cb: CallbackQuery):
 # ВЫБОР ЗАМА
 # =========================================================
 
-@dp.callback_query(F.data.startswith("survey_zam:"))
+@dp.callback_query(F.data.startswith("zam_"))
 async def zam_selected(cb: CallbackQuery):
     uid = cb.from_user.id
 
@@ -1561,7 +1631,7 @@ async def zam_selected(cb: CallbackQuery):
         await cb.answer("❌ Анкета не найдена.")
         return
 
-    zam = cb.data.split(":", 1)[1]
+    zam = cb.data[4:]
 
     if zam not in data["zam_data"]:
         await cb.answer(
@@ -1837,19 +1907,15 @@ def application_keyboard(app_id):
     ])
 
 
-def application_status_label(status):
-    return {
-        "pending": "🟠 Ожидает",
-        "accepted": "🟢 Принята",
-        "rejected": "🔴 Отклонена",
-        "cancelled": "⚪ Отменена",
-    }.get(status, "⚪ Неизвестно")
-
-
 def application_text(app, idx=None):
     u = app.get("data", {})
     status = app.get("status", "pending")
-    status_text = application_status_label(status)
+    status_text = {
+        "pending": "⏳ Ожидает решения",
+        "accepted": "✅ Принята",
+        "rejected": "❌ Отклонена",
+        "cancelled": "🚫 Отменена",
+    }.get(status, status)
     prefix = f"<b>Заявка #{idx}</b>" if idx is not None else "<b>Заявка</b>"
     return (
         f"{prefix}\n"
@@ -1918,7 +1984,7 @@ async def send_apps_page(message, status="pending", page=0, query=""):
         return
     app_id, app = items[page]
     total = len(items)
-    header = f"📋 <b>Управление заявками</b>\nКатегория: <b>{escape(application_status_label(status) if status != 'all' else '📋 Все')}</b> | Найдено: <b>{total}</b>\n\n"
+    header = f"📋 <b>Управление заявками</b>\nКатегория: <b>{escape(status)}</b> | Найдено: <b>{total}</b>\n\n"
     await message.answer(header + application_text(app, page + 1), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept:{app_id}"),
          InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{app_id}")],
@@ -1961,7 +2027,6 @@ async def apps_page_cb(cb: CallbackQuery):
 
 
 admin_search_mode = {}
-announcement_mode = {}
 
 @dp.callback_query(F.data == "apps_search")
 async def apps_search_cb(cb: CallbackQuery):
@@ -2432,9 +2497,15 @@ async def admin_panel(message: Message):
         return
     await message.answer(
         "👑 <b>Управление администраторами</b>\n\n"
-        "Выберите действие:",
-        reply_markup=admin_panel_keyboard(),
+        "<code>/add_admin @username</code> — добавить\n"
+        "<code>/remove_admin @username</code> — удалить\n\n"
+        "Также работают:\n"
+        "<code>/add admin @username</code>\n"
+        "<code>/remove admin @username</code>\n\n"
+        "Если Telegram ещё не сообщает ID пользователя, бот поставит его в ожидание и "
+        "автоматически выдаст админку при первом замеченном сообщении этого пользователя."
     )
+
 
 # Быстрый кэш диалогов владельца: не обращаемся к Telethon при каждом открытии.
 owner_dialog_cache = {"time": 0.0, "users": []}
@@ -2861,8 +2932,7 @@ async def zam_add_cb(cb: CallbackQuery):
     if not is_super_admin(cb.from_user.id):
         await cb.answer("❌ Только владелец!", show_alert=True)
         return
-    zam_edit_mode[cb.from_user.id] = {"action": "add"}
-    await cb.message.answer("➕ Введите: <code>@username Game_Nick</code>")
+    await cb.message.answer("➕ Используй: <code>/add_zam @username Game_Nick</code>")
     await cb.answer()
 
 
@@ -2871,13 +2941,7 @@ async def zam_remove_cb(cb: CallbackQuery):
     if not is_super_admin(cb.from_user.id):
         await cb.answer("❌ Только владелец!", show_alert=True)
         return
-    zams = get_zam_nicknames()
-    if not zams:
-        await cb.answer("Замов пока нет", show_alert=True)
-        return
-    rows = [[InlineKeyboardButton(text=f"👑 {z[:28]}", callback_data=f"zam_confirmremove:{z}")] for z in zams]
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="zams_back")])
-    await cb.message.edit_text("➖ <b>Выберите зама для удаления:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await cb.message.answer("➖ Используй: <code>/remove_zam Game_Nick</code>")
     await cb.answer()
 
 
@@ -3031,14 +3095,6 @@ async def zam_confirmremove_cb(cb: CallbackQuery):
     nick=cb.data.split(":",1)[1]
     await cb.message.edit_text(f"⚠️ Удалить <b>{escape(nick)}</b> из замов?",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Да, удалить",callback_data=f"zam_doremove:{nick}")],[InlineKeyboardButton(text="↩️ Отмена",callback_data=f"zam_view:{nick}")]])); await cb.answer()
 
-@dp.callback_query(F.data == "zams_back")
-async def zams_back_cb(cb: CallbackQuery):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("❌ Только владелец!", show_alert=True); return
-    await cb.message.edit_text("👑 <b>Управление замами</b>", reply_markup=zams_panel_keyboard())
-    await cb.answer()
-
-
 @dp.callback_query(F.data.startswith("zam_doremove:"))
 async def zam_doremove_cb(cb: CallbackQuery):
     if not is_super_admin(cb.from_user.id): await cb.answer("❌",show_alert=True); return
@@ -3052,14 +3108,6 @@ async def zam_edit_text(message: Message):
     if not is_super_admin(message.from_user.id): return
     state=zam_edit_mode.pop(message.from_user.id,None)
     if not state: return
-    if state.get("action") == "add":
-        args = message.text.strip().split(maxsplit=1)
-        if len(args) < 2:
-            await message.answer("❌ Формат: <code>@username Game_Nick</code>")
-            return
-        await add_zam_by_username(message, args[0], args[1])
-        await send_zam_stats(message, 0)
-        return
     old=state["old_nick"]; field=state["field"]
     if old not in data.get("zam_data",{}): await message.answer("❌ Зам не найден."); return
     val=message.text.strip()
@@ -3256,334 +3304,434 @@ async def myid_cmd(message: Message):
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
     if is_super_admin(message.from_user.id):
-        text = "📋 <b>Управление ботом</b>\n\nВсе основные действия доступны через кнопки меню.\n\n👑 Владелец: управление админами, замами, заявками, участниками и журналом.\n🛡 Админы: заявки, участники, объявления и общий сбор."
+        text = (
+            "📋 <b>Команды владельца:</b>\n\n"
+            "/start — меню\n"
+            "/help — справка\n"
+            "/ping — пинг\n"
+            "/all — объявление\n"
+            "/add admin — выдать админа\n"
+            "/add zam — добавить зама\n"
+            "/remove admin — удалить админа\n"
+            "/remove zam — удалить зама\n"
+            "/add_zam — добавить зама\n"
+            "/remove_zam — удалить зама\n"
+            "/admins — список админов\n"
+            "/zam_stats — статистика замов\n"
+            "/logs — журнал\n"
+            "/clearlogs — очистить журнал\n"
+            "/log_on — уведомления вкл\n"
+            "/log_off — уведомления выкл\n"
+            "/topic_id — ID темы\n"
+            "/sbor — общий сбор\n"
+            "/stopsbor — остановить сбор\n"
+            "/set_token — смена токена\n"
+        )
     elif is_admin(message.from_user.id):
-        text = "📋 <b>Панель администратора</b>\n\nВсе основные действия доступны через кнопки меню.\n\n📝 Заявки • 👥 Участники • 📢 Объявления • 📢 Общий сбор"
+        text = (
+            "📋 <b>Команды администратора:</b>\n\n"
+            "/start — меню\n"
+            "/help — справка\n"
+            "/ping — пинг\n"
+            "/all — объявление\n"
+            "/кто — информация об участнике\n"
+            "/topic_id — ID темы\n"
+            "/sbor — общий сбор\n"
+            "/stopsbor — остановить сбор\n"
+        )
     else:
-        text = "📋 <b>Меню</b>\n\nЗаполнение анкеты и просмотр профиля доступны через кнопки ниже."
+        text = (
+            "📋 <b>Команды:</b>\n\n"
+            "/start — меню\n"
+            "/help — справка\n"
+        )
+
     await message.answer(text)
 
 
 # =========================================================
-# РАСШИРЕННАЯ ПАНЕЛЬ УПРАВЛЕНИЯ / СТАТИСТИКА / GOOGLE SHEETS
+# ОБЩИЙ СБОР
 # =========================================================
 
-def owner_only(uid):
-    return is_super_admin(uid)
+GATHER_DURATION_SECONDS = 90
+GATHER_INTERVAL_SECONDS = 20
+GATHER_CHUNK_SIZE = 25
 
 
-def admin_can(uid, permission="manage"):
-    if is_super_admin(uid):
+def _is_known_group_member(user_id):
+    uid = str(user_id)
+    if uid in data.get("group_members", {}):
         return True
-    if not is_admin(uid):
+
+    # Пользователи с заполненной анкетой считаются кандидатами для созыва
+    # только после того, как бот видел их в группе. Это не даёт тегать людей,
+    # которых мог уже не быть в чате.
+    return False
+
+
+async def get_gather_members():
+    """
+    Получает АКТУАЛЬНЫЙ полный список участников группы через
+    пользовательскую Telegram-сессию Telethon.
+
+    Bot API не умеет выдавать полный список участников супергруппы,
+    поэтому для команды «общий сбор» используется именно user-session.
+    Если Telethon не подключен, используем сохранённых участников как
+    безопасный fallback и явно сообщаем об этом в логи.
+    """
+    members = []
+
+    if telegram_user_is_ready():
+        try:
+            entity = None
+
+            # Сначала пытаемся найти группу среди диалогов пользовательской сессии.
+            async for dialog in telegram_user_client.iter_dialogs():
+                try:
+                    peer_id = utils.get_peer_id(dialog.entity)
+                    if peer_id == GROUP_ID:
+                        entity = dialog.entity
+                        break
+                except Exception:
+                    continue
+
+            # Если в диалогах не нашли — пробуем получить сущность напрямую.
+            if entity is None:
+                try:
+                    entity = await telegram_user_client.get_entity(GROUP_ID)
+                except Exception:
+                    entity = None
+
+            if entity is not None:
+                seen = set()
+
+                async for user in telegram_user_client.iter_participants(entity):
+                    try:
+                        user_id = int(user.id)
+                    except (TypeError, ValueError):
+                        continue
+
+                    if user_id in seen:
+                        continue
+                    seen.add(user_id)
+
+                    if getattr(user, "bot", False):
+                        continue
+                    if getattr(user, "deleted", False):
+                        continue
+
+                    first = getattr(user, "first_name", None) or ""
+                    last = getattr(user, "last_name", None) or ""
+                    full_name = f"{first} {last}".strip()
+                    username = getattr(user, "username", None)
+
+                    if not full_name:
+                        full_name = username or str(user_id)
+
+                    member = {
+                        "id": user_id,
+                        "name": full_name,
+                        "username": username,
+                    }
+                    members.append(member)
+
+                    # Обновляем локальный кэш тоже: тогда /список участников
+                    # и другие функции знают актуальных людей.
+                    data.setdefault("group_members", {})[str(user_id)] = {
+                        "id": user_id,
+                        "username": username,
+                        "full_name": full_name,
+                        "last_seen": datetime.now().isoformat(),
+                    }
+
+                save_data()
+                print(f"✅ Общий сбор: Telethon получил {len(members)} участников группы.")
+                return members
+
+            print("⚠️ Telethon подключен, но группа не найдена в пользовательской сессии.")
+
+        except Exception as e:
+            print(f"⚠️ Не удалось получить полный список участников через Telethon: {e}")
+
+    # Fallback — только ранее известных боту участников.
+    # Это не является полным списком, поэтому без user-session полный созыв
+    # сделать технически невозможно.
+    for uid, info in data.get("group_members", {}).items():
+        try:
+            user_id = int(uid)
+        except (TypeError, ValueError):
+            continue
+
+        full_name = (
+            info.get("full_name")
+            or info.get("username")
+            or str(user_id)
+        ).strip()
+
+        members.append({
+            "id": user_id,
+            "name": full_name,
+            "username": info.get("username"),
+        })
+
+    # Дополнительно подтягиваем принятых участников из анкет — если Bot API
+    # может подтвердить, что конкретный пользователь сейчас в группе.
+    known_ids = {m["id"] for m in members}
+    for app in data.get("applications", {}).values():
+        if app.get("status") != "accepted":
+            continue
+        try:
+            user_id = int(app.get("user_id"))
+        except (TypeError, ValueError):
+            continue
+        if user_id in known_ids:
+            continue
+
+        try:
+            member = await bot.get_chat_member(GROUP_ID, user_id)
+            status = getattr(member, "status", "")
+            is_member = status in {"member", "administrator", "creator"}
+            if status == "restricted":
+                is_member = bool(getattr(member, "is_member", False))
+            if not is_member:
+                continue
+
+            user = getattr(member, "user", None)
+            if not user or user.is_bot:
+                continue
+
+            members.append({
+                "id": user.id,
+                "name": user.full_name or user.username or str(user.id),
+                "username": user.username or None,
+            })
+            known_ids.add(user.id)
+        except Exception:
+            continue
+
+    unique = {}
+    for member in members:
+        unique[member["id"]] = member
+
+    return list(unique.values())
+
+def mention_html(member):
+    name = member.get("name") or member.get("username") or str(member["id"])
+    return f'<a href="tg://user?id={member["id"]}">{escape(name)}</a>'
+
+
+def chunk_mentions(members, size=GATHER_CHUNK_SIZE):
+    for i in range(0, len(members), size):
+        yield members[i:i + size]
+
+
+async def send_gather_wave(members, wave_no, total_waves):
+    header = (
+        f"📢 <b>ОБЩИЙ СБОР</b>\n\n"
+        f"Созыв: <b>{wave_no}/{total_waves}</b>\n"
+        f"⏱️ Необходимо собраться всем участникам.\n\n"
+    )
+
+    chunks = list(chunk_mentions(members))
+    if not chunks:
         return False
-    perms = data.setdefault("admin_permissions", {})
-    current = perms.get(str(uid))
-    if current is None:
-        return True
-    if permission in current:
-        return bool(current[permission])
+
+    for index, chunk in enumerate(chunks):
+        body = " ".join(mention_html(member) for member in chunk)
+        text = header if index == 0 else "📢 <b>ОБЩИЙ СБОР — продолжение</b>\n\n"
+        text += body
+
+        try:
+            await bot.send_message(
+                GROUP_ID,
+                text,
+            )
+        except Exception as e:
+            print(f"⚠️ Ошибка общего сбора: {e}")
+
     return True
 
 
-def dashboard_keyboard(uid):
-    rows = [
-        [InlineKeyboardButton(text="📋 Заявки", callback_data="dash:apps"), InlineKeyboardButton(text="👥 Участники", callback_data="dash:users")],
-        [InlineKeyboardButton(text="👑 Замы", callback_data="dash:zams"), InlineKeyboardButton(text="📊 Статистика", callback_data="dash:stats")],
-        [InlineKeyboardButton(text="📢 Объявление", callback_data="dash:announce"), InlineKeyboardButton(text="📢 Общий сбор", callback_data="dash:sbor")],
-        [InlineKeyboardButton(text="📜 Журнал", callback_data="dash:audit"), InlineKeyboardButton(text="☁️ Google Таблица", callback_data="dash:sheets")],
-    ]
-    if is_super_admin(uid):
-        rows.append([InlineKeyboardButton(text="🛡 Админы", callback_data="dash:admins"), InlineKeyboardButton(text="⚙️ Настройки", callback_data="dash:settings")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def settings_keyboard():
-    r = data.setdefault("bot_settings", {})
-    rem = "🟢" if r.get("reminders_enabled") else "🔴"
-    pin = "🟢" if r.get("pin_announcements") else "🔴"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{rem} Напоминания об анкетах", callback_data="set:reminders")],
-        [InlineKeyboardButton(text=f"{pin} Закреплять объявления", callback_data="set:pin")],
-        [InlineKeyboardButton(text="🔔 Уведомления админа", callback_data="set:notify")],
-        [InlineKeyboardButton(text="🧹 Проверить дубли", callback_data="set:duplicates")],
-        [InlineKeyboardButton(text="◀️ Панель", callback_data="dash:home")],
-    ])
-
-
-def stats_text():
-    users = data.get("users", {})
-    apps = data.get("applications", {})
-    pending = sum(1 for x in apps.values() if x.get("status") == "pending")
-    accepted = sum(1 for x in apps.values() if x.get("status") == "accepted")
-    rejected = sum(1 for x in apps.values() if x.get("status") == "rejected")
-    active_group = sum(1 for x in data.get("group_members", {}).values() if x.get("status") in ("member", "administrator", "creator"))
-    orgs = {}
-    for u in users.values():
-        org = u.get("organization") or "Не указано"
-        orgs[org] = orgs.get(org, 0) + 1
-    top_orgs = sorted(orgs.items(), key=lambda x: (-x[1], x[0]))[:8]
-    zams = get_all_zam_counts()
-    top_zams = sorted(zams, key=lambda x: (-x[1], x[0].lower()))[:5]
-    lines = [
-        "📊 <b>Статистика семьи</b>",
-        "",
-        f"👥 Анкет: <b>{len(users)}</b>",
-        f"🟢 Принятых заявок: <b>{accepted}</b>",
-        f"🟠 Ожидающих: <b>{pending}</b>",
-        f"🔴 Отклонённых: <b>{rejected}</b>",
-        f"👥 Видимых участников группы: <b>{active_group}</b>",
-        f"👑 Замов: <b>{len(data.get('zam_data', {}))}</b>",
-        "",
-        "🏢 <b>Организации:</b>",
-    ]
-    lines += [f"• {escape(k)} — <b>{v}</b>" for k,v in top_orgs] or ["• Нет данных"]
-    lines += ["", "🏆 <b>Замы по приглашениям:</b>"]
-    lines += [f"• {escape(n)} — <b>{c}</b>" for n,c,_,_ in top_zams] or ["• Нет данных"]
-    return "\n".join(lines)
-
-
-def duplicate_report():
-    users = data.get("users", {})
-    by_nick, by_tag = {}, {}
-    for uid,u in users.items():
-        nick = str(u.get("nickname") or "").strip().lower()
-        tag = str(u.get("tag") or "").strip().lower().lstrip("@")
-        if nick: by_nick.setdefault(nick, []).append(uid)
-        if tag and tag != "—": by_tag.setdefault(tag, []).append(uid)
-    dup_nick = [(k,v) for k,v in by_nick.items() if len(v)>1]
-    dup_tag = [(k,v) for k,v in by_tag.items() if len(v)>1]
-    lines=["🧹 <b>Проверка дублей</b>",""]
-    lines.append(f"Nickname-дубли: <b>{len(dup_nick)}</b>")
-    for k,v in dup_nick[:10]: lines.append(f"• {escape(k)} → {', '.join(v)}")
-    lines.append(f"@username-дубли: <b>{len(dup_tag)}</b>")
-    for k,v in dup_tag[:10]: lines.append(f"• @{escape(k)} → {', '.join(v)}")
-    if not dup_nick and not dup_tag: lines.append("\n✅ Дубликатов не найдено.")
-    return "\n".join(lines)
-
-
-def google_client():
-    if not gspread or not Credentials or not GOOGLE_SERVICE_ACCOUNT_JSON:
-        return None
+async def run_gather():
     try:
-        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-        return gspread.authorize(creds)
-    except Exception as e:
-        print(f"Google Sheets init error: {e}")
-        return None
+        members = await get_gather_members()
+        if not members:
+            print("⚠️ Общий сбор: нет известных участников для упоминания.")
+            return
+
+        total_waves = (GATHER_DURATION_SECONDS // GATHER_INTERVAL_SECONDS) + 1
+
+        for wave in range(total_waves):
+            # Заново собираем список перед каждой волной: новые люди, написавшие
+            # в чат во время сбора, автоматически попадут в следующую волну.
+            members = await get_gather_members()
+            if not members:
+                break
+
+            await send_gather_wave(members, wave + 1, total_waves)
+
+            if wave < total_waves - 1:
+                await asyncio.sleep(GATHER_INTERVAL_SECONDS)
+
+    finally:
+        gather_tasks.pop(GROUP_ID, None)
 
 
-def sync_google_sheets_sync():
-    client = google_client()
-    if client is None:
-        return {"ok": False, "error": "Не настроен GOOGLE_SERVICE_ACCOUNT_JSON или отсутствует gspread."}
+@dp.message(Command("sbor"))
+async def gather_command(message: Message):
+    if message.chat.id != GROUP_ID:
+        await message.answer("❌ Команду «сбор» нужно запускать в группе.")
+        return
+
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Только админы могут объявлять общий сбор!")
+        return
+
+    current = gather_tasks.get(GROUP_ID)
+    if current and not current.done():
+        await message.answer(
+            "📢 <b>Общий сбор уже идёт.</b>\n"
+            "Участники продолжают получать призывы в течение ближайшей минуты."
+        )
+        return
+
+    task = asyncio.create_task(run_gather())
+    gather_tasks[GROUP_ID] = task
+
+    await message.answer(
+        "🚨 <b>ОБЩИЙ СБОР ЗАПУЩЕН!</b>\n\n"
+        "Всех известных боту участников начну повторно призывать каждые "
+        f"{GATHER_INTERVAL_SECONDS} сек. в течение {GATHER_DURATION_SECONDS} сек."
+    )
+
+
+@dp.message(Command("stopsbor"))
+async def stop_gather_command(message: Message):
+    if message.chat.id != GROUP_ID:
+        await message.answer("❌ Команду нужно запускать в группе.")
+        return
+
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Только админы!")
+        return
+
+    task = gather_tasks.get(GROUP_ID)
+    if not task or task.done():
+        await message.answer("ℹ️ Сейчас общий сбор не идёт.")
+        return
+
+    task.cancel()
+    gather_tasks.pop(GROUP_ID, None)
+    await message.answer("🛑 <b>Общий сбор остановлен.</b>")
+
+
+# Команда без слеша: «общий сбор» или «Общий сбор».
+@dp.message(F.chat.id == GROUP_ID, F.text.func(lambda text: bool(text and text.strip().lower() == "общий сбор")))
+async def gather_phrase(message: Message):
+    await gather_command(message)
+
+
+# =========================================================
+# ЗАЩИТА ТЕМЫ НОВОСТИ
+# =========================================================
+
+@dp.message(F.chat.id == GROUP_ID)
+async def protect_topic(message: Message):
+    if message.message_thread_id == ANNOUNCE_TOPIC_ID:
+        if not is_admin(message.from_user.id):
+            try:
+                await message.delete()
+
+                await bot.send_message(
+                    GROUP_ID,
+                    f"❌ {escape(message.from_user.full_name)}, "
+                    f"только админы могут писать здесь!",
+                    reply_to_message_id=message.message_id,
+                )
+            except Exception:
+                pass
+
+
+# =========================================================
+# /ALL
+# =========================================================
+
+@dp.message(Command("all"))
+async def all_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Только админы!")
+        return
+
+    args = message.text.split(maxsplit=1)
+    audit_record(message.from_user.id, "commands", "выполнил /all", message.text or "", message.text or "")
+
+    if len(args) < 2:
+        await message.answer("❌ Использование: <code>/all</code> <code>текст</code>")
+        return
+
     try:
-        if GOOGLE_SHEET_ID:
-            sh = client.open_by_key(GOOGLE_SHEET_ID)
-        else:
-            sh = client.create(GOOGLE_SHEET_TITLE)
-        sheets = {
-            "Участники": [["Telegram ID","Nickname","@username","Ранг","Организация","Ранг в орг","Пригласил","Статус"]],
-            "Заявки": [["ID","Telegram ID","Nickname","@username","Ранг","Организация","Пригласил","Статус","Создано"]],
-            "Замы": [["№","Nickname","@username","Приглашений"]],
-            "Статистика": [["Показатель","Значение"]],
-            "Журнал": [["Время","Кто","Действие","Подробности"]],
-        }
-        for title, values in sheets.items():
-            try: ws = sh.worksheet(title); ws.clear()
-            except Exception: ws = sh.add_worksheet(title=title, rows=1000, cols=12)
-            ws.update("A1", values)
-        ws=sh.worksheet("Участники")
-        rows=[]
-        for uid,u in data.get("users",{}).items():
-            rows.append([uid,u.get("nickname",""),u.get("tag",""),u.get("rank_fam",""),u.get("organization",""),u.get("rank_org",""),u.get("inviter",""),u.get("status","accepted")])
-        if rows: ws.update("A2", rows)
-        ws=sh.worksheet("Заявки"); rows=[]
-        for aid,a in data.get("applications",{}).items():
-            d=a.get("data",a)
-            rows.append([aid,a.get("user_id",""),d.get("nickname",""),d.get("tag",d.get("username","")),d.get("rank_fam",""),d.get("organization",""),d.get("inviter",""),a.get("status",""),a.get("created","" )])
-        if rows: ws.update("A2", rows)
-        ws=sh.worksheet("Замы"); rows=[]
-        for i,(nick,info) in enumerate(data.get("zam_data",{}).items(),1): rows.append([i,nick,info.get("tg_username") or "",count_zam_answers(nick)])
-        if rows: ws.update("A2", rows)
-        ws=sh.worksheet("Статистика"); rows=[
-            ["Анкет",len(data.get("users",{}))],
-            ["Ожидающих заявок",sum(1 for a in data.get("applications",{}).values() if a.get("status")=="pending")],
-            ["Принятых заявок",sum(1 for a in data.get("applications",{}).values() if a.get("status")=="accepted")],
-            ["Отклонённых заявок",sum(1 for a in data.get("applications",{}).values() if a.get("status")=="rejected")],
-            ["Замов",len(data.get("zam_data",{}))],
-        ]; ws.update("A2",rows)
-        ws=sh.worksheet("Журнал"); rows=[]
-        for e in data.get("audit_events",[])[-1000:]: rows.append([e.get("time",""),audit_name(e.get("actor_id")),e.get("action",""),e.get("details","")])
-        if rows: ws.update("A2",rows)
-        data["google_sheet_url"] = sh.url
-        save_data()
-        return {"ok": True, "url": sh.url}
+        await bot.send_message(
+            GROUP_ID,
+            f"⚠️ <b>ВАЖНОЕ ОБЪЯВЛЕНИЕ</b>\n\n"
+            f"{escape(args[1])}\n\n"
+            f"@all",
+            message_thread_id=ANNOUNCE_TOPIC_ID,
+        )
+
+        await message.answer("✅ Отправлено.")
+
     except Exception as e:
-        return {"ok": False, "error": str(e)[:500]}
+        await message.answer(f"❌ {escape(str(e))}")
 
 
-def google_sheet_url():
-    return data.get("google_sheet_url") or (f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit" if GOOGLE_SHEET_ID else "")
+# =========================================================
+# /TOPIC_ID
+# =========================================================
 
-
-@dp.message(F.text == "🏠 Панель управления")
-async def dashboard_btn(message: Message):
-    if not is_admin(message.from_user.id): return
-    await message.answer("🏠 <b>Панель управления</b>\nВыберите действие:", reply_markup=dashboard_keyboard(message.from_user.id))
-
-@dp.message(F.text == "📊 Статистика")
-async def stats_btn(message: Message):
-    if not is_admin(message.from_user.id): return
-    await message.answer(stats_text(), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧹 Проверить дубли",callback_data="set:duplicates")],[InlineKeyboardButton(text="◀️ Панель",callback_data="dash:home")]]))
-
-@dp.message(F.text == "☁️ Google Таблица")
-async def sheets_btn(message: Message):
-    if not is_super_admin(message.from_user.id): return
-    url=google_sheet_url()
-    text="☁️ <b>Google Таблица</b>\n\n" + (f"Последняя таблица:\n{escape(url)}" if url else "Таблица ещё не создана.")
-    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Синхронизировать",callback_data="sheets:sync")],[InlineKeyboardButton(text="◀️ Панель",callback_data="dash:home")]]))
-
-@dp.message(F.text == "⚙️ Настройки")
-async def settings_btn(message: Message):
-    if not is_super_admin(message.from_user.id): return
-    await message.answer("⚙️ <b>Настройки бота</b>",reply_markup=settings_keyboard())
-
-@dp.callback_query(F.data.startswith("dash:"))
-async def dashboard_cb(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id): return await cb.answer("❌ Нет прав",show_alert=True)
-    action=cb.data.split(":",1)[1]
-    await cb.answer()
-    if action=="home": await cb.message.edit_text("🏠 <b>Панель управления</b>\nВыберите действие:",reply_markup=dashboard_keyboard(cb.from_user.id))
-    elif action=="apps": await send_apps_page(cb.message,"pending",0)
-    elif action=="users": await send_users_page(cb.message,"all",0)
-    elif action=="zams": await send_zam_stats(cb.message,0)
-    elif action=="stats": await cb.message.edit_text(stats_text(),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧹 Дубли",callback_data="set:duplicates")],[InlineKeyboardButton(text="◀️ Панель",callback_data="dash:home")]]))
-    elif action=="audit": await send_audit_page(cb.message)
-    elif action=="admins": await cb.message.edit_text("🛡 <b>Админка</b>",reply_markup=admin_panel_keyboard())
-    elif action=="settings": await cb.message.edit_text("⚙️ <b>Настройки бота</b>",reply_markup=settings_keyboard())
-    elif action=="sheets":
-        url=google_sheet_url(); await cb.message.edit_text("☁️ <b>Google Таблица</b>\n\n"+(escape(url) if url else "Таблица ещё не создана."),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Синхронизировать",callback_data="sheets:sync")],[InlineKeyboardButton(text="◀️ Панель",callback_data="dash:home")]]))
-    elif action=="announce":
-        announcement_mode[cb.from_user.id]={"pin":False}; await cb.message.answer("📣 Напишите текст объявления одним сообщением.\nДля отмены: /cancel")
-    elif action=="sbor":
-        await start_gather_from_button(cb.message)
-
-@dp.callback_query(F.data.startswith("set:"))
-async def settings_cb(cb: CallbackQuery):
-    if not is_super_admin(cb.from_user.id): return await cb.answer("❌ Только владелец",show_alert=True)
-    action=cb.data.split(":",1)[1]
-    if action=="reminders": data.setdefault("bot_settings",{})["reminders_enabled"]=not data.setdefault("bot_settings",{}).get("reminders_enabled",False); save_data(); await cb.message.edit_text("⚙️ Настройки",reply_markup=settings_keyboard()); await cb.answer("Готово")
-    elif action=="pin": data.setdefault("bot_settings",{})["pin_announcements"]=not data.setdefault("bot_settings",{}).get("pin_announcements",False); save_data(); await cb.message.edit_text("⚙️ Настройки",reply_markup=settings_keyboard()); await cb.answer("Готово")
-    elif action=="notify":
-        cur=data.setdefault("notify_settings",{}).get(str(cb.from_user.id),True); data["notify_settings"][str(cb.from_user.id)]=not cur; save_data(); await cb.message.edit_text("⚙️ Настройки",reply_markup=settings_keyboard()); await cb.answer("Уведомления " + ("включены" if not cur else "выключены"))
-    elif action=="duplicates": await cb.message.edit_text(duplicate_report(),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Настройки",callback_data="dash:settings")]])); await cb.answer()
-
-@dp.callback_query(F.data=="sheets:sync")
-async def sheets_sync_cb(cb: CallbackQuery):
-    if not is_super_admin(cb.from_user.id): return await cb.answer("❌ Только владелец",show_alert=True)
-    await cb.answer("Синхронизация запущена")
-    result=await asyncio.to_thread(sync_google_sheets_sync)
-    if result.get("ok"):
-        await cb.message.edit_text("✅ <b>Google Таблица обновлена.</b>\n\n"+escape(result.get("url","")),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Обновить ещё раз",callback_data="sheets:sync")],[InlineKeyboardButton(text="◀️ Панель",callback_data="dash:home")]]))
+@dp.message(Command("topic_id"))
+async def topic_id(message: Message):
+    if message.chat.id == GROUP_ID and message.message_thread_id:
+        await message.answer(
+            f"ID: {message.message_thread_id}"
+        )
     else:
-        await cb.message.edit_text("❌ <b>Google Таблица не настроена</b>\n\n"+escape(result.get("error","Неизвестная ошибка"))+"\n\nДобавь GOOGLE_SERVICE_ACCOUNT_JSON в Render и дай сервисному аккаунту доступ к таблице.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Панель",callback_data="dash:home")]]))
+        await message.answer("❌ Не в теме.")
 
-# Объявление через кнопку.
-@dp.message(lambda m: m.from_user.id in announcement_mode and bool(m.text) and not m.text.startswith("/"))
-async def announcement_text_handler(message: Message):
-    if not is_admin(message.from_user.id): return
-    announcement_mode.pop(message.from_user.id,None)
-    try:
-        sent=await bot.send_message(GROUP_ID,message.text,message_thread_id=ANNOUNCE_TOPIC_ID)
-        if data.setdefault("bot_settings",{}).get("pin_announcements"):
-            try: await bot.pin_chat_message(GROUP_ID,sent.message_id,disable_notification=True)
-            except Exception: pass
-        audit_record(message.from_user.id,"commands","отправил объявление",message.text,command="кнопка: объявление")
-        await message.answer("✅ Объявление отправлено.")
-    except Exception as e:
-        await message.answer("❌ Не удалось отправить объявление: "+escape(str(e)[:300]))
 
-# Сообщение участнику из карточки.
-participant_message_mode = {}
-@dp.callback_query(F.data.startswith("user_message:"))
-async def user_message_cb(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id): return await cb.answer("❌ Нет прав",show_alert=True)
-    uid=cb.data.split(":",1)[1]
-    if uid not in data.get("users",{}): return await cb.answer("Участник не найден",show_alert=True)
-    participant_message_mode[cb.from_user.id]=uid
-    await cb.message.answer("📨 Напишите сообщение участнику одним сообщением.\nДля отмены: /cancel")
-    await cb.answer()
+# =========================================================
+# /ADMINS
+# =========================================================
 
-@dp.message(lambda m: m.from_user.id in participant_message_mode and bool(m.text))
-async def user_message_handler(message: Message):
-    uid=participant_message_mode.pop(message.from_user.id,None)
-    if not uid or not is_admin(message.from_user.id): return
-    try:
-        await bot.send_message(int(uid),"📨 <b>Сообщение от администрации:</b>\n\n"+escape(message.text))
-        await message.answer("✅ Сообщение отправлено.")
-        audit_record(message.from_user.id,"users","отправил сообщение участнику",f"{uid}: {message.text[:500]}")
-    except Exception as e: await message.answer("❌ Не удалось отправить сообщение: "+escape(str(e)[:300]))
+@dp.message(Command("admins"))
+async def admins_cmd(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец!")
+        return
 
-# Добавляем кнопку сообщения в карточку участника, если функция уже существует.
-try:
-    _old_user_card_keyboard = user_card_keyboard
-    def user_card_keyboard(uid):
-        kb=_old_user_card_keyboard(uid)
-        rows=list(kb.inline_keyboard)
-        rows.insert(-1,[InlineKeyboardButton(text="📨 Написать сообщение",callback_data=f"user_message:{uid}")])
-        return InlineKeyboardMarkup(inline_keyboard=rows)
-except Exception:
-    pass
+    text = "👑 <b>Админы</b>\n\n"
 
-# Общий сбор: короткий режим через кнопку. Отправляет упоминания известных участников.
-async def start_gather_from_button(message: Message):
-    if not is_admin(message.from_user.id): return await message.answer("❌ Нет прав")
-    members=[]
-    for uid,u in data.get("users",{}).items():
-        tag=u.get("tag")
-        if tag and tag != "—": members.append("@"+str(tag).lstrip("@"))
-    if not members:
-        return await message.answer("❌ Нет участников с @username.")
-    text="📢 <b>ОБЩИЙ СБОР!</b>\n\n"+" ".join(members)
-    try:
-        await bot.send_message(GROUP_ID,text,message_thread_id=ANNOUNCE_TOPIC_ID)
-        await message.answer(f"✅ Общий сбор отправлен. Упомянуто: {len(members)}")
-        audit_record(message.from_user.id,"commands","запустил общий сбор",f"Упомянуто: {len(members)}",command="кнопка: общий сбор")
-    except Exception as e: await message.answer("❌ Ошибка: "+escape(str(e)[:300]))
+    for i in sorted(get_admins()):
+        text += f"• {escape(get_admin_display(i))}\n"
 
-@dp.message(F.text == "📢 Объявление")
-async def announcement_btn(message: Message):
-    if not is_admin(message.from_user.id): return
-    announcement_mode[message.from_user.id]={"pin":False}
-    await message.answer("📣 Напишите текст объявления одним сообщением.")
+    await message.answer(text)
 
-@dp.message(F.text == "📢 Общий сбор")
-async def gather_btn(message: Message):
-    await start_gather_from_button(message)
 
-# Ежедневное напоминание тем, кого бот знает по группе, но у кого нет анкеты.
-async def reminder_worker():
-    while True:
-        try:
-            await asyncio.sleep(3600)
-            if not data.setdefault("bot_settings",{}).get("reminders_enabled"): continue
-            now=datetime.now()
-            for uid,info in list(data.get("group_members",{}).items()):
-                if str(uid) in data.get("users",{}): continue
-                last=data.setdefault("last_reminders",{}).get(str(uid))
-                if last:
-                    try:
-                        if (now-datetime.fromisoformat(last)).total_seconds()<86400: continue
-                    except Exception: pass
-                try:
-                    await bot.send_message(int(uid),"📋 Напоминание: пожалуйста, перейдите в бота и заполните анкету.")
-                    data["last_reminders"][str(uid)]=now.isoformat(); save_data()
-                except Exception: pass
-        except asyncio.CancelledError: return
-        except Exception as e: print("reminder_worker:",e)
+# =========================================================
+# /SET_TOKEN
+# =========================================================
+
+@dp.message(Command("set_token"))
+async def set_token(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("❌ Только владелец!")
+        return
+
+    await message.answer(
+        "🔐 Смена токена отключена в этой версии.\n"
+        "Токен должен храниться только в Render → Environment → BOT_TOKEN.\n\n"
+        "После изменения BOT_TOKEN в Render перезапусти сервис."
+    )
+
 
 # =========================================================
 # КОМАНДЫ TELEGRAM ПО РОЛЯМ
@@ -3598,28 +3746,64 @@ DEFAULT_COMMANDS = [
 ADMIN_COMMANDS = [
     BotCommand(command="start", description="🏠 Меню"),
     BotCommand(command="help", description="📖 Справка"),
+    BotCommand(command="ping", description="📡 Пинг"),
+    BotCommand(command="all", description="📢 Объявление"),
+    BotCommand(command="кто", description="👤 Информация об участнике"),
+    BotCommand(command="topic_id", description="🆔 ID темы"),
+    BotCommand(command="sbor", description="📢 Общий сбор"),
+    BotCommand(command="stopsbor", description="🛑 Остановить сбор"),
 ]
 
-OWNER_COMMANDS = ADMIN_COMMANDS
+OWNER_COMMANDS = ADMIN_COMMANDS + [
+    BotCommand(command="add", description="➕ Выдать админа/зама"),
+    BotCommand(command="remove", description="➖ Убрать админа/зама"),
+    BotCommand(command="admins", description="👑 Админы"),
+    BotCommand(command="logs", description="📜 Журнал действий"),
+]
+
 
 async def set_command_scopes():
-    # Все основные действия остаются в кнопках; команды — только резерв.
-    try:
-        await bot.set_my_commands(DEFAULT_COMMANDS, scope=BotCommandScopeDefault())
-    except Exception as e:
-        print(f"⚠️ Не удалось установить базовые команды: {e}")
+    # Обычным игрокам — только базовые команды.
+    await bot.set_my_commands(
+        DEFAULT_COMMANDS,
+        scope=BotCommandScopeDefault(),
+    )
+
+    # Админам — админские команды.
     for admin_id in get_admins():
+        if admin_id == SUPER_ADMIN:
+            continue
+
         try:
-            await bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=int(admin_id)))
-        except Exception as e:
-            print(f"⚠️ Не удалось установить команды для {admin_id}: {e}")
+            await bot.set_my_commands(
+                ADMIN_COMMANDS,
+                scope=BotCommandScopeChat(chat_id=admin_id),
+            )
+        except Exception:
+            pass
+
+    # Владельцу — полный набор.
     try:
-        await bot.set_my_commands(OWNER_COMMANDS, scope=BotCommandScopeChat(chat_id=SUPER_ADMIN))
-    except Exception as e:
-        print(f"⚠️ Не удалось установить команды владельца: {e}")
+        await bot.set_my_commands(
+            OWNER_COMMANDS,
+            scope=BotCommandScopeChat(chat_id=SUPER_ADMIN),
+        )
+    except Exception:
+        pass
+
+
+# =========================================================
+# ЗАПУСК
+# =========================================================
 
 async def main():
     print("🤖 Бот запускается...")
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        print("⚠️ Google Sheets: GOOGLE_SERVICE_ACCOUNT_JSON отсутствует; синхронизация выключена.")
+    elif gspread is None or Credentials is None:
+        print("⚠️ Google Sheets: отсутствуют gspread/google-auth в окружении.")
+    else:
+        print("✅ Google Sheets: настройки найдены; для проверки и синхронизации отправь владельцу /sync_sheets.")
 
     if not DATABASE_URL:
         raise RuntimeError(
@@ -3644,7 +3828,6 @@ async def main():
     print("🤖 Бот запущен!")
     print("📌 Основная группа:", GROUP_LINK)
 
-    asyncio.create_task(reminder_worker())
     await dp.start_polling(bot)
 
 
