@@ -599,45 +599,44 @@ def load_data():
 _db_save_task = None
 _db_save_pending = False
 
-def _persist_snapshot(snapshot):
-    """Тяжёлая запись выполняется вне event loop, чтобы Telegram не ждал диск/БД."""
-    _write_local_json(DATA_FILE, snapshot)
-    if DATABASE_URL and psycopg2 is not None:
-        _db_set("data", snapshot)
-
 async def _flush_db_save():
     global _db_save_task, _db_save_pending
     try:
         while _db_save_pending:
             _db_save_pending = False
-            # Небольшой debounce: несколько кликов/аудит-событий объединяются в одну запись.
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.25)
             snapshot = json.loads(json.dumps(data, ensure_ascii=False))
-            await asyncio.to_thread(_persist_snapshot, snapshot)
+            if DATABASE_URL and psycopg2 is not None:
+                await asyncio.to_thread(_db_set, "data", snapshot)
     except Exception as e:
-        print(f"⚠️ Ошибка фонового сохранения данных: {e}")
+        print(f"⚠️ Ошибка фонового сохранения PostgreSQL: {e}")
     finally:
         _db_save_task = None
 
 def save_data():
-    """Неблокирующее сохранение. Диск и PostgreSQL никогда не тормозят обработчик Telegram."""
+    """Быстро сохраняет локальную копию, а PostgreSQL обновляет в фоне.
+    Это убирает задержки на каждом нажатии кнопки/записи журнала.
+    """
     global _db_save_task, _db_save_pending
+    _write_local_json(DATA_FILE, data)
+    if not (DATABASE_URL and psycopg2 is not None):
+        return
     _db_save_pending = True
     try:
         loop = asyncio.get_running_loop()
         if _db_save_task is None or _db_save_task.done():
             _db_save_task = loop.create_task(_flush_db_save())
     except RuntimeError:
-        # Вне event loop сохраняем синхронно — это только старт/служебные операции.
-        snapshot = json.loads(json.dumps(data, ensure_ascii=False))
-        _persist_snapshot(snapshot)
+        # Вне event loop (например, при старте/миграции) сохраняем сразу.
+        _db_set("data", json.loads(json.dumps(data, ensure_ascii=False)))
 
 async def save_data_now():
-    """Принудительно дождаться записи текущего состояния в PostgreSQL и файл."""
+    """Принудительно дождаться записи текущего состояния в PostgreSQL."""
     global _db_save_pending
     _db_save_pending = False
-    snapshot = json.loads(json.dumps(data, ensure_ascii=False))
-    await asyncio.to_thread(_persist_snapshot, snapshot)
+    if DATABASE_URL and psycopg2 is not None:
+        snapshot = json.loads(json.dumps(data, ensure_ascii=False))
+        await asyncio.to_thread(_db_set, "data", snapshot)
 
 
 def load_logs():
@@ -1136,7 +1135,15 @@ def admin_keyboard(user_id, has_survey=False):
         KeyboardButton(text="🟢 Статус бота"),
     )
     b.row(
-        KeyboardButton(text="🛠 Админка"),
+        KeyboardButton(text="📢 Объявление"),
+        KeyboardButton(text="📢 Общий сбор"),
+    )
+    if is_super_admin(user_id):
+        b.row(
+            KeyboardButton(text="🛠 Админка"),
+        )
+    b.row(
+        KeyboardButton(text="🛑 Остановить сбор"),
     )
 
     if has_survey:
@@ -1425,7 +1432,7 @@ async def survey_handler(message: Message):
                 [
                     InlineKeyboardButton(
                         text=z,
-                        callback_data=f"zam_{z}",
+                        callback_data=f"survey_zam:{z}",
                     )
                 ]
                 for z in zams
@@ -1501,7 +1508,7 @@ async def org_selected(cb: CallbackQuery):
             user_surveys.pop(uid, None)
             await cb.message.answer("⚠️ Сейчас замов нет. Обратитесь к администрации.")
             return
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=z, callback_data=f"zam_{z}")] for z in zams])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=z, callback_data=f"survey_zam:{z}")] for z in zams])
         await cb.message.answer("👤 Кто вас пригласил?", reply_markup=kb)
         return
 
@@ -1513,7 +1520,7 @@ async def org_selected(cb: CallbackQuery):
 # ВЫБОР ЗАМА
 # =========================================================
 
-@dp.callback_query(F.data.startswith("zam_"))
+@dp.callback_query(F.data.startswith("survey_zam:"))
 async def zam_selected(cb: CallbackQuery):
     uid = cb.from_user.id
 
@@ -1521,7 +1528,7 @@ async def zam_selected(cb: CallbackQuery):
         await cb.answer("❌ Анкета не найдена.")
         return
 
-    zam = cb.data[4:]
+    zam = cb.data.split(":", 1)[1]
 
     if zam not in data["zam_data"]:
         await cb.answer(
@@ -1797,15 +1804,19 @@ def application_keyboard(app_id):
     ])
 
 
+def application_status_label(status):
+    return {
+        "pending": "🟠 Ожидает",
+        "accepted": "🟢 Принята",
+        "rejected": "🔴 Отклонена",
+        "cancelled": "⚪ Отменена",
+    }.get(status, "⚪ Неизвестно")
+
+
 def application_text(app, idx=None):
     u = app.get("data", {})
     status = app.get("status", "pending")
-    status_text = {
-        "pending": "⏳ Ожидает решения",
-        "accepted": "✅ Принята",
-        "rejected": "❌ Отклонена",
-        "cancelled": "🚫 Отменена",
-    }.get(status, status)
+    status_text = application_status_label(status)
     prefix = f"<b>Заявка #{idx}</b>" if idx is not None else "<b>Заявка</b>"
     return (
         f"{prefix}\n"
@@ -1874,7 +1885,7 @@ async def send_apps_page(message, status="pending", page=0, query=""):
         return
     app_id, app = items[page]
     total = len(items)
-    header = f"📋 <b>Управление заявками</b>\nКатегория: <b>{escape(status)}</b> | Найдено: <b>{total}</b>\n\n"
+    header = f"📋 <b>Управление заявками</b>\nКатегория: <b>{escape(application_status_label(status) if status != 'all' else '📋 Все')}</b> | Найдено: <b>{total}</b>\n\n"
     await message.answer(header + application_text(app, page + 1), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept:{app_id}"),
          InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{app_id}")],
@@ -1917,6 +1928,7 @@ async def apps_page_cb(cb: CallbackQuery):
 
 
 admin_search_mode = {}
+announcement_mode = {}
 
 @dp.callback_query(F.data == "apps_search")
 async def apps_search_cb(cb: CallbackQuery):
@@ -2387,15 +2399,9 @@ async def admin_panel(message: Message):
         return
     await message.answer(
         "👑 <b>Управление администраторами</b>\n\n"
-        "<code>/add_admin @username</code> — добавить\n"
-        "<code>/remove_admin @username</code> — удалить\n\n"
-        "Также работают:\n"
-        "<code>/add admin @username</code>\n"
-        "<code>/remove admin @username</code>\n\n"
-        "Если Telegram ещё не сообщает ID пользователя, бот поставит его в ожидание и "
-        "автоматически выдаст админку при первом замеченном сообщении этого пользователя."
+        "Выберите действие:",
+        reply_markup=admin_panel_keyboard(),
     )
-
 
 # Быстрый кэш диалогов владельца: не обращаемся к Telethon при каждом открытии.
 owner_dialog_cache = {"time": 0.0, "users": []}
@@ -2822,7 +2828,8 @@ async def zam_add_cb(cb: CallbackQuery):
     if not is_super_admin(cb.from_user.id):
         await cb.answer("❌ Только владелец!", show_alert=True)
         return
-    await cb.message.answer("➕ Используй: <code>/add_zam @username Game_Nick</code>")
+    zam_edit_mode[cb.from_user.id] = {"action": "add"}
+    await cb.message.answer("➕ Введите: <code>@username Game_Nick</code>")
     await cb.answer()
 
 
@@ -2831,7 +2838,13 @@ async def zam_remove_cb(cb: CallbackQuery):
     if not is_super_admin(cb.from_user.id):
         await cb.answer("❌ Только владелец!", show_alert=True)
         return
-    await cb.message.answer("➖ Используй: <code>/remove_zam Game_Nick</code>")
+    zams = get_zam_nicknames()
+    if not zams:
+        await cb.answer("Замов пока нет", show_alert=True)
+        return
+    rows = [[InlineKeyboardButton(text=f"👑 {z[:28]}", callback_data=f"zam_confirmremove:{z}")] for z in zams]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="zams_back")])
+    await cb.message.edit_text("➖ <b>Выберите зама для удаления:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await cb.answer()
 
 
@@ -2985,6 +2998,14 @@ async def zam_confirmremove_cb(cb: CallbackQuery):
     nick=cb.data.split(":",1)[1]
     await cb.message.edit_text(f"⚠️ Удалить <b>{escape(nick)}</b> из замов?",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Да, удалить",callback_data=f"zam_doremove:{nick}")],[InlineKeyboardButton(text="↩️ Отмена",callback_data=f"zam_view:{nick}")]])); await cb.answer()
 
+@dp.callback_query(F.data == "zams_back")
+async def zams_back_cb(cb: CallbackQuery):
+    if not is_super_admin(cb.from_user.id):
+        await cb.answer("❌ Только владелец!", show_alert=True); return
+    await cb.message.edit_text("👑 <b>Управление замами</b>", reply_markup=zams_panel_keyboard())
+    await cb.answer()
+
+
 @dp.callback_query(F.data.startswith("zam_doremove:"))
 async def zam_doremove_cb(cb: CallbackQuery):
     if not is_super_admin(cb.from_user.id): await cb.answer("❌",show_alert=True); return
@@ -2998,6 +3019,14 @@ async def zam_edit_text(message: Message):
     if not is_super_admin(message.from_user.id): return
     state=zam_edit_mode.pop(message.from_user.id,None)
     if not state: return
+    if state.get("action") == "add":
+        args = message.text.strip().split(maxsplit=1)
+        if len(args) < 2:
+            await message.answer("❌ Формат: <code>@username Game_Nick</code>")
+            return
+        await add_zam_by_username(message, args[0], args[1])
+        await send_zam_stats(message, 0)
+        return
     old=state["old_nick"]; field=state["field"]
     if old not in data.get("zam_data",{}): await message.answer("❌ Зам не найден."); return
     val=message.text.strip()
@@ -3194,497 +3223,12 @@ async def myid_cmd(message: Message):
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
     if is_super_admin(message.from_user.id):
-        text = (
-            "📋 <b>Команды владельца:</b>\n\n"
-            "/start — меню\n"
-            "/help — справка\n"
-            "/ping — пинг\n"
-            "/all — объявление\n"
-            "/add admin — выдать админа\n"
-            "/add zam — добавить зама\n"
-            "/remove admin — удалить админа\n"
-            "/remove zam — удалить зама\n"
-            "/add_zam — добавить зама\n"
-            "/remove_zam — удалить зама\n"
-            "/admins — список админов\n"
-            "/zam_stats — статистика замов\n"
-            "/logs — журнал\n"
-            "/clearlogs — очистить журнал\n"
-            "/log_on — уведомления вкл\n"
-            "/log_off — уведомления выкл\n"
-            "/topic_id — ID темы\n"
-            "/sbor — общий сбор\n"
-            "/stopsbor — остановить сбор\n"
-            "/set_token — смена токена\n"
-        )
+        text = "📋 <b>Управление ботом</b>\n\nВсе основные действия доступны через кнопки меню.\n\n👑 Владелец: управление админами, замами, заявками, участниками и журналом.\n🛡 Админы: заявки, участники, объявления и общий сбор."
     elif is_admin(message.from_user.id):
-        text = (
-            "📋 <b>Команды администратора:</b>\n\n"
-            "/start — меню\n"
-            "/help — справка\n"
-            "/ping — пинг\n"
-            "/all — объявление\n"
-            "/кто — информация об участнике\n"
-            "/topic_id — ID темы\n"
-            "/sbor — общий сбор\n"
-            "/stopsbor — остановить сбор\n"
-        )
+        text = "📋 <b>Панель администратора</b>\n\nВсе основные действия доступны через кнопки меню.\n\n📝 Заявки • 👥 Участники • 📢 Объявления • 📢 Общий сбор"
     else:
-        text = (
-            "📋 <b>Команды:</b>\n\n"
-            "/start — меню\n"
-            "/help — справка\n"
-        )
-
+        text = "📋 <b>Меню</b>\n\nЗаполнение анкеты и просмотр профиля доступны через кнопки ниже."
     await message.answer(text)
-
-
-# =========================================================
-# ОБЩИЙ СБОР
-# =========================================================
-
-GATHER_DURATION_SECONDS = 90
-GATHER_INTERVAL_SECONDS = 20
-GATHER_CHUNK_SIZE = 25
-
-
-def _is_known_group_member(user_id):
-    uid = str(user_id)
-    if uid in data.get("group_members", {}):
-        return True
-
-    # Пользователи с заполненной анкетой считаются кандидатами для созыва
-    # только после того, как бот видел их в группе. Это не даёт тегать людей,
-    # которых мог уже не быть в чате.
-    return False
-
-
-async def get_gather_members():
-    """
-    Получает АКТУАЛЬНЫЙ полный список участников группы через
-    пользовательскую Telegram-сессию Telethon.
-
-    Bot API не умеет выдавать полный список участников супергруппы,
-    поэтому для команды «общий сбор» используется именно user-session.
-    Если Telethon не подключен, используем сохранённых участников как
-    безопасный fallback и явно сообщаем об этом в логи.
-    """
-    members = []
-
-    if telegram_user_is_ready():
-        try:
-            entity = None
-
-            # Сначала пытаемся найти группу среди диалогов пользовательской сессии.
-            async for dialog in telegram_user_client.iter_dialogs():
-                try:
-                    peer_id = utils.get_peer_id(dialog.entity)
-                    if peer_id == GROUP_ID:
-                        entity = dialog.entity
-                        break
-                except Exception:
-                    continue
-
-            # Если в диалогах не нашли — пробуем получить сущность напрямую.
-            if entity is None:
-                try:
-                    entity = await telegram_user_client.get_entity(GROUP_ID)
-                except Exception:
-                    entity = None
-
-            if entity is not None:
-                seen = set()
-
-                async for user in telegram_user_client.iter_participants(entity):
-                    try:
-                        user_id = int(user.id)
-                    except (TypeError, ValueError):
-                        continue
-
-                    if user_id in seen:
-                        continue
-                    seen.add(user_id)
-
-                    if getattr(user, "bot", False):
-                        continue
-                    if getattr(user, "deleted", False):
-                        continue
-
-                    first = getattr(user, "first_name", None) or ""
-                    last = getattr(user, "last_name", None) or ""
-                    full_name = f"{first} {last}".strip()
-                    username = getattr(user, "username", None)
-
-                    if not full_name:
-                        full_name = username or str(user_id)
-
-                    member = {
-                        "id": user_id,
-                        "name": full_name,
-                        "username": username,
-                    }
-                    members.append(member)
-
-                    # Обновляем локальный кэш тоже: тогда /список участников
-                    # и другие функции знают актуальных людей.
-                    data.setdefault("group_members", {})[str(user_id)] = {
-                        "id": user_id,
-                        "username": username,
-                        "full_name": full_name,
-                        "last_seen": datetime.now().isoformat(),
-                    }
-
-                save_data()
-                print(f"✅ Общий сбор: Telethon получил {len(members)} участников группы.")
-                return members
-
-            print("⚠️ Telethon подключен, но группа не найдена в пользовательской сессии.")
-
-        except Exception as e:
-            print(f"⚠️ Не удалось получить полный список участников через Telethon: {e}")
-
-    # Fallback — только ранее известных боту участников.
-    # Это не является полным списком, поэтому без user-session полный созыв
-    # сделать технически невозможно.
-    for uid, info in data.get("group_members", {}).items():
-        try:
-            user_id = int(uid)
-        except (TypeError, ValueError):
-            continue
-
-        full_name = (
-            info.get("full_name")
-            or info.get("username")
-            or str(user_id)
-        ).strip()
-
-        members.append({
-            "id": user_id,
-            "name": full_name,
-            "username": info.get("username"),
-        })
-
-    # Дополнительно подтягиваем принятых участников из анкет — если Bot API
-    # может подтвердить, что конкретный пользователь сейчас в группе.
-    known_ids = {m["id"] for m in members}
-    for app in data.get("applications", {}).values():
-        if app.get("status") != "accepted":
-            continue
-        try:
-            user_id = int(app.get("user_id"))
-        except (TypeError, ValueError):
-            continue
-        if user_id in known_ids:
-            continue
-
-        try:
-            member = await bot.get_chat_member(GROUP_ID, user_id)
-            status = getattr(member, "status", "")
-            is_member = status in {"member", "administrator", "creator"}
-            if status == "restricted":
-                is_member = bool(getattr(member, "is_member", False))
-            if not is_member:
-                continue
-
-            user = getattr(member, "user", None)
-            if not user or user.is_bot:
-                continue
-
-            members.append({
-                "id": user.id,
-                "name": user.full_name or user.username or str(user.id),
-                "username": user.username or None,
-            })
-            known_ids.add(user.id)
-        except Exception:
-            continue
-
-    unique = {}
-    for member in members:
-        unique[member["id"]] = member
-
-    return list(unique.values())
-
-def mention_html(member):
-    name = member.get("name") or member.get("username") or str(member["id"])
-    return f'<a href="tg://user?id={member["id"]}">{escape(name)}</a>'
-
-
-def chunk_mentions(members, size=GATHER_CHUNK_SIZE):
-    for i in range(0, len(members), size):
-        yield members[i:i + size]
-
-
-async def send_gather_wave(members, wave_no, total_waves):
-    header = (
-        f"📢 <b>ОБЩИЙ СБОР</b>\n\n"
-        f"Созыв: <b>{wave_no}/{total_waves}</b>\n"
-        f"⏱️ Необходимо собраться всем участникам.\n\n"
-    )
-
-    chunks = list(chunk_mentions(members))
-    if not chunks:
-        return False
-
-    for index, chunk in enumerate(chunks):
-        body = " ".join(mention_html(member) for member in chunk)
-        text = header if index == 0 else "📢 <b>ОБЩИЙ СБОР — продолжение</b>\n\n"
-        text += body
-
-        try:
-            await bot.send_message(
-                GROUP_ID,
-                text,
-            )
-        except Exception as e:
-            print(f"⚠️ Ошибка общего сбора: {e}")
-
-    return True
-
-
-async def run_gather():
-    try:
-        members = await get_gather_members()
-        if not members:
-            print("⚠️ Общий сбор: нет известных участников для упоминания.")
-            return
-
-        total_waves = (GATHER_DURATION_SECONDS // GATHER_INTERVAL_SECONDS) + 1
-
-        for wave in range(total_waves):
-            # Заново собираем список перед каждой волной: новые люди, написавшие
-            # в чат во время сбора, автоматически попадут в следующую волну.
-            members = await get_gather_members()
-            if not members:
-                break
-
-            await send_gather_wave(members, wave + 1, total_waves)
-
-            if wave < total_waves - 1:
-                await asyncio.sleep(GATHER_INTERVAL_SECONDS)
-
-    finally:
-        gather_tasks.pop(GROUP_ID, None)
-
-
-@dp.message(Command("sbor"))
-async def gather_command(message: Message):
-    if message.chat.id != GROUP_ID:
-        await message.answer("❌ Команду «сбор» нужно запускать в группе.")
-        return
-
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Только админы могут объявлять общий сбор!")
-        return
-
-    current = gather_tasks.get(GROUP_ID)
-    if current and not current.done():
-        await message.answer(
-            "📢 <b>Общий сбор уже идёт.</b>\n"
-            "Участники продолжают получать призывы в течение ближайшей минуты."
-        )
-        return
-
-    task = asyncio.create_task(run_gather())
-    gather_tasks[GROUP_ID] = task
-
-    await message.answer(
-        "🚨 <b>ОБЩИЙ СБОР ЗАПУЩЕН!</b>\n\n"
-        "Всех известных боту участников начну повторно призывать каждые "
-        f"{GATHER_INTERVAL_SECONDS} сек. в течение {GATHER_DURATION_SECONDS} сек."
-    )
-
-
-@dp.message(Command("stopsbor"))
-async def stop_gather_command(message: Message):
-    if message.chat.id != GROUP_ID:
-        await message.answer("❌ Команду нужно запускать в группе.")
-        return
-
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Только админы!")
-        return
-
-    task = gather_tasks.get(GROUP_ID)
-    if not task or task.done():
-        await message.answer("ℹ️ Сейчас общий сбор не идёт.")
-        return
-
-    task.cancel()
-    gather_tasks.pop(GROUP_ID, None)
-    await message.answer("🛑 <b>Общий сбор остановлен.</b>")
-
-
-# Команда без слеша: «общий сбор» или «Общий сбор».
-@dp.message(F.chat.id == GROUP_ID, F.text.func(lambda text: bool(text and text.strip().lower() == "общий сбор")))
-async def gather_phrase(message: Message):
-    await gather_command(message)
-
-
-# =========================================================
-# ЗАЩИТА ТЕМЫ НОВОСТИ
-# =========================================================
-
-@dp.message(F.chat.id == GROUP_ID)
-async def protect_topic(message: Message):
-    if message.message_thread_id == ANNOUNCE_TOPIC_ID:
-        if not is_admin(message.from_user.id):
-            try:
-                await message.delete()
-
-                await bot.send_message(
-                    GROUP_ID,
-                    f"❌ {escape(message.from_user.full_name)}, "
-                    f"только админы могут писать здесь!",
-                    reply_to_message_id=message.message_id,
-                )
-            except Exception:
-                pass
-
-
-# =========================================================
-# /ALL
-# =========================================================
-
-@dp.message(Command("all"))
-async def all_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Только админы!")
-        return
-
-    args = message.text.split(maxsplit=1)
-    audit_record(message.from_user.id, "commands", "выполнил /all", message.text or "", message.text or "")
-
-    if len(args) < 2:
-        await message.answer("❌ Использование: <code>/all</code> <code>текст</code>")
-        return
-
-    try:
-        await bot.send_message(
-            GROUP_ID,
-            f"⚠️ <b>ВАЖНОЕ ОБЪЯВЛЕНИЕ</b>\n\n"
-            f"{escape(args[1])}\n\n"
-            f"@all",
-            message_thread_id=ANNOUNCE_TOPIC_ID,
-        )
-
-        await message.answer("✅ Отправлено.")
-
-    except Exception as e:
-        await message.answer(f"❌ {escape(str(e))}")
-
-
-# =========================================================
-# /TOPIC_ID
-# =========================================================
-
-@dp.message(Command("topic_id"))
-async def topic_id(message: Message):
-    if message.chat.id == GROUP_ID and message.message_thread_id:
-        await message.answer(
-            f"ID: {message.message_thread_id}"
-        )
-    else:
-        await message.answer("❌ Не в теме.")
-
-
-# =========================================================
-# /ADMINS
-# =========================================================
-
-@dp.message(Command("admins"))
-async def admins_cmd(message: Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("❌ Только владелец!")
-        return
-
-    text = "👑 <b>Админы</b>\n\n"
-
-    for i in sorted(get_admins()):
-        text += f"• {escape(get_admin_display(i))}\n"
-
-    await message.answer(text)
-
-
-# =========================================================
-# /SET_TOKEN
-# =========================================================
-
-@dp.message(Command("set_token"))
-async def set_token(message: Message):
-    if not is_super_admin(message.from_user.id):
-        await message.answer("❌ Только владелец!")
-        return
-
-    await message.answer(
-        "🔐 Смена токена отключена в этой версии.\n"
-        "Токен должен храниться только в Render → Environment → BOT_TOKEN.\n\n"
-        "После изменения BOT_TOKEN в Render перезапусти сервис."
-    )
-
-
-# =========================================================
-# КОМАНДЫ TELEGRAM ПО РОЛЯМ
-# =========================================================
-
-DEFAULT_COMMANDS = [
-    BotCommand(command="start", description="🏠 Меню"),
-    BotCommand(command="help", description="📖 Справка"),
-    BotCommand(command="myid", description="🆔 Мой Telegram ID"),
-]
-
-ADMIN_COMMANDS = [
-    BotCommand(command="start", description="🏠 Меню"),
-    BotCommand(command="help", description="📖 Справка"),
-    BotCommand(command="ping", description="📡 Пинг"),
-    BotCommand(command="all", description="📢 Объявление"),
-    BotCommand(command="кто", description="👤 Информация об участнике"),
-    BotCommand(command="topic_id", description="🆔 ID темы"),
-    BotCommand(command="sbor", description="📢 Общий сбор"),
-    BotCommand(command="stopsbor", description="🛑 Остановить сбор"),
-]
-
-OWNER_COMMANDS = ADMIN_COMMANDS + [
-    BotCommand(command="add", description="➕ Выдать админа/зама"),
-    BotCommand(command="remove", description="➖ Убрать админа/зама"),
-    BotCommand(command="admins", description="👑 Админы"),
-    BotCommand(command="logs", description="📜 Журнал действий"),
-]
-
-
-async def set_command_scopes():
-    # Обычным игрокам — только базовые команды.
-    await bot.set_my_commands(
-        DEFAULT_COMMANDS,
-        scope=BotCommandScopeDefault(),
-    )
-
-    # Админам — админские команды.
-    for admin_id in get_admins():
-        if admin_id == SUPER_ADMIN:
-            continue
-
-        try:
-            await bot.set_my_commands(
-                ADMIN_COMMANDS,
-                scope=BotCommandScopeChat(chat_id=admin_id),
-            )
-        except Exception:
-            pass
-
-    # Владельцу — полный набор.
-    try:
-        await bot.set_my_commands(
-            OWNER_COMMANDS,
-            scope=BotCommandScopeChat(chat_id=SUPER_ADMIN),
-        )
-    except Exception:
-        pass
-
-
-# =========================================================
-# ЗАПУСК
-# =========================================================
 
 async def main():
     print("🤖 Бот запускается...")
