@@ -365,6 +365,7 @@ class AdminPermissionMiddleware(BaseMiddleware):
         "🛠 Админка": "admins",
         "☁️ Google Таблица": "sheets",
         "⚙️ Настройки": "settings",
+        "🔔 Напоминания": "reminders",
     }
 
     def callback_permission(self, cd):
@@ -377,10 +378,11 @@ class AdminPermissionMiddleware(BaseMiddleware):
         if cd.startswith("perm:"): return "admins"
         if cd.startswith("sheets:"): return "sheets"
         if cd.startswith("set:"): return "settings"
+        if cd.startswith("rem:"): return "reminders"
         if cd.startswith("announce_target:"): return "announcements"
         if cd.startswith("dash:"):
             action=cd.split(":",1)[1]
-            return {"apps":"applications","users":"users","zams":"zams","stats":"stats","announce":"announcements","sbor":"gathering","audit":"audit","sheets":"sheets","admins":"admins","settings":"settings"}.get(action)
+            return {"apps":"applications","users":"users","zams":"zams","stats":"stats","announce":"announcements","sbor":"gathering","audit":"audit","sheets":"sheets","admins":"admins","settings":"settings","reminders":"reminders"}.get(action)
         return None
 
     async def __call__(self, handler, event, data_ctx):
@@ -769,6 +771,7 @@ defaults = {
     "notify_settings": {},
     "bot_settings": {"reminders_enabled": False, "pin_announcements": False},
     "last_reminders": {},
+    "reminders": [],
     "admin_permissions": {},
 }
 
@@ -796,6 +799,11 @@ if not isinstance(data.get("bot_settings"), dict):
     changed = True
 if not isinstance(data.get("last_reminders"), dict):
     data["last_reminders"] = {}
+    changed = True
+if not isinstance(data.get("reminders"), list):
+    data["reminders"] = []
+if not data.setdefault("bot_settings", {}).get("timezone"):
+    data["bot_settings"]["timezone"] = "Europe/Moscow"
     changed = True
 
 if not data.get("admins"):
@@ -1081,6 +1089,7 @@ ADMIN_PERMISSION_DEFS = [
     ("settings", "⚙️ Настройки"),
     ("sheets", "☁️ Google Таблица"),
     ("participant_message", "📨 Сообщения участникам"),
+    ("reminders", "🔔 Напоминания"),
 ]
 
 ADMIN_PERMISSION_LABELS = dict(ADMIN_PERMISSION_DEFS)
@@ -1100,6 +1109,7 @@ DEFAULT_ADMIN_PERMISSIONS = {
     "settings": False,
     "sheets": False,
     "participant_message": True,
+    "reminders": False,
 }
 
 
@@ -1282,38 +1292,30 @@ def main_keyboard(has_survey=False):
 
 
 def admin_keyboard(user_id, has_survey=False):
+    """Удобное компактное меню администратора: основные действия сверху,
+    расширенные разделы — в панели управления."""
     b = ReplyKeyboardBuilder()
-
     rows = []
     if admin_can(user_id, "applications"):
-        rows.append([KeyboardButton(text="📋 Управление заявками"), KeyboardButton(text="⏳ Активные заявки")])
+        rows.append([KeyboardButton(text="📋 Заявки"), KeyboardButton(text="⏳ Активные заявки")])
     if admin_can(user_id, "users"):
-        rows.append([KeyboardButton(text="👥 Список участников")])
-    if admin_can(user_id, "status"):
-        rows.append([KeyboardButton(text="🟢 Статус бота")])
+        rows.append([KeyboardButton(text="👥 Участники"), KeyboardButton(text="📊 Статистика")]) if admin_can(user_id, "stats") else rows.append([KeyboardButton(text="👥 Участники")])
+    elif admin_can(user_id, "stats"):
+        rows.append([KeyboardButton(text="📊 Статистика")])
     if admin_can(user_id, "announcements"):
         rows.append([KeyboardButton(text="📢 Объявление")])
     if admin_can(user_id, "gathering"):
         rows.append([KeyboardButton(text="📢 Общий сбор")])
-    if any(admin_can(user_id, p) for p in ("applications","users","announcements","gathering","zams","stats","audit","admins","settings","sheets")):
-        rows.append([KeyboardButton(text="🏠 Панель управления")])
-    if admin_can(user_id, "stats"):
-        rows.append([KeyboardButton(text="📊 Статистика")])
-    if admin_can(user_id, "gathering") and is_super_admin(user_id):
-        rows.append([KeyboardButton(text="🛑 Остановить сбор")])
-    if has_survey:
-        rows.append([KeyboardButton(text="🔄 Перезаполнить анкету")])
+    if admin_can(user_id, "reminders"):
+        rows.append([KeyboardButton(text="🔔 Напоминания")])
     if admin_can(user_id, "zams"):
         rows.append([KeyboardButton(text="👑 Замы")])
-    if admin_can(user_id, "audit"):
-        rows.append([KeyboardButton(text="📜 Журнал действий")])
-    if admin_can(user_id, "sheets"):
-        rows.append([KeyboardButton(text="☁️ Google Таблица")])
-    if admin_can(user_id, "settings"):
-        rows.append([KeyboardButton(text="⚙️ Настройки")])
-    if admin_can(user_id, "admins"):
-        rows.append([KeyboardButton(text="🛠 Админка")])
-
+    if has_survey:
+        rows.append([KeyboardButton(text="🔄 Перезаполнить анкету")])
+    if any(admin_can(user_id, p) for p in ("audit","admins","settings","sheets","status")):
+        rows.append([KeyboardButton(text="🏠 Панель управления")])
+    if admin_can(user_id, "status"):
+        rows.append([KeyboardButton(text="🟢 Статус бота")])
     for row in rows:
         b.row(*row)
     return b.as_markup(resize_keyboard=True)
@@ -3480,6 +3482,8 @@ def dashboard_keyboard(uid):
         rows.append([InlineKeyboardButton(text="🛡 Админы", callback_data="dash:admins")])
     if admin_can(uid, "settings"):
         rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data="dash:settings")])
+    if admin_can(uid, "reminders"):
+        rows.append([InlineKeyboardButton(text="🔔 Напоминания", callback_data="dash:reminders")])
     return InlineKeyboardMarkup(inline_keyboard=rows or [[InlineKeyboardButton(text="📭 Нет доступных функций", callback_data="dash:none")]])
 
 
@@ -3491,6 +3495,7 @@ def settings_keyboard():
         [InlineKeyboardButton(text=f"{rem} Напоминания об анкетах", callback_data="set:reminders")],
         [InlineKeyboardButton(text=f"{pin} Закреплять объявления", callback_data="set:pin")],
         [InlineKeyboardButton(text="🔔 Уведомления админа", callback_data="set:notify")],
+        [InlineKeyboardButton(text="🔔 Управление напоминаниями", callback_data="rem:menu")],
         [InlineKeyboardButton(text="🧹 Проверить дубли", callback_data="set:duplicates")],
         [InlineKeyboardButton(text="◀️ Панель", callback_data="dash:home")],
     ])
@@ -3649,6 +3654,7 @@ async def dashboard_cb(cb: CallbackQuery):
     elif action=="audit": await send_audit_page(cb.message)
     elif action=="admins": await cb.message.edit_text("🛡 <b>Админка</b>",reply_markup=admin_panel_keyboard())
     elif action=="settings": await cb.message.edit_text("⚙️ <b>Настройки бота</b>",reply_markup=settings_keyboard())
+    elif action=="reminders": await cb.message.edit_text(reminders_text(), reply_markup=reminders_keyboard())
     elif action=="sheets":
         url=google_sheet_url(); await cb.message.edit_text("☁️ <b>Google Таблица</b>\n\n"+(escape(url) if url else "Таблица ещё не создана."),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Синхронизировать",callback_data="sheets:sync")],[InlineKeyboardButton(text="◀️ Панель",callback_data="dash:home")]]))
     elif action=="announce":
@@ -3682,6 +3688,416 @@ async def sheets_sync_cb(cb: CallbackQuery):
         await cb.message.edit_text("✅ <b>Google Таблица обновлена.</b>\n\n"+escape(result.get("url","")),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Обновить ещё раз",callback_data="sheets:sync")],[InlineKeyboardButton(text="◀️ Панель",callback_data="dash:home")]]))
     else:
         await cb.message.edit_text("❌ <b>Google Таблица не настроена</b>\n\n"+escape(result.get("error","Неизвестная ошибка"))+"\n\nДобавь GOOGLE_SERVICE_ACCOUNT_JSON в Render и дай сервисному аккаунту доступ к таблице.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Панель",callback_data="dash:home")]]))
+
+# =========================================================
+# ЕЖЕДНЕВНЫЕ НАПОМИНАНИЯ
+# =========================================================
+
+reminder_mode = {}
+
+REMINDER_TARGETS = {
+    "group": "👥 Группа",
+    "topic": "🧵 Конкретная тема",
+    "dm": "👤 ЛС всем участникам",
+}
+
+TIMEZONES = {
+    "Europe/Moscow": "🇷🇺 Москва (МСК)",
+    "Europe/Kaliningrad": "🇷🇺 Калининград",
+    "Europe/Samara": "🇷🇺 Самара",
+    "Europe/Volgograd": "🇷🇺 Волгоград",
+    "Asia/Yekaterinburg": "🇷🇺 Екатеринбург",
+    "Asia/Omsk": "🇷🇺 Омск",
+    "Asia/Novosibirsk": "🇷🇺 Новосибирск",
+    "Asia/Krasnoyarsk": "🇷🇺 Красноярск",
+    "Asia/Irkutsk": "🇷🇺 Иркутск",
+    "Asia/Yakutsk": "🇷🇺 Якутск",
+    "Asia/Vladivostok": "🇷🇺 Владивосток",
+    "Asia/Magadan": "🇷🇺 Магадан",
+    "Asia/Kamchatka": "🇷🇺 Камчатка",
+    "Europe/Berlin": "🇩🇪 Берлин",
+}
+
+
+def _next_reminder_id():
+    ids = []
+    for r in data.get("reminders", []):
+        try: ids.append(int(r.get("id", 0)))
+        except Exception: pass
+    return max(ids, default=0) + 1
+
+
+def _reminder_by_id(rid):
+    try: rid = int(rid)
+    except Exception: return None
+    for r in data.get("reminders", []):
+        try:
+            if int(r.get("id", -1)) == rid: return r
+        except Exception: pass
+    return None
+
+
+def _valid_hhmm(value):
+    return bool(re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value.strip()))
+
+
+def _bot_timezone_name():
+    return str(data.setdefault("bot_settings", {}).get("timezone") or "Europe/Moscow")
+
+
+def _bot_timezone_label():
+    name = _bot_timezone_name()
+    return TIMEZONES.get(name, name)
+
+
+def reminders_text():
+    reminders = data.get("reminders", [])
+    lines = ["🔔 <b>Напоминания</b>", "", f"⏰ Часовой пояс: <b>{escape(_bot_timezone_label())}</b>", ""]
+    if not reminders:
+        lines.append("📭 Пока нет ни одного напоминания.")
+    else:
+        for r in sorted(reminders, key=lambda x: x.get("time", "99:99")):
+            status = "🟢" if r.get("enabled", True) else "🔴"
+            target = REMINDER_TARGETS.get(r.get("target", "group"), "👥 Группа")
+            mention = " • 🔔 всех" if r.get("mention_all") else ""
+            lines.append(f"{status} <b>{escape(str(r.get('name','Без названия')))}</b> — <code>{escape(str(r.get('time','--:--')))}</code>")
+            lines.append(f"   {target}{mention}")
+            lines.append(f"   {escape(str(r.get('text',''))[:140])}")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def reminders_keyboard():
+    rows = []
+    for r in sorted(data.get("reminders", []), key=lambda x: x.get("time", "99:99")):
+        rid = int(r.get("id", 0)); status = "🟢" if r.get("enabled", True) else "🔴"
+        name = str(r.get("name", "Без названия"))[:24]
+        rows.append([InlineKeyboardButton(text=f"{status} {name} — {r.get('time','--:--')}", callback_data=f"rem:view:{rid}")])
+    rows.append([InlineKeyboardButton(text="➕ Создать", callback_data="rem:create"), InlineKeyboardButton(text="⏰ Часовой пояс", callback_data="rem:timezone")])
+    rows.append([InlineKeyboardButton(text="◀️ Панель", callback_data="dash:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def reminder_edit_keyboard(rid):
+    r = _reminder_by_id(rid)
+    if not r: return reminders_keyboard()
+    enabled = "⏸ Выключить" if r.get("enabled", True) else "▶️ Включить"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Название", callback_data=f"rem:name:{rid}"), InlineKeyboardButton(text="💬 Текст", callback_data=f"rem:text:{rid}")],
+        [InlineKeyboardButton(text="🕐 Время", callback_data=f"rem:time:{rid}"), InlineKeyboardButton(text="📍 Куда", callback_data=f"rem:target:{rid}")],
+        [InlineKeyboardButton(text="🔔 Упоминать всех", callback_data=f"rem:mention:{rid}")],
+        [InlineKeyboardButton(text=enabled, callback_data=f"rem:toggle:{rid}")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"rem:delete:{rid}")],
+        [InlineKeyboardButton(text="◀️ К списку", callback_data="rem:menu")],
+    ])
+
+
+def reminder_card(r):
+    status = "🟢 включено" if r.get("enabled", True) else "🔴 выключено"
+    target = REMINDER_TARGETS.get(r.get("target", "group"), "👥 Группа")
+    extra = "\n🔔 Упоминание всех: <b>да</b>" if r.get("mention_all") else "\n🔔 Упоминание всех: <b>нет</b>"
+    if r.get("target") == "topic": extra += f"\n🧵 ID темы: <code>{escape(str(r.get('topic_id','')))}</code>"
+    return (f"🔔 <b>{escape(str(r.get('name','Без названия')))}</b>\n\n"
+            f"💬 {escape(str(r.get('text','')))}\n\n"
+            f"🕐 Каждый день в <code>{escape(str(r.get('time','--:--')))}</code>\n"
+            f"📍 {target}{extra}\n"
+            f"⏰ Часовой пояс: <b>{escape(_bot_timezone_label())}</b>\n"
+            f"📌 Статус: {status}")
+
+
+def reminder_target_keyboard(rid, creating=False):
+    prefix = "remnewtarget" if creating else f"remtarget:{rid}"
+    rows = [
+        [InlineKeyboardButton(text="👥 Группа", callback_data=f"{prefix}:group")],
+        [InlineKeyboardButton(text="🧵 Конкретная тема", callback_data=f"{prefix}:topic")],
+        [InlineKeyboardButton(text="👤 ЛС всем участникам", callback_data=f"{prefix}:dm")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="rem:menu")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def reminder_mention_keyboard(rid=None):
+    prefix = "remnewmention" if rid is None else f"remmentionset:{rid}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔔 Да, упоминать всех", callback_data=f"{prefix}:yes")],
+        [InlineKeyboardButton(text="🔕 Нет", callback_data=f"{prefix}:no")],
+    ])
+
+
+def timezone_keyboard():
+    rows=[]
+    items=list(TIMEZONES.items())
+    for i in range(0,len(items),2):
+        row=[]
+        for name,label in items[i:i+2]:
+            row.append(InlineKeyboardButton(text=label, callback_data=f"remtz:{name}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="rem:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(F.text == "🔔 Напоминания")
+async def reminders_btn(message: Message):
+    if not admin_can(message.from_user.id, "reminders"):
+        await message.answer(permission_denied_text("reminders")); return
+    await message.answer(reminders_text(), reply_markup=reminders_keyboard())
+
+
+@dp.callback_query(F.data.startswith("remtz:"))
+async def reminder_timezone_cb(cb: CallbackQuery):
+    if not admin_can(cb.from_user.id, "reminders"):
+        return await cb.answer(permission_denied_text("reminders"), show_alert=True)
+    tz = cb.data.split(":",1)[1]
+    if tz not in TIMEZONES:
+        return await cb.answer("Неизвестный часовой пояс", show_alert=True)
+    data.setdefault("bot_settings", {})["timezone"] = tz
+    save_data()
+    await cb.message.edit_text(reminders_text(), reply_markup=reminders_keyboard())
+    await cb.answer("Часовой пояс сохранён")
+
+
+@dp.callback_query(F.data.startswith("rem:"))
+async def reminders_cb(cb: CallbackQuery):
+    if not admin_can(cb.from_user.id, "reminders"):
+        return await cb.answer(permission_denied_text("reminders"), show_alert=True)
+    parts = cb.data.split(":")
+    action = parts[1] if len(parts)>1 else "menu"
+
+    if action == "menu":
+        await cb.message.edit_text(reminders_text(), reply_markup=reminders_keyboard()); return await cb.answer()
+    if action == "timezone":
+        await cb.message.edit_text("⏰ <b>Часовой пояс бота</b>\n\nВыбери, по какому времени должны срабатывать ежедневные напоминания:", reply_markup=timezone_keyboard()); return await cb.answer()
+    if action == "create":
+        reminder_mode[cb.from_user.id] = {"step":"name"}
+        await cb.message.edit_text("➕ <b>Создание напоминания</b>\n\nШаг 1/5 — напиши название.\nНапример: <b>Утренний сбор</b>\n\nДля отмены: /cancel")
+        return await cb.answer()
+
+    if len(parts) < 3: return await cb.answer()
+    try: rid=int(parts[2])
+    except Exception: return await cb.answer("Ошибка", show_alert=True)
+    r=_reminder_by_id(rid)
+    if not r: return await cb.answer("Напоминание не найдено", show_alert=True)
+
+    if action == "view":
+        await cb.message.edit_text(reminder_card(r), reply_markup=reminder_edit_keyboard(rid)); return await cb.answer()
+    if action == "name":
+        reminder_mode[cb.from_user.id]={"step":"edit_name","id":rid}; await cb.message.answer("✏️ Напиши новое название.\nДля отмены: /cancel"); return await cb.answer()
+    if action == "text":
+        reminder_mode[cb.from_user.id]={"step":"edit_text","id":rid}; await cb.message.answer("💬 Напиши новый текст.\nДля отмены: /cancel"); return await cb.answer()
+    if action == "time":
+        reminder_mode[cb.from_user.id]={"step":"edit_time","id":rid}; await cb.message.answer("🕐 Новое время в формате <code>HH:MM</code>.\nНапример: <code>18:30</code>"); return await cb.answer()
+    if action == "target":
+        await cb.message.edit_text("📍 <b>Куда отправлять?</b>", reply_markup=reminder_target_keyboard(rid)); return await cb.answer()
+    if action == "mention":
+        r["mention_all"] = not bool(r.get("mention_all"))
+        save_data(); await cb.message.edit_text(reminder_card(r), reply_markup=reminder_edit_keyboard(rid)); return await cb.answer("Изменено")
+    if action == "toggle":
+        r["enabled"]=not bool(r.get("enabled",True)); r["last_sent_date"]=None; save_data()
+        await cb.message.edit_text(reminder_card(r), reply_markup=reminder_edit_keyboard(rid)); return await cb.answer("Статус изменён")
+    if action == "delete":
+        data["reminders"]=[x for x in data.get("reminders",[]) if int(x.get("id",-1))!=rid]; save_data()
+        await cb.message.edit_text(reminders_text(), reply_markup=reminders_keyboard()); return await cb.answer("Удалено")
+
+
+@dp.callback_query(F.data.startswith("remtarget:"))
+async def reminder_target_cb(cb: CallbackQuery):
+    if not admin_can(cb.from_user.id,"reminders"): return await cb.answer("❌ Нет прав",show_alert=True)
+    _,rid,target=cb.data.split(":",2); r=_reminder_by_id(rid)
+    if not r: return await cb.answer("Не найдено",show_alert=True)
+    if target not in REMINDER_TARGETS: return await cb.answer("Ошибка",show_alert=True)
+    r["target"]=target
+    if target != "topic": r.pop("topic_id",None)
+    save_data()
+    if target == "topic":
+        reminder_mode[cb.from_user.id]={"step":"edit_topic","id":int(rid)}
+        await cb.message.answer("🧵 Напиши <b>ID темы</b> (message_thread_id).\nЕго можно получить командой /topic_id в нужной теме.\nДля отмены: /cancel")
+    else:
+        await cb.message.edit_text(reminder_card(r), reply_markup=reminder_edit_keyboard(int(rid)))
+    await cb.answer("Место отправки изменено")
+
+
+@dp.callback_query(F.data.startswith("remnewtarget:"))
+async def reminder_new_target_cb(cb: CallbackQuery):
+    if not admin_can(cb.from_user.id,"reminders"): return await cb.answer("❌ Нет прав",show_alert=True)
+    target=cb.data.split(":",1)[1]
+    if target not in REMINDER_TARGETS: return await cb.answer("Ошибка",show_alert=True)
+    state=reminder_mode.get(cb.from_user.id)
+    if not state: return await cb.answer("Создание уже отменено",show_alert=True)
+    state["target"]=target
+    if target=="topic":
+        state["step"]="topic"
+        await cb.message.edit_text("🧵 <b>Шаг 4/5</b> — напиши ID темы (message_thread_id).\nНапример: <code>126387</code>\nДля отмены: /cancel")
+    else:
+        state["step"]="mention"
+        await cb.message.edit_text("🔔 <b>Шаг 4/5</b> — упоминать всех участников в сообщении?", reply_markup=reminder_mention_keyboard())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("remnewmention:"))
+async def reminder_new_mention_cb(cb: CallbackQuery):
+    if not admin_can(cb.from_user.id,"reminders"): return await cb.answer("❌ Нет прав",show_alert=True)
+    choice=cb.data.split(":",1)[1]; state=reminder_mode.get(cb.from_user.id)
+    if not state: return await cb.answer("Создание уже отменено",show_alert=True)
+    state["mention_all"]=(choice=="yes"); state["step"]="time"
+    await cb.message.edit_text("🕐 <b>Шаг 5/5</b> — напиши время в формате <code>HH:MM</code>.\nНапример: <code>20:30</code>")
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("remmentionset:"))
+async def reminder_mention_set_cb(cb: CallbackQuery):
+    if not admin_can(cb.from_user.id,"reminders"): return await cb.answer("❌ Нет прав",show_alert=True)
+    _,rid,choice=cb.data.split(":",2); r=_reminder_by_id(rid)
+    if not r: return await cb.answer("Не найдено",show_alert=True)
+    r["mention_all"]=(choice=="yes"); save_data()
+    await cb.message.edit_text(reminder_card(r),reply_markup=reminder_edit_keyboard(int(rid))); await cb.answer("Сохранено")
+
+
+@dp.message(Command("cancel"))
+async def reminder_cancel_cmd(message: Message):
+    if message.from_user.id in reminder_mode:
+        reminder_mode.pop(message.from_user.id,None)
+        await message.answer("❌ Действие отменено.", reply_markup=reminders_keyboard() if admin_can(message.from_user.id,"reminders") else None)
+
+
+@dp.message(lambda m: m.from_user.id in reminder_mode and bool(m.text) and not m.text.startswith("/"))
+async def reminder_text_handler(message: Message):
+    if not admin_can(message.from_user.id,"reminders"):
+        reminder_mode.pop(message.from_user.id,None); return
+    state=reminder_mode.get(message.from_user.id,{}); step=state.get("step"); value=message.text.strip()
+
+    if step=="name":
+        if not 1<=len(value)<=100: return await message.answer("❌ Название: 1–100 символов.")
+        state["name"]=value; state["step"]="text"
+        return await message.answer("💬 <b>Шаг 2/5</b> — напиши текст сообщения.")
+    if step=="text":
+        if not 1<=len(value)<=4000: return await message.answer("❌ Текст: 1–4000 символов.")
+        state["text"]=value; state["step"]="target"
+        return await message.answer("📍 <b>Шаг 3/5</b> — выбери место отправки:",reply_markup=reminder_target_keyboard(0,creating=True))
+    if step=="topic":
+        if not value.isdigit() or int(value)<=0: return await message.answer("❌ ID темы должен быть положительным числом.")
+        state["topic_id"]=int(value); state["step"]="mention"
+        return await message.answer("🔔 <b>Шаг 4/5</b> — упоминать всех участников?",reply_markup=reminder_mention_keyboard())
+    if step=="time":
+        if not _valid_hhmm(value): return await message.answer("❌ Время должно быть в формате <code>HH:MM</code>.")
+        rid=_next_reminder_id()
+        data.setdefault("reminders",[]).append({
+            "id":rid,"name":state["name"],"text":state["text"],"time":value,"enabled":True,
+            "target":state.get("target","group"),"topic_id":state.get("topic_id"),
+            "mention_all":bool(state.get("mention_all")),"last_sent_date":None,
+            "created_by":message.from_user.id,"created_at":datetime.now().isoformat(timespec="seconds")})
+        save_data(); reminder_mode.pop(message.from_user.id,None)
+        audit_record(message.from_user.id,"commands","создал ежедневное напоминание",f"{state['name']} — {value}")
+        return await message.answer("✅ <b>Напоминание создано!</b>\n\n"+reminders_text(),reply_markup=reminders_keyboard())
+
+    rid=state.get("id"); r=_reminder_by_id(rid)
+    if not r:
+        reminder_mode.pop(message.from_user.id,None); return await message.answer("❌ Напоминание уже удалено.")
+    if step=="edit_name":
+        if not 1<=len(value)<=100: return await message.answer("❌ Название: 1–100 символов.")
+        r["name"]=value
+    elif step=="edit_text":
+        if not 1<=len(value)<=4000: return await message.answer("❌ Текст: 1–4000 символов.")
+        r["text"]=value
+    elif step=="edit_time":
+        if not _valid_hhmm(value): return await message.answer("❌ Время должно быть в формате <code>HH:MM</code>.")
+        r["time"]=value; r["last_sent_date"]=None
+    elif step=="edit_topic":
+        if not value.isdigit() or int(value)<=0: return await message.answer("❌ ID темы должен быть положительным числом.")
+        r["topic_id"]=int(value)
+    else: return
+    save_data(); reminder_mode.pop(message.from_user.id,None)
+    audit_record(message.from_user.id,"commands","изменил ежедневное напоминание",f"{r.get('name')} — {r.get('time')}")
+    await message.answer("✅ Изменения сохранены.",reply_markup=reminders_keyboard())
+
+
+async def _reminder_members():
+    try:
+        members=await get_gather_members()
+        if members: return members
+    except Exception as e:
+        print("⚠️ Не удалось получить участников для напоминания:",e)
+    members=[]
+    seen=set()
+    for uid,info in data.get("group_members",{}).items():
+        try: iid=int(uid)
+        except Exception: continue
+        if iid in seen: continue
+        if info.get("status") in {"left","kicked"}: continue
+        name=info.get("full_name") or info.get("username") or str(iid)
+        members.append({"id":iid,"name":name,"username":info.get("username")}); seen.add(iid)
+    for uid,info in data.get("users",{}).items():
+        try: iid=int(uid)
+        except Exception: continue
+        if iid in seen: continue
+        members.append({"id":iid,"name":info.get("nickname") or info.get("tag") or str(iid),"username":str(info.get("tag","")).lstrip("@") or None}); seen.add(iid)
+    return members
+
+
+def _mention(member):
+    return f'<a href="tg://user?id={int(member["id"])}">{escape(str(member.get("name") or member.get("username") or member["id"]))}</a>'
+
+
+async def send_scheduled_reminder(r):
+    target=r.get("target","group")
+    mention_all=bool(r.get("mention_all"))
+    base=str(r.get("text", ""))
+    topic_id=r.get("topic_id")
+    if target in ("group","topic"):
+        kwargs={}
+        if target=="topic": kwargs["message_thread_id"]=int(topic_id)
+        if mention_all:
+            members=await _reminder_members()
+            mentions=" ".join(_mention(m) for m in members)
+            if mentions:
+                # Telegram message limit — разбиваем упоминания на несколько сообщений.
+                chunks=[]; cur=base+"\n\n"; limit=3800
+                for m in mentions.split(" "):
+                    if len(cur)+len(m)+1>limit:
+                        chunks.append(cur); cur=m+" "
+                    else: cur+=m+" "
+                if cur.strip(): chunks.append(cur)
+                for chunk in chunks:
+                    await bot.send_message(GROUP_ID,chunk,**kwargs)
+            else:
+                await bot.send_message(GROUP_ID,base,**kwargs)
+        else:
+            await bot.send_message(GROUP_ID,base,**kwargs)
+        return True
+    if target=="dm":
+        members=await _reminder_members()
+        ok=0
+        for member in members:
+            text=base
+            if mention_all: text += "\n\n"+_mention(member)
+            try:
+                await bot.send_message(int(member["id"]),text); ok+=1; await asyncio.sleep(0.06)
+            except Exception: pass
+        return ok>0
+    return False
+
+
+async def scheduled_reminder_worker():
+    """Ежедневный планировщик с часовым поясом, заданным в самом боте."""
+    from zoneinfo import ZoneInfo
+    while True:
+        try:
+            tz_name=_bot_timezone_name()
+            try: tz=ZoneInfo(tz_name)
+            except Exception: tz=ZoneInfo("Europe/Moscow")
+            now=datetime.now(tz); hhmm=now.strftime("%H:%M"); today=now.strftime("%Y-%m-%d")
+            changed=False
+            for r in list(data.get("reminders",[])):
+                if not r.get("enabled",True) or str(r.get("time",""))!=hhmm or r.get("last_sent_date")==today: continue
+                try:
+                    if await send_scheduled_reminder(r):
+                        r["last_sent_date"]=today; changed=True
+                        audit_record(SUPER_ADMIN,"commands","автоматически отправил ежедневное напоминание",str(r.get("name","")),command="scheduler")
+                except Exception as e: print(f"⚠️ Не удалось отправить напоминание {r.get('id')}: {e}")
+            if changed: save_data()
+            await asyncio.sleep(max(1,61-datetime.now(tz).second))
+        except asyncio.CancelledError: return
+        except Exception as e:
+            print("scheduled_reminder_worker:",e); await asyncio.sleep(30)
 
 # Выбор направления объявления.
 @dp.callback_query(F.data.startswith("announce_target:"))
@@ -3882,6 +4298,7 @@ async def main():
     print("📌 Основная группа:", GROUP_LINK)
 
     asyncio.create_task(reminder_worker())
+    asyncio.create_task(scheduled_reminder_worker())
     await dp.start_polling(bot)
 
 
