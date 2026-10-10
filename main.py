@@ -351,6 +351,19 @@ class AuditCallbackMiddleware(BaseMiddleware):
 
 
 
+class MaintenanceModeMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data_ctx):
+        uid = event.from_user.id if getattr(event, "from_user", None) else None
+        enabled = bool(data.get("bot_settings", {}).get("maintenance_mode", False))
+        if enabled and uid != SUPER_ADMIN:
+            if isinstance(event, CallbackQuery):
+                await event.answer("🔴 Бот временно выключен владельцем.", show_alert=True)
+            elif isinstance(event, Message):
+                await event.answer("🔴 <b>Бот временно выключен.</b>\n\nПопробуйте позже.")
+            return
+        return await handler(event, data_ctx)
+
+
 class AdminPermissionMiddleware(BaseMiddleware):
     MESSAGE_PERMS = {
         "📋 Управление заявками": "applications",
@@ -366,6 +379,7 @@ class AdminPermissionMiddleware(BaseMiddleware):
         "☁️ Google Таблица": "sheets",
         "⚙️ Настройки": "settings",
         "🔔 Напоминания": "reminders",
+        "📨 Report": "reports",
     }
 
     def callback_permission(self, cd):
@@ -379,10 +393,11 @@ class AdminPermissionMiddleware(BaseMiddleware):
         if cd.startswith("sheets:"): return "sheets"
         if cd.startswith("set:"): return "settings"
         if cd.startswith("rem:"): return "reminders"
+        if cd.startswith(("report:", "reports:")): return "reports"
         if cd.startswith("announce_target:"): return "announcements"
         if cd.startswith("dash:"):
             action=cd.split(":",1)[1]
-            return {"apps":"applications","users":"users","zams":"zams","stats":"stats","announce":"announcements","sbor":"gathering","audit":"audit","sheets":"sheets","admins":"admins","settings":"settings","reminders":"reminders"}.get(action)
+            return {"apps":"applications","users":"users","zams":"zams","stats":"stats","announce":"announcements","sbor":"gathering","audit":"audit","sheets":"sheets","admins":"admins","settings":"settings","reminders":"reminders","reports":"reports"}.get(action)
         return None
 
     async def __call__(self, handler, event, data_ctx):
@@ -402,6 +417,8 @@ class AdminPermissionMiddleware(BaseMiddleware):
         return await handler(event, data_ctx)
 
 
+dp.message.outer_middleware(MaintenanceModeMiddleware())
+dp.callback_query.outer_middleware(MaintenanceModeMiddleware())
 dp.message.outer_middleware(AdminPermissionMiddleware())
 dp.callback_query.outer_middleware(AdminPermissionMiddleware())
 dp.message.outer_middleware(AuditMessageMiddleware())
@@ -668,6 +685,50 @@ def load_data():
 
 _db_save_task = None
 _db_save_pending = False
+_google_sync_task = None
+_google_sync_pending = False
+_google_sync_running = False
+
+async def _flush_google_sync():
+    """Отложенная синхронизация Google Sheets после изменения данных.
+    Несколько быстрых действий объединяются в один экспорт.
+    """
+    global _google_sync_task, _google_sync_pending, _google_sync_running
+    try:
+        while _google_sync_pending:
+            _google_sync_pending = False
+            await asyncio.sleep(2.0)
+            if not GOOGLE_SERVICE_ACCOUNT_JSON or not gspread or not Credentials:
+                continue
+            _google_sync_running = True
+            try:
+                result = await asyncio.to_thread(sync_google_sheets_sync)
+                if not result.get("ok"):
+                    print("⚠️ Автосинхронизация Google Sheets:", result.get("error", "ошибка"))
+            finally:
+                _google_sync_running = False
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        _google_sync_running = False
+        print("⚠️ Ошибка автосинхронизации Google Sheets:", e)
+    finally:
+        _google_sync_task = None
+
+def request_google_sync():
+    global _google_sync_task, _google_sync_pending
+    if not (GOOGLE_SERVICE_ACCOUNT_JSON and gspread and Credentials):
+        return
+    if _google_sync_running:
+        _google_sync_pending = True
+        return
+    _google_sync_pending = True
+    try:
+        loop = asyncio.get_running_loop()
+        if _google_sync_task is None or _google_sync_task.done():
+            _google_sync_task = loop.create_task(_flush_google_sync())
+    except RuntimeError:
+        pass
 
 async def _flush_db_save():
     global _db_save_task, _db_save_pending
@@ -692,6 +753,8 @@ def save_data():
     if not (DATABASE_URL and psycopg2 is not None):
         return
     _db_save_pending = True
+    if not _google_sync_running:
+        request_google_sync()
     try:
         loop = asyncio.get_running_loop()
         if _db_save_task is None or _db_save_task.done():
@@ -769,9 +832,11 @@ defaults = {
     "initial_zams_installed": False,
     "audit_events": [],
     "notify_settings": {},
-    "bot_settings": {"reminders_enabled": False, "pin_announcements": False},
+    "bot_settings": {"reminders_enabled": False, "pin_announcements": False, "maintenance_mode": False},
     "last_reminders": {},
     "reminders": [],
+    "reports": [],
+    "report_seq": 0,
     "admin_permissions": {},
 }
 
@@ -795,15 +860,22 @@ if not isinstance(data.get("notify_settings"), dict):
     data["notify_settings"] = {}
     changed = True
 if not isinstance(data.get("bot_settings"), dict):
-    data["bot_settings"] = {"reminders_enabled": False, "pin_announcements": False}
+    data["bot_settings"] = {"reminders_enabled": False, "pin_announcements": False, "maintenance_mode": False}
     changed = True
 if not isinstance(data.get("last_reminders"), dict):
     data["last_reminders"] = {}
     changed = True
 if not isinstance(data.get("reminders"), list):
     data["reminders"] = []
+if not isinstance(data.get("reports"), list):
+    data["reports"] = []
+if not isinstance(data.get("report_seq"), int):
+    data["report_seq"] = 0
 if not data.setdefault("bot_settings", {}).get("timezone"):
     data["bot_settings"]["timezone"] = "Europe/Moscow"
+    changed = True
+if "maintenance_mode" not in data.setdefault("bot_settings", {}):
+    data["bot_settings"]["maintenance_mode"] = False
     changed = True
 
 if not data.get("admins"):
@@ -1090,6 +1162,7 @@ ADMIN_PERMISSION_DEFS = [
     ("sheets", "☁️ Google Таблица"),
     ("participant_message", "📨 Сообщения участникам"),
     ("reminders", "🔔 Напоминания"),
+    ("reports", "📨 Report / обращения"),
 ]
 
 ADMIN_PERMISSION_LABELS = dict(ADMIN_PERMISSION_DEFS)
@@ -1110,6 +1183,7 @@ DEFAULT_ADMIN_PERMISSIONS = {
     "sheets": False,
     "participant_message": True,
     "reminders": False,
+    "reports": True,
 }
 
 
@@ -1287,6 +1361,9 @@ def main_keyboard(has_survey=False):
     b.row(
         KeyboardButton(text="👤 Мой профиль"),
     )
+    b.row(
+        KeyboardButton(text="📨 Report"),
+    )
 
     return b.as_markup(resize_keyboard=True)
 
@@ -1312,6 +1389,7 @@ def admin_keyboard(user_id, has_survey=False):
         rows.append([KeyboardButton(text="👑 Замы")])
     if has_survey:
         rows.append([KeyboardButton(text="🔄 Перезаполнить анкету")])
+    rows.append([KeyboardButton(text="📨 Report")])
     if any(admin_can(user_id, p) for p in ("audit","admins","settings","sheets","status")):
         rows.append([KeyboardButton(text="🏠 Панель управления")])
     if admin_can(user_id, "status"):
@@ -3484,6 +3562,8 @@ def dashboard_keyboard(uid):
         rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data="dash:settings")])
     if admin_can(uid, "reminders"):
         rows.append([InlineKeyboardButton(text="🔔 Напоминания", callback_data="dash:reminders")])
+    if admin_can(uid, "reports"):
+        rows.append([InlineKeyboardButton(text="📨 Report / обращения", callback_data="dash:reports")])
     return InlineKeyboardMarkup(inline_keyboard=rows or [[InlineKeyboardButton(text="📭 Нет доступных функций", callback_data="dash:none")]])
 
 
@@ -3496,6 +3576,7 @@ def settings_keyboard():
         [InlineKeyboardButton(text=f"{pin} Закреплять объявления", callback_data="set:pin")],
         [InlineKeyboardButton(text="🔔 Уведомления админа", callback_data="set:notify")],
         [InlineKeyboardButton(text="🔔 Управление напоминаниями", callback_data="rem:menu")],
+        [InlineKeyboardButton(text=("🔴 Выключить бота для всех" if not r.get("maintenance_mode") else "🟢 Включить бота для всех"), callback_data="set:maintenance")],
         [InlineKeyboardButton(text="🧹 Проверить дубли", callback_data="set:duplicates")],
         [InlineKeyboardButton(text="◀️ Панель", callback_data="dash:home")],
     ])
@@ -3580,6 +3661,8 @@ def sync_google_sheets_sync():
             "Замы": [["№","Nickname","@username","Приглашений"]],
             "Статистика": [["Показатель","Значение"]],
             "Журнал": [["Время","Кто","Действие","Подробности"]],
+            "Напоминания": [["ID","Название","Текст","Время","Статус","Куда","Тема ID","Упоминать всех","Создал","Создано"]],
+            "Репорты": [["ID","Дата","Пользователь ID","Пользователь","@username","Категория","Текст","Статус","Ответил","Ответ"]],
         }
         for title, values in sheets.items():
             try: ws = sh.worksheet(title); ws.clear()
@@ -3608,6 +3691,14 @@ def sync_google_sheets_sync():
         ws=sh.worksheet("Журнал"); rows=[]
         for e in data.get("audit_events",[])[-1000:]: rows.append([e.get("time",""),audit_name(e.get("actor_id")),e.get("action",""),e.get("details","")])
         if rows: ws.update("A2",rows)
+        ws=sh.worksheet("Напоминания"); rows=[]
+        for r in data.get("reminders",[]):
+            rows.append([r.get("id",""),r.get("name",""),r.get("text",""),r.get("time",""),"Вкл" if r.get("enabled",True) else "Выкл",REMINDER_TARGETS.get(r.get("target","group"),r.get("target","")),r.get("topic_id",""), "Да" if r.get("mention_all") else "Нет",r.get("created_by",""),r.get("created_at","")])
+        if rows: ws.update("A2",rows)
+        ws=sh.worksheet("Репорты"); rows=[]
+        for rp in data.get("reports",[]):
+            rows.append([rp.get("id",""),rp.get("created_at",""),rp.get("user_id",""),rp.get("user_name",""),rp.get("username",""),rp.get("category",""),rp.get("text",""),rp.get("status","open"),rp.get("answered_by_name","") or "",rp.get("admin_reply","") or ""])
+        if rows: ws.update("A2",rows)
         data["google_sheet_url"] = sh.url
         save_data()
         return {"ok": True, "url": sh.url}
@@ -3633,7 +3724,7 @@ async def stats_btn(message: Message):
 async def sheets_btn(message: Message):
     if not admin_can(message.from_user.id, "sheets"): return
     url=google_sheet_url()
-    text="☁️ <b>Google Таблица</b>\n\n" + (f"Последняя таблица:\n{escape(url)}" if url else "Таблица ещё не создана.")
+    text="☁️ <b>Google Таблица</b>\n\n" + (f"Последняя таблица:\n{escape(url)}" if url else "Таблица ещё не создана.") + "\n\n🔄 <b>Автосинхронизация:</b> включена — изменения отправляются автоматически."
     await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Синхронизировать",callback_data="sheets:sync")],[InlineKeyboardButton(text="◀️ Панель",callback_data="dash:home")]]))
 
 @dp.message(F.text == "⚙️ Настройки")
@@ -3655,6 +3746,7 @@ async def dashboard_cb(cb: CallbackQuery):
     elif action=="admins": await cb.message.edit_text("🛡 <b>Админка</b>",reply_markup=admin_panel_keyboard())
     elif action=="settings": await cb.message.edit_text("⚙️ <b>Настройки бота</b>",reply_markup=settings_keyboard())
     elif action=="reminders": await cb.message.edit_text(reminders_text(), reply_markup=reminders_keyboard())
+    elif action=="reports": await send_reports_page(cb.message)
     elif action=="sheets":
         url=google_sheet_url(); await cb.message.edit_text("☁️ <b>Google Таблица</b>\n\n"+(escape(url) if url else "Таблица ещё не создана."),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Синхронизировать",callback_data="sheets:sync")],[InlineKeyboardButton(text="◀️ Панель",callback_data="dash:home")]]))
     elif action=="announce":
@@ -3674,6 +3766,14 @@ async def settings_cb(cb: CallbackQuery):
     if not admin_can(cb.from_user.id, "settings"): return await cb.answer(permission_denied_text("settings"),show_alert=True)
     action=cb.data.split(":",1)[1]
     if action=="reminders": data.setdefault("bot_settings",{})["reminders_enabled"]=not data.setdefault("bot_settings",{}).get("reminders_enabled",False); save_data(); await cb.message.edit_text("⚙️ Настройки",reply_markup=settings_keyboard()); await cb.answer("Готово")
+    elif action=="maintenance":
+        if not is_super_admin(cb.from_user.id):
+            return await cb.answer("❌ Только владелец", show_alert=True)
+        enabled = not bool(data.setdefault("bot_settings", {}).get("maintenance_mode", False))
+        data["bot_settings"]["maintenance_mode"] = enabled
+        save_data()
+        await cb.message.edit_text("⚙️ <b>Настройки бота</b>\n\n" + ("🔴 <b>Бот выключен для всех, кроме владельца.</b>" if enabled else "🟢 <b>Бот снова доступен всем.</b>"), reply_markup=settings_keyboard())
+        await cb.answer("Режим изменён")
     elif action=="pin": data.setdefault("bot_settings",{})["pin_announcements"]=not data.setdefault("bot_settings",{}).get("pin_announcements",False); save_data(); await cb.message.edit_text("⚙️ Настройки",reply_markup=settings_keyboard()); await cb.answer("Готово")
     elif action=="notify":
         cur=data.setdefault("notify_settings",{}).get(str(cb.from_user.id),True); data["notify_settings"][str(cb.from_user.id)]=not cur; save_data(); await cb.message.edit_text("⚙️ Настройки",reply_markup=settings_keyboard()); await cb.answer("Уведомления " + ("включены" if not cur else "выключены"))
@@ -3688,6 +3788,175 @@ async def sheets_sync_cb(cb: CallbackQuery):
         await cb.message.edit_text("✅ <b>Google Таблица обновлена.</b>\n\n"+escape(result.get("url","")),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Обновить ещё раз",callback_data="sheets:sync")],[InlineKeyboardButton(text="◀️ Панель",callback_data="dash:home")]]))
     else:
         await cb.message.edit_text("❌ <b>Google Таблица не настроена</b>\n\n"+escape(result.get("error","Неизвестная ошибка"))+"\n\nДобавь GOOGLE_SERVICE_ACCOUNT_JSON в Render и дай сервисному аккаунту доступ к таблице.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Панель",callback_data="dash:home")]]))
+
+# =========================================================
+# REPORT / ОБРАЩЕНИЯ ПОЛЬЗОВАТЕЛЕЙ
+# =========================================================
+
+report_mode = {}
+REPORT_CATEGORIES = {
+    "bug": "🐞 Ошибка",
+    "suggest": "💡 Предложение",
+    "complaint": "🚨 Жалоба",
+    "other": "❓ Другое",
+}
+
+def _next_report_id():
+    return max([int(x.get("id", 0)) for x in data.get("reports", []) if str(x.get("id", "")).isdigit()] or [0]) + 1
+
+def report_menu_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🐞 Ошибка", callback_data="report:new:bug"), InlineKeyboardButton(text="💡 Предложение", callback_data="report:new:suggest")],
+        [InlineKeyboardButton(text="🚨 Жалоба", callback_data="report:new:complaint"), InlineKeyboardButton(text="❓ Другое", callback_data="report:new:other")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="report:cancel")],
+    ])
+
+def report_admin_keyboard(rid):
+    r = next((x for x in data.get("reports", []) if int(x.get("id", -1)) == int(rid)), None)
+    if not r: return None
+    if r.get("status") == "closed":
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Открыть", callback_data=f"report:reopen:{rid}")]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Ответить", callback_data=f"report:reply:{rid}"), InlineKeyboardButton(text="✅ Закрыть", callback_data=f"report:close:{rid}")]
+    ])
+
+def report_user_label(r):
+    u = r.get("user_name") or str(r.get("user_id"))
+    un = f" @{r.get('username')}" if r.get("username") else ""
+    return escape(u + un)
+
+def report_card(r):
+    status = "🟢 Открыт" if r.get("status") != "closed" else "⚫ Закрыт"
+    reply = r.get("admin_reply")
+    text = (f"📨 <b>Report #{r.get('id')}</b>\n\n"
+            f"👤 {report_user_label(r)}\n"
+            f"📂 {escape(REPORT_CATEGORIES.get(r.get('category'), r.get('category','Другое')))}\n"
+            f"🕐 {escape(str(r.get('created_at','')))}\n"
+            f"📌 {status}\n\n"
+            f"💬 <b>Сообщение:</b>\n{escape(str(r.get('text','')))}")
+    if reply:
+        text += f"\n\n↩️ <b>Ответ:</b>\n{escape(str(reply))}"
+    return text
+
+def reports_keyboard():
+    rows=[]
+    reports=sorted(data.get("reports", []), key=lambda x:int(x.get("id",0)), reverse=True)
+    for r in reports[:20]:
+        status="🟢" if r.get("status") != "closed" else "⚫"
+        rows.append([InlineKeyboardButton(text=f"{status} #{r.get('id')} — {REPORT_CATEGORIES.get(r.get('category'),'Другое')[:18]}", callback_data=f"reports:view:{r.get('id')}")])
+    rows.append([InlineKeyboardButton(text="◀️ Панель", callback_data="dash:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def send_reports_page(message):
+    if not admin_can(message.from_user.id, "reports"):
+        await message.answer(permission_denied_text("reports")); return
+    reports=data.get("reports", [])
+    open_count=sum(1 for r in reports if r.get("status") != "closed")
+    await message.answer(f"📨 <b>Report / обращения</b>\n\nВсего: <b>{len(reports)}</b>\nОткрытых: <b>{open_count}</b>\n\nВыберите обращение:", reply_markup=reports_keyboard())
+
+@dp.message(F.text == "📨 Report")
+async def report_button(message: Message):
+    await message.answer("📨 <b>Связь с администрацией</b>\n\nВыберите тип обращения:", reply_markup=report_menu_keyboard())
+
+@dp.callback_query(F.data.startswith("report:new:"))
+async def report_new_cb(cb: CallbackQuery):
+    category=cb.data.split(":",2)[2]
+    if category not in REPORT_CATEGORIES: return await cb.answer("Ошибка",show_alert=True)
+    report_mode[cb.from_user.id]={"category":category}
+    await cb.message.edit_text(f"📨 <b>{escape(REPORT_CATEGORIES[category])}</b>\n\nОпишите проблему или предложение одним сообщением.\n\nДля отмены: /cancel_report")
+    await cb.answer()
+
+@dp.callback_query(F.data == "report:cancel")
+async def report_cancel_cb(cb: CallbackQuery):
+    report_mode.pop(cb.from_user.id,None)
+    await cb.message.edit_text("❌ Создание обращения отменено.")
+    await cb.answer()
+
+@dp.message(Command("cancel_report"))
+async def cancel_report_cmd(message: Message):
+    report_mode.pop(message.from_user.id,None)
+    await message.answer("❌ Обращение отменено.")
+
+@dp.callback_query(F.data.startswith("reports:view:"))
+async def report_view_cb(cb: CallbackQuery):
+    if not admin_can(cb.from_user.id,"reports"): return await cb.answer(permission_denied_text("reports"),show_alert=True)
+    rid=int(cb.data.split(":")[2]); r=next((x for x in data.get("reports",[]) if int(x.get("id",-1))==rid),None)
+    if not r: return await cb.answer("Не найдено",show_alert=True)
+    await cb.message.edit_text(report_card(r),reply_markup=report_admin_keyboard(rid)); await cb.answer()
+
+@dp.callback_query(F.data.startswith("report:reply:"))
+async def report_reply_cb(cb: CallbackQuery):
+    if not admin_can(cb.from_user.id,"reports"): return await cb.answer(permission_denied_text("reports"),show_alert=True)
+    rid=int(cb.data.split(":")[2]); r=next((x for x in data.get("reports",[]) if int(x.get("id",-1))==rid),None)
+    if not r: return await cb.answer("Не найдено",show_alert=True)
+    report_mode[cb.from_user.id]={"admin_reply":True,"report_id":rid}
+    await cb.message.answer(f"💬 Напишите ответ для пользователя по Report #{rid}.\n\nДля отмены: /cancel_report")
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("report:close:"))
+async def report_close_cb(cb: CallbackQuery):
+    if not admin_can(cb.from_user.id,"reports"): return await cb.answer(permission_denied_text("reports"),show_alert=True)
+    rid=int(cb.data.split(":")[2]); r=next((x for x in data.get("reports",[]) if int(x.get("id",-1))==rid),None)
+    if not r: return await cb.answer("Не найдено",show_alert=True)
+    r["status"]="closed"; r["closed_at"]=datetime.now().isoformat(timespec="seconds"); r["closed_by"]=cb.from_user.id
+    save_data(); audit_record(cb.from_user.id,"commands","закрыл обращение Report",f"#{rid}")
+    try: await bot.send_message(int(r["user_id"]),f"📨 Ваш Report <b>#{rid}</b> закрыт администрацией.")
+    except Exception: pass
+    await cb.message.edit_text(report_card(r),reply_markup=report_admin_keyboard(rid)); await cb.answer("Закрыто")
+
+@dp.callback_query(F.data.startswith("report:reopen:"))
+async def report_reopen_cb(cb: CallbackQuery):
+    if not admin_can(cb.from_user.id,"reports"): return await cb.answer(permission_denied_text("reports"),show_alert=True)
+    rid=int(cb.data.split(":")[2]); r=next((x for x in data.get("reports",[]) if int(x.get("id",-1))==rid),None)
+    if not r: return await cb.answer("Не найдено",show_alert=True)
+    r["status"]="open"; save_data(); audit_record(cb.from_user.id,"commands","открыл обращение Report",f"#{rid}")
+    await cb.message.edit_text(report_card(r),reply_markup=report_admin_keyboard(rid)); await cb.answer("Открыто")
+
+# admin reply handler must run before generic reminder/report handlers
+@dp.message(lambda m: m.from_user.id in report_mode and report_mode[m.from_user.id].get("admin_reply") and bool(m.text) and not m.text.startswith("/"))
+async def report_admin_reply_handler(message: Message):
+    state=report_mode.pop(message.from_user.id,None)
+    if not state: return
+    if not admin_can(message.from_user.id,"reports"):
+        return await message.answer(permission_denied_text("reports"))
+    rid=int(state["report_id"]); r=next((x for x in data.get("reports",[]) if int(x.get("id",-1))==rid),None)
+    if not r: return await message.answer("❌ Обращение не найдено.")
+    reply=message.text.strip()
+    if not reply or len(reply)>4000: return await message.answer("❌ Ответ: 1–4000 символов.")
+    r["admin_reply"]=reply; r["answered_by"]=message.from_user.id; r["answered_by_name"]=get_admin_display(message.from_user.id); r["status"]="answered"
+    save_data(); audit_record(message.from_user.id,"commands","ответил на Report",f"#{rid}")
+    try:
+        await bot.send_message(int(r["user_id"]), f"💬 <b>Ответ администрации на Report #{rid}</b>\n\n{escape(reply)}")
+        sent="Пользователю отправлено."
+    except Exception:
+        sent="Не удалось отправить пользователю (возможно, он не открыл ЛС с ботом)."
+    await message.answer(f"✅ Ответ сохранён. {sent}", reply_markup=reports_keyboard())
+
+@dp.message(lambda m: m.from_user.id in report_mode and bool(m.text) and not m.text.startswith("/"))
+async def report_text_handler(message: Message):
+    state=report_mode.pop(message.from_user.id,None)
+    if not state: return
+    text=message.text.strip()
+    if not text or len(text)>4000:
+        report_mode[message.from_user.id]=state
+        return await message.answer("❌ Сообщение должно быть от 1 до 4000 символов.")
+    try:
+        chat=await bot.get_chat(message.from_user.id)
+        username=chat.username or ""
+        user_name=chat.full_name or str(message.from_user.id)
+    except Exception:
+        username=message.from_user.username or ""
+        user_name=message.from_user.full_name or str(message.from_user.id)
+    rid=_next_report_id()
+    report={"id":rid,"user_id":message.from_user.id,"user_name":user_name,"username":username,"category":state["category"],"text":text,"status":"open","created_at":datetime.now().isoformat(timespec="seconds"),"admin_reply":"","answered_by":"","answered_by_name":""}
+    data.setdefault("reports",[]).append(report)
+    data["report_seq"]=rid
+    save_data(); audit_record(message.from_user.id,"commands","создал обращение Report",f"#{rid} {REPORT_CATEGORIES[state['category']]}")
+    for admin_id in sorted(get_admins() | {SUPER_ADMIN}):
+        try:
+            await bot.send_message(admin_id, "📨 <b>Новое обращение</b>\n\n"+report_card(report), reply_markup=report_admin_keyboard(rid))
+        except Exception: pass
+    await message.answer(f"✅ Обращение <b>#{rid}</b> отправлено администрации.\n\nАдминистратор сможет ответить вам прямо через бота.")
 
 # =========================================================
 # ЕЖЕДНЕВНЫЕ НАПОМИНАНИЯ
@@ -3749,6 +4018,33 @@ def _bot_timezone_label():
     name = _bot_timezone_name()
     return TIMEZONES.get(name, name)
 
+
+def reminder_draft_text(state):
+    target = REMINDER_TARGETS.get(state.get("target", "group"), "👥 Группа")
+    mention = "🔔 Да" if state.get("mention_all") else "🔕 Нет"
+    topic = f"\n🧵 ID темы: <code>{escape(str(state.get('topic_id')))}</code>" if state.get("target") == "topic" and state.get("topic_id") else ""
+    return (
+        "➕ <b>Создание напоминания</b>\n\n"
+        f"📝 Название: <b>{escape(str(state.get('name') or '—'))}</b>\n"
+        f"💬 Текст: {escape(str(state.get('text') or '—'))}\n"
+        f"⏰ Время: <code>{escape(str(state.get('time') or '--:--'))}</code>\n"
+        f"📍 Куда: {target}{topic}\n"
+        f"🔔 Упоминать всех: {mention}\n"
+        f"🌍 Часовой пояс: <b>{escape(_bot_timezone_label())}</b>\n\n"
+        "📢 <b>Предпросмотр сообщения:</b>\n"
+        f"<blockquote>{escape(str(state.get('text') or '—'))}</blockquote>\n\n"
+        "Проверь настройки и сохрани напоминание."
+    )
+
+def reminder_draft_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Название", callback_data="remdraft:name"), InlineKeyboardButton(text="💬 Текст", callback_data="remdraft:text")],
+        [InlineKeyboardButton(text="⏰ Время", callback_data="remdraft:time"), InlineKeyboardButton(text="📍 Куда", callback_data="remdraft:target")],
+        [InlineKeyboardButton(text="🔔 Упоминать всех", callback_data="remdraft:mention")],
+        [InlineKeyboardButton(text="🌍 Часовой пояс", callback_data="remdraft:timezone")],
+        [InlineKeyboardButton(text="💾 Сохранить", callback_data="remdraft:save")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="remdraft:cancel")],
+    ])
 
 def reminders_text():
     reminders = data.get("reminders", [])
@@ -3852,7 +4148,10 @@ async def reminder_timezone_cb(cb: CallbackQuery):
         return await cb.answer("Неизвестный часовой пояс", show_alert=True)
     data.setdefault("bot_settings", {})["timezone"] = tz
     save_data()
-    await cb.message.edit_text(reminders_text(), reply_markup=reminders_keyboard())
+    if cb.from_user.id in reminder_mode and reminder_mode[cb.from_user.id].get("step") not in {"edit_name","edit_text","edit_time","edit_topic"}:
+        await cb.message.edit_text(reminder_draft_text(reminder_mode[cb.from_user.id]), reply_markup=reminder_draft_keyboard())
+    else:
+        await cb.message.edit_text(reminders_text(), reply_markup=reminders_keyboard())
     await cb.answer("Часовой пояс сохранён")
 
 
@@ -3869,7 +4168,7 @@ async def reminders_cb(cb: CallbackQuery):
         await cb.message.edit_text("⏰ <b>Часовой пояс бота</b>\n\nВыбери, по какому времени должны срабатывать ежедневные напоминания:", reply_markup=timezone_keyboard()); return await cb.answer()
     if action == "create":
         reminder_mode[cb.from_user.id] = {"step":"name"}
-        await cb.message.edit_text("➕ <b>Создание напоминания</b>\n\nШаг 1/5 — напиши название.\nНапример: <b>Утренний сбор</b>\n\nДля отмены: /cancel")
+        await cb.message.edit_text("➕ <b>Создание напоминания</b>\n\nСначала напиши название.\nНапример: <b>Утренний сбор</b>\n\nПосле заполнения будет показан полный предпросмотр.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="rem:menu")]]))
         return await cb.answer()
 
     if len(parts) < 3: return await cb.answer()
@@ -3898,6 +4197,47 @@ async def reminders_cb(cb: CallbackQuery):
         data["reminders"]=[x for x in data.get("reminders",[]) if int(x.get("id",-1))!=rid]; save_data()
         await cb.message.edit_text(reminders_text(), reply_markup=reminders_keyboard()); return await cb.answer("Удалено")
 
+
+@dp.callback_query(F.data.startswith("remdraft:"))
+async def reminder_draft_cb(cb: CallbackQuery):
+    if not admin_can(cb.from_user.id, "reminders"):
+        return await cb.answer(permission_denied_text("reminders"), show_alert=True)
+    state = reminder_mode.get(cb.from_user.id)
+    if not state:
+        return await cb.answer("Черновик не найден", show_alert=True)
+    action = cb.data.split(":",1)[1]
+    if action == "save":
+        if not state.get("name") or not state.get("text") or not _valid_hhmm(str(state.get("time",""))):
+            return await cb.answer("Заполни название, текст и время", show_alert=True)
+        rid=_next_reminder_id()
+        data.setdefault("reminders",[]).append({"id":rid,"name":state["name"],"text":state["text"],"time":state["time"],"enabled":True,"target":state.get("target","group"),"topic_id":state.get("topic_id"),"mention_all":bool(state.get("mention_all")),"last_sent_date":None,"created_by":cb.from_user.id,"created_at":datetime.now().isoformat(timespec="seconds")})
+        save_data(); audit_record(cb.from_user.id,"commands","создал ежедневное напоминание",f"{state['name']} — {state['time']}")
+        reminder_mode.pop(cb.from_user.id,None)
+        await cb.message.edit_text("✅ <b>Напоминание сохранено!</b>\n\n"+reminders_text(), reply_markup=reminders_keyboard())
+        return await cb.answer("Сохранено")
+    if action == "cancel":
+        reminder_mode.pop(cb.from_user.id,None)
+        await cb.message.edit_text(reminders_text(), reply_markup=reminders_keyboard())
+        return await cb.answer("Отменено")
+    if action == "name":
+        state["step"]="draft_name"; await cb.message.answer("📝 Напиши новое название для черновика."); return await cb.answer()
+    if action == "text":
+        state["step"]="draft_text"; await cb.message.answer("💬 Напиши текст сообщения для черновика."); return await cb.answer()
+    if action == "time":
+        state["step"]="draft_time"; await cb.message.answer("⏰ Напиши время в формате <code>HH:MM</code>."); return await cb.answer()
+    if action == "target":
+        await cb.message.edit_text("📍 <b>Куда отправлять?</b>", reply_markup=reminder_target_keyboard(0, creating=True)); return await cb.answer()
+    if action == "mention":
+        await cb.message.edit_text("🔔 <b>Упоминать всех участников?</b>", reply_markup=reminder_mention_keyboard()); return await cb.answer()
+    if action == "timezone":
+        await cb.message.edit_text("🌍 <b>Часовой пояс</b>", reply_markup=timezone_keyboard()); return await cb.answer()
+    return await cb.answer()
+
+@dp.callback_query(F.data == "remdraft:preview")
+async def reminder_draft_preview_cb(cb: CallbackQuery):
+    state=reminder_mode.get(cb.from_user.id)
+    if not state: return await cb.answer("Черновик не найден",show_alert=True)
+    await cb.message.edit_text(reminder_draft_text(state), reply_markup=reminder_draft_keyboard()); await cb.answer()
 
 @dp.callback_query(F.data.startswith("remtarget:"))
 async def reminder_target_cb(cb: CallbackQuery):
@@ -3929,7 +4269,7 @@ async def reminder_new_target_cb(cb: CallbackQuery):
         await cb.message.edit_text("🧵 <b>Шаг 4/5</b> — напиши ID темы (message_thread_id).\nНапример: <code>126387</code>\nДля отмены: /cancel")
     else:
         state["step"]="mention"
-        await cb.message.edit_text("🔔 <b>Шаг 4/5</b> — упоминать всех участников в сообщении?", reply_markup=reminder_mention_keyboard())
+        await cb.message.edit_text("🔔 <b>Упоминать всех участников?</b>", reply_markup=reminder_mention_keyboard())
     await cb.answer()
 
 
@@ -3939,7 +4279,7 @@ async def reminder_new_mention_cb(cb: CallbackQuery):
     choice=cb.data.split(":",1)[1]; state=reminder_mode.get(cb.from_user.id)
     if not state: return await cb.answer("Создание уже отменено",show_alert=True)
     state["mention_all"]=(choice=="yes"); state["step"]="time"
-    await cb.message.edit_text("🕐 <b>Шаг 5/5</b> — напиши время в формате <code>HH:MM</code>.\nНапример: <code>20:30</code>")
+    await cb.message.edit_text("⏰ <b>Теперь укажи время</b> в формате <code>HH:MM</code>.\nНапример: <code>20:30</code>")
     await cb.answer()
 
 
@@ -3965,6 +4305,18 @@ async def reminder_text_handler(message: Message):
         reminder_mode.pop(message.from_user.id,None); return
     state=reminder_mode.get(message.from_user.id,{}); step=state.get("step"); value=message.text.strip()
 
+    if step=="draft_name":
+        if not 1<=len(value)<=100: return await message.answer("❌ Название: 1–100 символов.")
+        state["name"]=value; state["step"]="preview"
+        return await message.answer(reminder_draft_text(state), reply_markup=reminder_draft_keyboard())
+    if step=="draft_text":
+        if not 1<=len(value)<=4000: return await message.answer("❌ Текст: 1–4000 символов.")
+        state["text"]=value; state["step"]="preview"
+        return await message.answer(reminder_draft_text(state), reply_markup=reminder_draft_keyboard())
+    if step=="draft_time":
+        if not _valid_hhmm(value): return await message.answer("❌ Время должно быть в формате <code>HH:MM</code>.")
+        state["time"]=value; state["step"]="preview"
+        return await message.answer(reminder_draft_text(state), reply_markup=reminder_draft_keyboard())
     if step=="name":
         if not 1<=len(value)<=100: return await message.answer("❌ Название: 1–100 символов.")
         state["name"]=value; state["step"]="text"
@@ -3976,18 +4328,12 @@ async def reminder_text_handler(message: Message):
     if step=="topic":
         if not value.isdigit() or int(value)<=0: return await message.answer("❌ ID темы должен быть положительным числом.")
         state["topic_id"]=int(value); state["step"]="mention"
-        return await message.answer("🔔 <b>Шаг 4/5</b> — упоминать всех участников?",reply_markup=reminder_mention_keyboard())
+        return await message.answer("🔔 <b>Упоминать всех участников?</b>",reply_markup=reminder_mention_keyboard())
     if step=="time":
         if not _valid_hhmm(value): return await message.answer("❌ Время должно быть в формате <code>HH:MM</code>.")
-        rid=_next_reminder_id()
-        data.setdefault("reminders",[]).append({
-            "id":rid,"name":state["name"],"text":state["text"],"time":value,"enabled":True,
-            "target":state.get("target","group"),"topic_id":state.get("topic_id"),
-            "mention_all":bool(state.get("mention_all")),"last_sent_date":None,
-            "created_by":message.from_user.id,"created_at":datetime.now().isoformat(timespec="seconds")})
-        save_data(); reminder_mode.pop(message.from_user.id,None)
-        audit_record(message.from_user.id,"commands","создал ежедневное напоминание",f"{state['name']} — {value}")
-        return await message.answer("✅ <b>Напоминание создано!</b>\n\n"+reminders_text(),reply_markup=reminders_keyboard())
+        state["time"] = value
+        state["step"] = "preview"
+        return await message.answer(reminder_draft_text(state), reply_markup=reminder_draft_keyboard())
 
     rid=state.get("id"); r=_reminder_by_id(rid)
     if not r:
