@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import re
+import traceback
 from datetime import datetime
 from html import escape
 import threading
@@ -18,6 +20,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message,
     CallbackQuery,
+    ErrorEvent,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     KeyboardButton,
@@ -88,7 +91,12 @@ telegram_user_client = None
 telegram_user_ready = False
 
 # ВЛАДЕЛЕЦ БОТА — твой Telegram ID
-SUPER_ADMIN = 6166697485
+# Render Environment: SUPER_ADMIN_ID=6166697485
+try:
+    SUPER_ADMIN = int(os.environ.get("SUPER_ADMIN_ID", "6166697485").strip())
+except (TypeError, ValueError):
+    SUPER_ADMIN = 6166697485
+
 ADMIN_IDS = {
     SUPER_ADMIN,
     123456789,
@@ -154,6 +162,105 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode="HTML"),
 )
 dp = Dispatcher()
+
+# =========================================================
+# АВТОМАТИЧЕСКИЕ ОТЧЁТЫ ОБ ОШИБКАХ ВЛАДЕЛЬЦУ
+# =========================================================
+
+_error_report_last = {}
+_ERROR_REPORT_COOLDOWN = 60
+
+
+def _error_ru(exc):
+    name = type(exc).__name__
+    text = str(exc or "").strip()
+
+    explanations = {
+        "NameError": "В коде используется имя, которое не определено. Частая причина — забытый import или опечатка.",
+        "ImportError": "Не удалось импортировать нужный модуль или объект. Проверь импорт и зависимости.",
+        "ModuleNotFoundError": "В окружении Render отсутствует нужный Python-модуль. Проверь requirements.txt.",
+        "KeyError": "Бот запросил отсутствующий ключ словаря. Поле могло отсутствовать в данных.",
+        "TypeError": "Бот получил данные неправильного типа или функция вызвана с неверными аргументами.",
+        "ValueError": "Получено значение неправильного формата.",
+        "AttributeError": "У объекта нет свойства или метода, к которому обратился код.",
+        "IndexError": "Код обратился к элементу списка, которого не существует.",
+        "TimeoutError": "Операция не успела завершиться. Возможна проблема с сетью, Telegram или базой.",
+        "OperationalError": "Ошибка подключения или работы с базой данных/внешним сервисом.",
+        "TelegramConflictError": "Запущен второй экземпляр бота, который одновременно получает Telegram updates.",
+        "TelegramBadRequest": "Telegram отклонил запрос. Обычно это неверный chat_id, topic, сообщение или параметр.",
+        "TelegramForbiddenError": "Telegram запретил действие: бот не имеет доступа, был заблокирован или не имеет нужного права.",
+    }
+    result = explanations.get(
+        name,
+        "Произошла необработанная ошибка. По стеку ниже можно определить точное место и причину."
+    )
+
+    if name == "NameError" and "re" in text and "not defined" in text:
+        result = "Используется модуль re, но он не подключён. В начале main.py должен быть import re."
+
+    return result
+
+
+async def _send_error_report(exc, context="Обработка Telegram update"):
+    try:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+        fingerprint = f"{type(exc).__name__}|{str(exc)}|{tb}"
+        import hashlib
+        key = hashlib.sha256(fingerprint.encode("utf-8", "replace")).hexdigest()[:20]
+        now = datetime.now().timestamp()
+
+        if now - _error_report_last.get(key, 0) < _ERROR_REPORT_COOLDOWN:
+            return
+        _error_report_last[key] = now
+
+        # Ищем последнюю строку main.py с номером строки.
+        location = "не определено"
+        matches = re.findall(r'File ".*?/main\.py", line (\d+), in ([^\n]+)', tb)
+        if matches:
+            line, func = matches[-1]
+            location = f"main.py, строка {line}, функция {func.strip()}"
+
+        report = (
+            "🚨 <b>ОШИБКА БОТА</b>\n\n"
+            f"📌 <b>Где:</b> {escape(str(context))}\n"
+            f"📍 <b>Место:</b> <code>{escape(location)}</code>\n"
+            f"❌ <b>Тип:</b> <code>{escape(type(exc).__name__)}</code>\n\n"
+            f"🇷🇺 <b>Расшифровка:</b>\n{escape(_error_ru(exc))}\n\n"
+            f"📄 <b>Оригинал:</b>\n<code>{escape(str(exc) or '(без текста)')[:1500]}</code>\n\n"
+            f"🔎 <b>Стек:</b>\n<pre>{escape(tb[-5000:])}</pre>"
+        )
+
+        # Telegram: максимум около 4096 символов.
+        for i in range(0, len(report), 3900):
+            try:
+                await bot.send_message(SUPER_ADMIN, report[i:i + 3900])
+            except Exception as send_exc:
+                print("❌ Не удалось отправить отчёт владельцу:", repr(send_exc))
+                break
+    except Exception as report_exc:
+        print("❌ Ошибка формирования отчёта:", repr(report_exc))
+
+
+async def _global_error_handler(event: ErrorEvent):
+    exc = event.exception
+    print("❌ Необработанная ошибка:", repr(exc))
+    await _send_error_report(exc)
+    return True
+
+
+dp.errors.register(_global_error_handler)
+
+
+def _asyncio_error_handler(loop, context):
+    exc = context.get("exception")
+    if exc is None:
+        exc = RuntimeError(context.get("message", "Неизвестная ошибка asyncio"))
+    print("❌ Ошибка фоновой задачи:", repr(exc))
+    try:
+        loop.create_task(_send_error_report(exc, "Фоновая задача asyncio"))
+    except Exception as e:
+        print("❌ Не удалось запланировать отчёт:", repr(e))
+
 
 
 # =========================================================
@@ -1374,7 +1481,7 @@ def admin_keyboard(user_id, has_survey=False):
     b = ReplyKeyboardBuilder()
     rows = []
     if admin_can(user_id, "applications"):
-        rows.append([KeyboardButton(text="📋 Заявки"), KeyboardButton(text="⏳ Активные заявки")])
+        rows.append([KeyboardButton(text="📋 Заявки")])
     if admin_can(user_id, "users"):
         rows.append([KeyboardButton(text="👥 Участники"), KeyboardButton(text="📊 Статистика")]) if admin_can(user_id, "stats") else rows.append([KeyboardButton(text="👥 Участники")])
     elif admin_can(user_id, "stats"):
@@ -3646,6 +3753,16 @@ def google_client():
         return None
 
 
+
+def sheet_application_status(status):
+    return {
+        "pending": "🟠 Ожидает",
+        "accepted": "🟢 Принята",
+        "rejected": "🔴 Отклонена",
+        "cancelled": "⚪ Отменена",
+    }.get(str(status), "⚪ Неизвестно")
+
+
 def sync_google_sheets_sync():
     client = google_client()
     if client is None:
@@ -3676,7 +3793,7 @@ def sync_google_sheets_sync():
         ws=sh.worksheet("Заявки"); rows=[]
         for aid,a in data.get("applications",{}).items():
             d=a.get("data",a)
-            rows.append([aid,a.get("user_id",""),d.get("nickname",""),d.get("tag",d.get("username","")),d.get("rank_fam",""),d.get("organization",""),d.get("inviter",""),a.get("status",""),a.get("created","" )])
+            rows.append([aid,a.get("user_id",""),d.get("nickname",""),d.get("tag",d.get("username","")),d.get("rank_fam",""),d.get("organization",""),d.get("inviter",""),sheet_application_status(a.get("status","")),a.get("created","" )])
         if rows: ws.update("A2", rows)
         ws=sh.worksheet("Замы"); rows=[]
         for i,(nick,info) in enumerate(data.get("zam_data",{}).items(),1): rows.append([i,nick,info.get("tg_username") or "",count_zam_answers(nick)])
@@ -4438,7 +4555,9 @@ async def scheduled_reminder_worker():
                     if await send_scheduled_reminder(r):
                         r["last_sent_date"]=today; changed=True
                         audit_record(SUPER_ADMIN,"commands","автоматически отправил ежедневное напоминание",str(r.get("name","")),command="scheduler")
-                except Exception as e: print(f"⚠️ Не удалось отправить напоминание {r.get('id')}: {e}")
+                except Exception as e:
+                    print(f"⚠️ Не удалось отправить напоминание {r.get('id')}: {e}")
+                    await _send_error_report(e, f"Автоматическое напоминание #{r.get('id')}")
             if changed: save_data()
             await asyncio.sleep(max(1,61-datetime.now(tz).second))
         except asyncio.CancelledError: return
@@ -4500,7 +4619,8 @@ async def announcement_text_handler(message: Message):
         if dm_failed: parts.append(f"ошибок ЛС: {dm_failed}")
         await message.answer("✅ Объявление отправлено — " + ", ".join(parts) + ".")
     except Exception as e:
-        await message.answer("❌ Не удалось отправить объявление: "+escape(str(e)[:300]))
+        await _send_error_report(e, "Отправка объявления")
+        await message.answer("❌ Не удалось отправить объявление. Подробная ошибка отправлена владельцу.")
 
 # Сообщение участнику из карточки.
 participant_message_mode = {}
@@ -4534,33 +4654,161 @@ try:
 except Exception:
     pass
 
-# Общий сбор: короткий режим через кнопку. Отправляет упоминания известных участников.
-async def start_gather_from_button(message: Message):
-    if not is_admin(message.from_user.id): return await message.answer("❌ Нет прав")
-    members=[]
-    for uid,u in data.get("users",{}).items():
-        tag=u.get("tag")
-        if tag and tag != "—": members.append("@"+str(tag).lstrip("@"))
-    if not members:
-        return await message.answer("❌ Нет участников с @username.")
-    text="📢 <b>ОБЩИЙ СБОР!</b>\n\n"+" ".join(members)
-    try:
-        await bot.send_message(GROUP_ID,text,message_thread_id=ANNOUNCE_TOPIC_ID)
-        await message.answer(f"✅ Общий сбор отправлен. Упомянуто: {len(members)}")
-        audit_record(message.from_user.id,"commands","запустил общий сбор",f"Упомянуто: {len(members)}",command="кнопка: общий сбор")
-    except Exception as e: await message.answer("❌ Ошибка: "+escape(str(e)[:300]))
+# =========================================================
+# ОБЩИЙ СБОР — с реальными упоминаниями и кнопкой ОСТАНОВИТЬ
+# =========================================================
 
-@dp.message(F.text == "📢 Объявление")
-async def announcement_btn(message: Message):
-    if not admin_can(message.from_user.id, "announcements"): return
-    announcement_mode[message.from_user.id]={"pin":False}
-    await message.answer("📣 Напишите текст объявления одним сообщением.")
+gather_tasks = {}
+gather_active = set()
+
+
+def _gather_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛑 Остановить сбор", callback_data="gather:stop")]
+    ])
+
+
+def _mention_user(uid, info):
+    name = str(
+        info.get("full_name")
+        or info.get("nickname")
+        or info.get("tag")
+        or uid
+    ).strip()
+    return f'<a href="tg://user?id={int(uid)}">{escape(name[:60])}</a>'
+
+
+def _gather_members():
+    result = {}
+    # Сначала реальные участники группы — можно упомянуть даже без username.
+    for uid, info in data.get("group_members", {}).items():
+        try:
+            if str(info.get("status", "member")) not in {"member", "administrator", "creator", "restricted"}:
+                continue
+            result[str(uid)] = info
+        except Exception:
+            continue
+
+    # Дополняем пользователями, которых бот знает по анкетам.
+    for uid, info in data.get("users", {}).items():
+        result.setdefault(str(uid), {
+            "full_name": info.get("full_name") or info.get("nickname") or info.get("tag") or str(uid),
+            "username": info.get("tag"),
+            "status": "member",
+        })
+
+    return list(result.items())
+
+
+async def _run_gather(owner_id, control_message):
+    try:
+        members = _gather_members()
+        if not members:
+            await control_message.answer("❌ Бот пока не знает участников группы.")
+            return
+
+        # Разбиваем на небольшие сообщения, чтобы Telegram не отклонял длинное сообщение.
+        batch_size = 15
+        total = len(members)
+
+        for pos in range(0, total, batch_size):
+            if owner_id not in gather_active:
+                await control_message.answer("🛑 <b>Общий сбор остановлен.</b>")
+                return
+
+            batch = members[pos:pos + batch_size]
+            mentions = " ".join(_mention_user(uid, info) for uid, info in batch)
+            text = (
+                "📢 <b>ОБЩИЙ СБОР!</b>\n\n"
+                f"{mentions}\n\n"
+                f"📋 Участники: {pos + len(batch)}/{total}"
+            )
+
+            await bot.send_message(
+                GROUP_ID,
+                text,
+                message_thread_id=ANNOUNCE_TOPIC_ID,
+                reply_markup=_gather_keyboard() if pos + len(batch) < total else None,
+            )
+
+            if pos + batch_size < total:
+                # Около 1–2 минут на большой сбор.
+                await asyncio.sleep(5)
+
+        await control_message.answer(f"✅ <b>Общий сбор завершён.</b>\nУпомянуто: {total}")
+        audit_record(owner_id, "commands", "запустил общий сбор", f"Упомянуто: {total}", command="кнопка: общий сбор")
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        await _send_error_report(e, "Общий сбор")
+        try:
+            await control_message.answer("❌ <b>Общий сбор не удалось выполнить.</b>\nОшибка отправлена владельцу.")
+        except Exception:
+            pass
+    finally:
+        gather_active.discard(owner_id)
+        gather_tasks.pop(owner_id, None)
+
+
+async def start_gather_from_button(message: Message):
+    uid = message.from_user.id
+    if not admin_can(uid, "gathering"):
+        return await message.answer(permission_denied_text("gathering"))
+
+    if uid in gather_active:
+        return await message.answer(
+            "⚠️ <b>Общий сбор уже идёт.</b>\nОстановить его можно кнопкой «🛑 Остановить сбор»."
+        )
+
+    gather_active.add(uid)
+    task = asyncio.create_task(_run_gather(uid, message))
+    gather_tasks[uid] = task
+
+    await message.answer(
+        "📢 <b>Общий сбор запущен.</b>\n"
+        "Бот начал отправлять реальные упоминания участников в тему объявлений.",
+        reply_markup=_gather_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "gather:stop")
+async def gather_stop_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    if not admin_can(uid, "gathering"):
+        return await cb.answer(permission_denied_text("gathering"), show_alert=True)
+
+    task = gather_tasks.get(uid)
+    gather_active.discard(uid)
+
+    if task and not task.done():
+        task.cancel()
+
+    await cb.answer("🛑 Сбор остановлен")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await cb.message.answer("🛑 <b>Общий сбор остановлен.</b>")
+
+
+@dp.message(F.text == "🛑 Остановить сбор")
+async def gather_stop_btn(message: Message):
+    uid = message.from_user.id
+    if not admin_can(uid, "gathering"):
+        await message.answer(permission_denied_text("gathering"))
+        return
+
+    task = gather_tasks.get(uid)
+    gather_active.discard(uid)
+    if task and not task.done():
+        task.cancel()
+    await message.answer("🛑 <b>Общий сбор остановлен.</b>")
+
 
 @dp.message(F.text == "📢 Общий сбор")
 async def gather_btn(message: Message):
-    if not admin_can(message.from_user.id, "gathering"):
-        await message.answer(permission_denied_text("gathering")); return
     await start_gather_from_button(message)
+
 
 # Ежедневное напоминание тем, кого бот знает по группе, но у кого нет анкеты.
 async def reminder_worker():
@@ -4581,7 +4829,9 @@ async def reminder_worker():
                     data["last_reminders"][str(uid)]=now.isoformat(); save_data()
                 except Exception: pass
         except asyncio.CancelledError: return
-        except Exception as e: print("reminder_worker:",e)
+        except Exception as e:
+            print("reminder_worker:", e)
+            await _send_error_report(e, "Фоновое напоминание анкет")
 
 # =========================================================
 # КОМАНДЫ TELEGRAM ПО РОЛЯМ
@@ -4619,6 +4869,11 @@ async def set_command_scopes():
 async def main():
     print("🤖 Бот запускается...")
 
+    try:
+        asyncio.get_running_loop().set_exception_handler(_asyncio_error_handler)
+    except Exception as e:
+        print("⚠️ Не удалось установить обработчик asyncio:", repr(e))
+
     if not DATABASE_URL:
         raise RuntimeError(
             "❌ DATABASE_URL не задан. Добавь URL Supabase в Render Environment. "
@@ -4653,3 +4908,9 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("🛑 Бот остановлен.")
+    except Exception as e:
+        print("❌ Критическая ошибка запуска:", repr(e))
+        try:
+            asyncio.run(_send_error_report(e, "Критическая ошибка запуска"))
+        except Exception as report_exc:
+            print("❌ Не удалось отправить отчёт:", repr(report_exc))
