@@ -4,3 +4,4 @@ psycopg2-binary>=2.9,<3.0
 telethon>=1.36,<2.0
 gspread>=6.1,<7.0
 google-auth>=2.34,<3.0
+asyncpg
