@@ -295,12 +295,6 @@ async def db_init():
                 "last_name": "TEXT", "created_at": "TIMESTAMPTZ DEFAULT NOW()",
                 "updated_at": "TIMESTAMPTZ DEFAULT NOW()",
             },
-            "zam_bank": {
-                "inviter": "TEXT", "invited_user_id": "BIGINT",
-                "amount": "BIGINT DEFAULT 100000",
-                "action": "TEXT DEFAULT 'credited'",
-                "created_at": "TIMESTAMPTZ DEFAULT NOW()",
-            },
         }
         for table_name, columns in legacy_columns.items():
             for column_name, definition in columns.items():
@@ -325,6 +319,17 @@ async def db_init():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
+        # Миграции zam_bank выполняем только после гарантированного создания таблицы.
+        for column, definition in (
+            ("inviter", "TEXT"),
+            ("invited_user_id", "BIGINT"),
+            ("amount", "BIGINT DEFAULT 100000"),
+            ("action", "TEXT DEFAULT 'credited'"),
+            ("created_at", "TIMESTAMPTZ DEFAULT NOW()"),
+        ):
+            await conn.execute(
+                f"ALTER TABLE zam_bank ADD COLUMN IF NOT EXISTS {column} {definition}"
+            )
 
         await conn.execute("""
             INSERT INTO admins (
@@ -2446,6 +2451,35 @@ def google_client():
         return None
 
 
+def _safe_replace_sheet(ws, rows, sheet_label):
+    """Обновляет лист без очистки и защищает старые строки от потери.
+
+    Если в Google Sheets строк больше, чем пришло из БД, не перезаписываем
+    лист: это может означать подключение к пустой/не той базе или неполную выборку.
+    В таком случае старые данные остаются доступными для восстановления.
+    """
+    try:
+        existing = ws.get_all_values()
+    except Exception:
+        existing = []
+
+    old_count = max(0, len(existing) - 1) if existing else 0
+    new_count = max(0, len(rows) - 1) if rows else 0
+    if old_count > new_count:
+        logger.error(
+            "SAFE SYNC: лист '%s' не перезаписан: в Google Sheets %s записей, из БД пришло %s. "
+            "Проверь DATABASE_URL/базу; старые строки сохранены.",
+            sheet_label, old_count, new_count
+        )
+        return False
+
+    # Не вызываем ws.clear(): запись поверх диапазона не удаляет старые данные
+    # при ошибочной/пустой выборке; сокращение числа строк блокируется выше.
+    if rows:
+        ws.update(range_name="A1", values=rows)
+    return True
+
+
 def sync_google_sheets_sync(applications, reports, reminders, admins, logs, bank, users):
 
     if not GOOGLE_SHEET_ID:
@@ -2507,13 +2541,8 @@ def sync_google_sheets_sync(applications, reports, reminders, admins, logs, bank
                 str(row["created_at"])
             ])
 
-        ws.clear()
-
-        # Новый синтаксис gspread
-        ws.update(
-            range_name="A1",
-            values=rows
-        )
+        # Защита от потери заявок при подключении к пустой/не той БД.
+        _safe_replace_sheet(ws, rows, "Заявки")
 
         # ------------------------------------------------
         # REPORTS
@@ -2550,12 +2579,7 @@ def sync_google_sheets_sync(applications, reports, reminders, admins, logs, bank
                 str(row["created_at"])
             ])
 
-        report_ws.clear()
-
-        report_ws.update(
-            range_name="A1",
-            values=report_rows
-        )
+        _safe_replace_sheet(report_ws, report_rows, "Report")
 
         extra_sheets = {
             "Напоминания": (
@@ -2591,8 +2615,7 @@ def sync_google_sheets_sync(applications, reports, reminders, admins, logs, bank
                 extra_ws = spreadsheet.worksheet(title)
             except Exception:
                 extra_ws = spreadsheet.add_worksheet(title=title, rows=1000, cols=max(10, len(headers)))
-            extra_ws.clear()
-            extra_ws.update(range_name="A1", values=[headers] + body)
+            _safe_replace_sheet(extra_ws, [headers] + body, title)
 
         logger.info(
             "Google Sheets synchronized"
@@ -2845,7 +2868,7 @@ async def main():
     # Удаляем webhook перед polling
     try:
         await bot.delete_webhook(
-            drop_pending_updates=True
+            drop_pending_updates=False
         )
     except Exception as e:
         logger.warning(
