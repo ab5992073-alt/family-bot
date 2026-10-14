@@ -258,6 +258,57 @@ async def db_init():
             await conn.execute(
                 f"ALTER TABLE admins ADD COLUMN IF NOT EXISTS {column} {definition}"
             )
+        # Миграции для старых баз данных. CREATE TABLE IF NOT EXISTS
+        # не добавляет новые поля в уже существующие таблицы.
+        # В частности, старый bot_logs без user_id вызывал KeyError
+        # при синхронизации журнала с Google Sheets.
+        legacy_columns = {
+            "bot_logs": {
+                "user_id": "BIGINT",
+                "username": "TEXT",
+                "action": "TEXT",
+                "details": "TEXT",
+                "created_at": "TIMESTAMPTZ DEFAULT NOW()",
+            },
+            "applications": {
+                "user_id": "BIGINT", "username": "TEXT", "nickname": "TEXT",
+                "family_rank": "TEXT", "organization": "TEXT",
+                "organization_rank": "TEXT", "inviter": "TEXT",
+                "status": "TEXT DEFAULT 'pending'",
+                "created_at": "TIMESTAMPTZ DEFAULT NOW()",
+                "updated_at": "TIMESTAMPTZ DEFAULT NOW()",
+            },
+            "reports": {
+                "user_id": "BIGINT", "username": "TEXT", "text": "TEXT",
+                "status": "TEXT DEFAULT 'new'",
+                "created_at": "TIMESTAMPTZ DEFAULT NOW()",
+            },
+            "reminders": {
+                "name": "TEXT", "message": "TEXT", "time": "TEXT",
+                "destination": "TEXT DEFAULT 'group'", "topic_id": "BIGINT",
+                "user_id": "BIGINT", "mention_all": "BOOLEAN DEFAULT FALSE",
+                "enabled": "BOOLEAN DEFAULT TRUE",
+                "created_at": "TIMESTAMPTZ DEFAULT NOW()",
+            },
+            "bot_users": {
+                "user_id": "BIGINT", "username": "TEXT", "first_name": "TEXT",
+                "last_name": "TEXT", "created_at": "TIMESTAMPTZ DEFAULT NOW()",
+                "updated_at": "TIMESTAMPTZ DEFAULT NOW()",
+            },
+            "zam_bank": {
+                "inviter": "TEXT", "invited_user_id": "BIGINT",
+                "amount": "BIGINT DEFAULT 100000",
+                "action": "TEXT DEFAULT 'credited'",
+                "created_at": "TIMESTAMPTZ DEFAULT NOW()",
+            },
+        }
+        for table_name, columns in legacy_columns.items():
+            for column_name, definition in columns.items():
+                await conn.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS "
+                    f"{column_name} {definition}"
+                )
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
@@ -477,7 +528,7 @@ async def main_menu(user_id: int) -> ReplyKeyboardMarkup:
     if await check_permission(user_id, "can_gather"):
         rows.append([KeyboardButton(text="📢 Общий сбор"), KeyboardButton(text="🛑 Остановить сбор")])
     if await check_permission(user_id, "can_applications"):
-        rows.append([KeyboardButton(text="📋 Управление заявками"), KeyboardButton(text="⏳ Активные заявки")])
+        rows.append([KeyboardButton(text="📋 Управление заявками")])
     if await is_admin(user_id):
         rows.append([KeyboardButton(text="👥 Список участников"), KeyboardButton(text="🟢 Статус бота")])
     if await check_permission(user_id, "can_reminders"):
@@ -2675,7 +2726,6 @@ async def ahelp(message: Message):
         "👤 Мой профиль\n"
         "📋 Моя заявка\n"
         "📋 Управление заявками\n"
-        "⏳ Активные заявки\n"
         "📨 Report\n"
         "📢 Объявления\n"
         "📢 Общий сбор\n"
