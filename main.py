@@ -309,27 +309,7 @@ async def db_init():
                 value TEXT NOT NULL
             )
         """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS zam_bank (
-                id SERIAL PRIMARY KEY,
-                inviter TEXT NOT NULL,
-                invited_user_id BIGINT,
-                amount BIGINT NOT NULL DEFAULT 100000,
-                action TEXT NOT NULL DEFAULT 'credited',
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            )
-        """)
-        # Миграции zam_bank выполняем только после гарантированного создания таблицы.
-        for column, definition in (
-            ("inviter", "TEXT"),
-            ("invited_user_id", "BIGINT"),
-            ("amount", "BIGINT DEFAULT 100000"),
-            ("action", "TEXT DEFAULT 'credited'"),
-            ("created_at", "TIMESTAMPTZ DEFAULT NOW()"),
-        ):
-            await conn.execute(
-                f"ALTER TABLE zam_bank ADD COLUMN IF NOT EXISTS {column} {definition}"
-            )
+        # Zam-bank functionality removed. Any existing historical table/data is left untouched.
 
         await conn.execute("""
             INSERT INTO admins (
@@ -630,26 +610,6 @@ async def application_start(
 ):
 
     await save_user(message)
-
-    # При повторном заполнении снимаем предыдущее начисление заму.
-    previous = await db_fetchrow("""
-        SELECT id, inviter, status FROM applications
-        WHERE user_id = $1
-        ORDER BY id DESC LIMIT 1
-    """, message.from_user.id)
-    if previous and previous["status"] == "accepted" and (previous["inviter"] or "").strip():
-        inviter_name = previous["inviter"].strip()
-        credited = await db_fetchrow("""
-            SELECT COALESCE(SUM(amount), 0) AS balance
-            FROM zam_bank
-            WHERE invited_user_id = $1 AND inviter = $2
-        """, message.from_user.id, inviter_name)
-        balance = int(credited["balance"] or 0) if credited else 0
-        if balance > 0:
-            await db_execute("""
-                INSERT INTO zam_bank(inviter, invited_user_id, amount, action)
-                VALUES ($1, $2, -100000, 'reversed')
-            """, inviter_name, message.from_user.id)
 
     await state.set_state(ApplicationForm.nickname)
 
@@ -1005,17 +965,6 @@ async def app_accept(callback: CallbackQuery):
             updated_at = NOW()
         WHERE id = $1
     """, app_id)
-
-    inviter = (row["inviter"] or "").strip()
-    if inviter:
-        await db_execute("""
-            INSERT INTO zam_bank(inviter, invited_user_id, amount, action)
-            SELECT $1, $2, 100000, 'credited'
-            WHERE (
-                SELECT COALESCE(SUM(amount), 0) FROM zam_bank
-                WHERE invited_user_id = $2 AND inviter = $1
-            ) <= 0
-        """, inviter, row["user_id"])
 
     invite_text = "Добро пожаловать!"
     try:
@@ -1522,7 +1471,7 @@ async def myid_command(message: Message):
 # WHO
 # ============================================================
 
-@dp.message(Command("кто", "kto"))
+@dp.message(Command("kto"))
 async def kto_command(message: Message):
 
     if not message.reply_to_message:
@@ -2047,10 +1996,11 @@ async def reminder_time(
     )
 
     await message.answer(
-        "Куда отправлять?\n\n"
-        "Напишите:\n"
-        "<b>группа</b>\n"
-        "<b>личка</b>"
+        "Куда отправлять напоминание?\n\n"
+        "Напишите один вариант:\n"
+        "<b>группа</b> — в группу\n"
+        "<b>личка</b> — пользователю по Telegram ID\n"
+        "<b>владельцу</b> — владельцу бота"
     )
 
 
@@ -2062,37 +2012,28 @@ async def reminder_destination(
 
     value = message.text.strip().lower()
 
-    if value not in ("группа", "личка"):
-
+    if value not in ("группа", "личка", "владельцу"):
         await message.answer(
-            "Напишите <b>группа</b> или <b>личка</b>."
+            "Напишите <b>группа</b>, <b>личка</b> или <b>владельцу</b>."
         )
-
         return
 
-    await state.update_data(
-        destination=value
-    )
+    await state.update_data(destination=value)
 
-    if value == "группа":
-
-        await state.set_state(
-            ReminderForm.topic
-        )
-
+    if value == "владельцу":
+        await state.update_data(topic_id=OWNER_ID)
+        await state.set_state(ReminderForm.mention)
+        await message.answer("Напоминание будет отправляться владельцу. Упоминать всех? Напишите <b>да</b> или <b>нет</b>.")
+    elif value == "группа":
+        await state.set_state(ReminderForm.topic)
         await message.answer(
             "Введите ID темы.\n\n"
             "Для новостей можно написать:\n"
             "<code>126387</code>\n\n"
             "Если без темы — <code>0</code>."
         )
-
     else:
-
-        await state.set_state(
-            ReminderForm.topic
-        )
-
+        await state.set_state(ReminderForm.topic)
         await message.answer(
             "Введите Telegram ID пользователя,\n"
             "которому отправлять напоминание:"
@@ -2191,7 +2132,7 @@ async def reminder_list(
     callback: CallbackQuery
 ):
 
-    if not await check_permission(
+    if not await is_owner(callback.from_user.id) and not await check_permission(
         callback.from_user.id,
         "can_reminders"
     ):
@@ -2254,7 +2195,7 @@ async def reminder_list(
 
 @dp.callback_query(F.data.startswith("rem_edit:"))
 async def reminder_edit(callback: CallbackQuery, state: FSMContext):
-    if not await check_permission(callback.from_user.id, "can_reminders"):
+    if not await is_owner(callback.from_user.id) and not await check_permission(callback.from_user.id, "can_reminders"):
         await callback.answer("Нет прав", show_alert=True)
         return
     reminder_id = int(callback.data.split(":")[1])
@@ -2276,7 +2217,7 @@ async def reminder_toggle(
     callback: CallbackQuery
 ):
 
-    if not await check_permission(
+    if not await is_owner(callback.from_user.id) and not await check_permission(
         callback.from_user.id,
         "can_reminders"
     ):
@@ -2306,7 +2247,7 @@ async def reminder_delete(
     callback: CallbackQuery
 ):
 
-    if not await check_permission(
+    if not await is_owner(callback.from_user.id) and not await check_permission(
         callback.from_user.id,
         "can_reminders"
     ):
@@ -2382,6 +2323,12 @@ async def send_reminder(row):
 
             await bot.send_message(
                 chat_id=row["topic_id"],
+                text=text
+            )
+
+        elif destination == "владельцу":
+            await bot.send_message(
+                chat_id=OWNER_ID,
                 text=text
             )
 
@@ -2664,18 +2611,7 @@ async def sync_google_sheets():
 # OWNER SETTINGS: TIMEZONE
 # ============================================================
 
-@dp.message(F.text == "🌍 Часовой пояс")
-async def timezone_menu(message: Message):
-    if not await is_owner(message.from_user.id):
-        await message.answer("❌ Настраивать часовой пояс может только владелец.")
-        return
-    row = await db_fetchrow("SELECT value FROM bot_settings WHERE key = 'timezone'")
-    current = row["value"] if row else TIMEZONE
-    await message.answer(
-        f"🌍 Текущий часовой пояс: <code>{current}</code>\n"
-        "Изменить: <code>/timezone Europe/Moscow</code>\n"
-        "Пример другого пояса: <code>Europe/Amsterdam</code>."
-    )
+# Timezone reply-keyboard button removed; /timezone command remains available to the owner.
 
 @dp.message(Command("timezone"))
 async def timezone_set(message: Message):
@@ -2720,28 +2656,23 @@ async def ahelp(message: Message):
 
     text = (
         "🛠 <b>СПРАВКА ПО КОМАНДАМ</b>\n\n"
-        "<b>Основные:</b>\n"
+        "<b>Основные команды:</b>\n"
         "/start — главное меню\n"
         "/myid — узнать Telegram ID\n"
-        "/ping — проверить связь с Telegram\n"
+        "/ping — проверить связь\n"
         "/kto — информация о пользователе (ответом на сообщение)\n"
-        "/ahelp — эта справка\n\n"
-        "<b>Доступные разделы зависят от назначенных прав:</b>\n"
-        "📋 Управление заявками\n📢 Объявления\n📢 Общий сбор\n"
-        "⏰ Напоминания\n👥 Список участников\n🟢 Статус бота\n"
+        "/ahelp — справка для администратора/владельца\n\n"
+        "<b>Разделы меню</b> отображаются в зависимости от выданных прав: заявки, объявления, общий сбор, напоминания, список участников и статус бота."
     )
     if await is_owner(uid):
         text += (
-            "\n<b>Только владелец:</b>\n"
+            "\n\n<b>Команды владельца:</b>\n"
             "/add_admin ID — добавить администратора\n"
             "/del_admin ID — удалить администратора\n"
-            "/set_admin_permission ID право on/off — изменить права\n"
-            "/admins — список администраторов\n"
-            "👑 Администрирование\n📜 Журнал действий\n"
-            "Полный доступ ко всем функциям бота."
+            "/set_admin_permission ID право on/off — изменить права администратора\n"
+            "/timezone Europe/Moscow — изменить часовой пояс\n"
+            "Владелец имеет полный доступ ко всем разделам."
         )
-    else:
-        text += "\nДля команд управления администраторами требуются права владельца."
     await message.answer(text)
 
 
@@ -2796,6 +2727,10 @@ async def set_commands():
                 BotCommand(
                     command="del_admin",
                     description="Удалить администратора"
+                ),
+                BotCommand(
+                    command="set_admin_permission",
+                    description="Изменить права администратора"
                 ),
             ],
             scope=BotCommandScopeChat(
