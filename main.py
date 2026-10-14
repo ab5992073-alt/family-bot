@@ -477,7 +477,7 @@ async def main_menu(user_id: int) -> ReplyKeyboardMarkup:
     if await check_permission(user_id, "can_gather"):
         rows.append([KeyboardButton(text="📢 Общий сбор"), KeyboardButton(text="🛑 Остановить сбор")])
     if await check_permission(user_id, "can_applications"):
-        rows.append([KeyboardButton(text="📋 Управление заявками"), KeyboardButton(text="⏳ Активные заявки")])
+        rows.append([KeyboardButton(text="📋 Управление заявками")])
     if await is_admin(user_id):
         rows.append([KeyboardButton(text="👥 Список участников"), KeyboardButton(text="🟢 Статус бота")])
     if await check_permission(user_id, "can_reminders"):
@@ -2675,7 +2675,6 @@ async def ahelp(message: Message):
         "👤 Мой профиль\n"
         "📋 Моя заявка\n"
         "📋 Управление заявками\n"
-        "⏳ Активные заявки\n"
         "📨 Report\n"
         "📢 Объявления\n"
         "📢 Общий сбор\n"
