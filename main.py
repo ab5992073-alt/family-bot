@@ -47,11 +47,18 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
+# ID группы, куда бот отправляет объявления/напоминания
 GROUP_ID = int(os.getenv("GROUP_ID", "-1002409536359"))
 
-ANNOUNCE_TOPIC_ID = int(os.getenv("ANNOUNCE_TOPIC_ID", "126387"))
+# Тема Новости
+ANNOUNCE_TOPIC_ID = int(
+    os.getenv("ANNOUNCE_TOPIC_ID", "126387")
+)
 
-TOPIC_ID = int(os.getenv("TOPIC_ID", str(ANNOUNCE_TOPIC_ID)))
+# Также поддерживаем старое имя переменной
+TOPIC_ID = int(
+    os.getenv("TOPIC_ID", str(ANNOUNCE_TOPIC_ID))
+)
 
 OWNER_ID = 6166697485
 
@@ -103,14 +110,11 @@ def health2():
 
 
 def run_flask():
-    try:
-        flask_app.run(
-            host="0.0.0.0",
-            port=PORT,
-            use_reloader=False
-        )
-    except Exception as e:
-        logger.error("Flask failed: %s", e)
+    flask_app.run(
+        host="0.0.0.0",
+        port=PORT,
+        use_reloader=False
+    )
 
 
 # ============================================================
@@ -162,7 +166,6 @@ async def db_init():
 
     async with db_pool.acquire() as conn:
 
-        # ---------- bot_users ----------
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_users (
                 user_id BIGINT PRIMARY KEY,
@@ -173,19 +176,7 @@ async def db_init():
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
-        # Миграции для случая, когда таблица была создана в старой версии.
-        for column, definition in (
-            ("username", "TEXT"),
-            ("first_name", "TEXT"),
-            ("last_name", "TEXT"),
-            ("created_at", "TIMESTAMPTZ DEFAULT NOW()"),
-            ("updated_at", "TIMESTAMPTZ DEFAULT NOW()"),
-        ):
-            await conn.execute(
-                f"ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS {column} {definition}"
-            )
 
-        # ---------- admins ----------
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS admins (
                 user_id BIGINT PRIMARY KEY,
@@ -201,7 +192,6 @@ async def db_init():
             )
         """)
 
-        # ---------- applications ----------
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS applications (
                 id SERIAL PRIMARY KEY,
@@ -218,7 +208,6 @@ async def db_init():
             )
         """)
 
-        # ---------- reports ----------
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS reports (
                 id SERIAL PRIMARY KEY,
@@ -230,7 +219,6 @@ async def db_init():
             )
         """)
 
-        # ---------- reminders ----------
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS reminders (
                 id SERIAL PRIMARY KEY,
@@ -246,7 +234,6 @@ async def db_init():
             )
         """)
 
-        # ---------- bot_logs ----------
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_logs (
                 id SERIAL PRIMARY KEY,
@@ -258,9 +245,8 @@ async def db_init():
             )
         """)
 
-        # ---------- миграции admins ----------
+        # Миграции без удаления существующих данных.
         for column, definition in (
-            ("username", "TEXT"),
             ("is_owner", "BOOLEAN DEFAULT FALSE"),
             ("can_applications", "BOOLEAN DEFAULT TRUE"),
             ("can_announcements", "BOOLEAN DEFAULT TRUE"),
@@ -272,16 +258,12 @@ async def db_init():
             await conn.execute(
                 f"ALTER TABLE admins ADD COLUMN IF NOT EXISTS {column} {definition}"
             )
-
-        # ---------- bot_settings ----------
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             )
         """)
-
-        # ---------- zam_bank ----------
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS zam_bank (
                 id SERIAL PRIMARY KEY,
@@ -293,7 +275,6 @@ async def db_init():
             )
         """)
 
-        # ---------- owner ----------
         await conn.execute("""
             INSERT INTO admins (
                 user_id,
@@ -331,16 +312,10 @@ async def db_init():
     logger.info("PostgreSQL initialized")
 
 
-# ============================================================
-# GOOGLE SYNC SCHEDULER
-# ============================================================
-
 _sheet_sync_task = None
-_sheet_sync_pending = False
-
 
 async def _delayed_google_sync():
-    global _sheet_sync_task, _sheet_sync_pending
+    global _sheet_sync_task
     try:
         await asyncio.sleep(2)
         await sync_google_sheets()
@@ -348,13 +323,9 @@ async def _delayed_google_sync():
         logger.warning("Scheduled Google Sheets sync failed: %s", e)
     finally:
         _sheet_sync_task = None
-        if _sheet_sync_pending:
-            _sheet_sync_pending = False
-            schedule_google_sync()
-
 
 def schedule_google_sync():
-    global _sheet_sync_task, _sheet_sync_pending
+    global _sheet_sync_task
     if not GOOGLE_SHEET_ID or not GOOGLE_AVAILABLE:
         return
     if _sheet_sync_task is None or _sheet_sync_task.done():
@@ -362,9 +333,6 @@ def schedule_google_sync():
             _sheet_sync_task = asyncio.create_task(_delayed_google_sync())
         except RuntimeError:
             pass
-    else:
-        _sheet_sync_pending = True
-
 
 async def db_execute(query, *args):
     if not db_pool:
@@ -402,30 +370,27 @@ async def save_user(message: Message):
     if not user:
         return
 
-    try:
-        await db_execute("""
-            INSERT INTO bot_users (
-                user_id,
-                username,
-                first_name,
-                last_name,
-                updated_at
-            )
-            VALUES ($1, $2, $3, $4, NOW())
-            ON CONFLICT (user_id)
-            DO UPDATE SET
-                username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name,
-                last_name = EXCLUDED.last_name,
-                updated_at = NOW()
-        """,
-            user.id,
-            user.username,
-            user.first_name,
-            user.last_name
+    await db_execute("""
+        INSERT INTO bot_users (
+            user_id,
+            username,
+            first_name,
+            last_name,
+            updated_at
         )
-    except Exception as e:
-        logger.warning("save_user failed: %s", e)
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (user_id)
+        DO UPDATE SET
+            username = EXCLUDED.username,
+            first_name = EXCLUDED.first_name,
+            last_name = EXCLUDED.last_name,
+            updated_at = NOW()
+    """,
+        user.id,
+        user.username,
+        user.first_name,
+        user.last_name
+    )
 
 
 # ============================================================
@@ -533,44 +498,6 @@ def cancel_keyboard():
 
 
 # ============================================================
-# HELPERS
-# ============================================================
-
-async def safe_answer(message: Message, text: str, **kwargs):
-    """Отправляет текст, разбивая его на куски < 4096 символов."""
-    LIMIT = 4000
-    if not text:
-        return
-    if len(text) <= LIMIT:
-        try:
-            await message.answer(text, **kwargs)
-        except Exception as e:
-            logger.warning("safe_answer failed: %s", e)
-        return
-    # Первый чанк с клавиатурой (если передана), остальные — без.
-    first = True
-    for i in range(0, len(text), LIMIT):
-        chunk = text[i:i + LIMIT]
-        try:
-            if first:
-                await message.answer(chunk, **kwargs)
-                first = False
-            else:
-                await message.answer(chunk)
-        except Exception as e:
-            logger.warning("safe_answer chunk failed: %s", e)
-
-
-def escape_html(value: str) -> str:
-    return (
-        str(value)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
-# ============================================================
 # STATES
 # ============================================================
 
@@ -649,6 +576,7 @@ async def application_start(
 
     await save_user(message)
 
+    # При повторном заполнении снимаем предыдущее начисление заму.
     previous = await db_fetchrow("""
         SELECT id, inviter, status FROM applications
         WHERE user_id = $1
@@ -684,10 +612,12 @@ async def application_nickname(
 ):
 
     await state.update_data(
-        nickname=(message.text or "").strip()
+        nickname=message.text.strip()
     )
 
-    await state.set_state(ApplicationForm.family_rank)
+    await state.set_state(
+        ApplicationForm.family_rank
+    )
 
     await message.answer(
         "Выберите семейный ранг:\n\n"
@@ -710,10 +640,12 @@ async def application_rank(
 ):
 
     await state.update_data(
-        family_rank=(message.text or "").strip()
+        family_rank=message.text.strip()
     )
 
-    await state.set_state(ApplicationForm.organization)
+    await state.set_state(
+        ApplicationForm.organization
+    )
 
     await message.answer(
         "Введите организацию:\n\n"
@@ -740,10 +672,12 @@ async def application_org(
 ):
 
     await state.update_data(
-        organization=(message.text or "").strip()
+        organization=message.text.strip()
     )
 
-    await state.set_state(ApplicationForm.organization_rank)
+    await state.set_state(
+        ApplicationForm.organization_rank
+    )
 
     await message.answer(
         "Введите ранг в организации:"
@@ -757,10 +691,12 @@ async def application_org_rank(
 ):
 
     await state.update_data(
-        organization_rank=(message.text or "").strip()
+        organization_rank=message.text.strip()
     )
 
-    await state.set_state(ApplicationForm.inviter)
+    await state.set_state(
+        ApplicationForm.inviter
+    )
 
     await message.answer(
         "Введите ник пригласившего зама.\n\n"
@@ -776,16 +712,7 @@ async def application_inviter(
 
     data = await state.get_data()
 
-    required = ("nickname", "family_rank", "organization", "organization_rank")
-    if not all(k in data and data[k] for k in required):
-        await state.clear()
-        await message.answer(
-            "❌ Анкета повреждена, начните заново.",
-            reply_markup=await main_menu(message.from_user.id)
-        )
-        return
-
-    inviter = (message.text or "").strip()
+    inviter = message.text.strip()
 
     username = (
         f"@{message.from_user.username}"
@@ -869,8 +796,6 @@ async def application_inviter(
 @dp.message(F.text == "👤 Мой профиль")
 async def profile_handler(message: Message):
 
-    await save_user(message)
-
     row = await db_fetchrow("""
         SELECT *
         FROM applications
@@ -880,16 +805,18 @@ async def profile_handler(message: Message):
     """, message.from_user.id)
 
     if not row:
-        await message.answer("❌ У вас пока нет анкеты.")
+        await message.answer(
+            "❌ У вас пока нет анкеты."
+        )
         return
 
     await message.answer(
         "👤 <b>Ваш профиль</b>\n\n"
-        f"🎮 Ник: <b>{escape_html(row['nickname'] or '-')}</b>\n"
-        f"⭐ Ранг: <b>{escape_html(row['family_rank'] or '-')}</b>\n"
-        f"🏢 Организация: <b>{escape_html(row['organization'] or '-')}</b>\n"
-        f"🎖 Ранг организации: <b>{escape_html(row['organization_rank'] or '-')}</b>\n"
-        f"👤 Зам: <b>{escape_html(row['inviter'] or '-')}</b>\n"
+        f"🎮 Ник: <b>{row['nickname']}</b>\n"
+        f"⭐ Ранг: <b>{row['family_rank']}</b>\n"
+        f"🏢 Организация: <b>{row['organization']}</b>\n"
+        f"🎖 Ранг организации: <b>{row['organization_rank']}</b>\n"
+        f"👤 Зам: <b>{row['inviter']}</b>\n"
         f"📌 Статус: <b>{row['status']}</b>"
     )
 
@@ -910,17 +837,19 @@ async def my_application(message: Message):
     """, message.from_user.id)
 
     if not row:
-        await message.answer("❌ Заявка не найдена.")
+        await message.answer(
+            "❌ Заявка не найдена."
+        )
         return
 
     await message.answer(
         "📋 <b>Ваша заявка</b>\n\n"
         f"ID: <b>#{row['id']}</b>\n"
-        f"Ник: <b>{escape_html(row['nickname'] or '-')}</b>\n"
-        f"Ранг: <b>{escape_html(row['family_rank'] or '-')}</b>\n"
-        f"Организация: <b>{escape_html(row['organization'] or '-')}</b>\n"
-        f"Ранг: <b>{escape_html(row['organization_rank'] or '-')}</b>\n"
-        f"Зам: <b>{escape_html(row['inviter'] or '-')}</b>\n"
+        f"Ник: <b>{row['nickname']}</b>\n"
+        f"Ранг: <b>{row['family_rank']}</b>\n"
+        f"Организация: <b>{row['organization']}</b>\n"
+        f"Ранг: <b>{row['organization_rank']}</b>\n"
+        f"Зам: <b>{row['inviter']}</b>\n"
         f"Статус: <b>{row['status']}</b>"
     )
 
@@ -932,8 +861,13 @@ async def my_application(message: Message):
 @dp.message(F.text == "📋 Управление заявками")
 async def manage_applications(message: Message):
 
-    if not await check_permission(message.from_user.id, "can_applications"):
-        await message.answer("❌ У вас нет права управлять заявками.")
+    if not await check_permission(
+        message.from_user.id,
+        "can_applications"
+    ):
+        await message.answer(
+            "❌ У вас нет права управлять заявками."
+        )
         return
 
     rows = await db_fetch("""
@@ -945,7 +879,9 @@ async def manage_applications(message: Message):
     """)
 
     if not rows:
-        await message.answer("📭 Новых заявок нет.")
+        await message.answer(
+            "📭 Новых заявок нет."
+        )
         return
 
     for row in rows:
@@ -968,12 +904,12 @@ async def manage_applications(message: Message):
         await message.answer(
             "📋 <b>Заявка</b>\n\n"
             f"ID: <b>#{row['id']}</b>\n"
-            f"👤 Пользователь: {escape_html(row['username'] or '-')}\n"
-            f"🎮 Ник: <b>{escape_html(row['nickname'] or '-')}</b>\n"
-            f"⭐ Ранг: {escape_html(row['family_rank'] or '-')}\n"
-            f"🏢 Организация: {escape_html(row['organization'] or '-')}\n"
-            f"🎖 Ранг: {escape_html(row['organization_rank'] or '-')}\n"
-            f"👤 Зам: {escape_html(row['inviter'] or '-')}",
+            f"👤 Пользователь: {row['username']}\n"
+            f"🎮 Ник: <b>{row['nickname']}</b>\n"
+            f"⭐ Ранг: {row['family_rank']}\n"
+            f"🏢 Организация: {row['organization']}\n"
+            f"🎖 Ранг: {row['organization_rank']}\n"
+            f"👤 Зам: {row['inviter']}",
             reply_markup=kb
         )
 
@@ -981,11 +917,19 @@ async def manage_applications(message: Message):
 @dp.callback_query(F.data.startswith("app_accept:"))
 async def app_accept(callback: CallbackQuery):
 
-    if not await check_permission(callback.from_user.id, "can_applications"):
-        await callback.answer("Нет прав", show_alert=True)
+    if not await check_permission(
+        callback.from_user.id,
+        "can_applications"
+    ):
+        await callback.answer(
+            "Нет прав",
+            show_alert=True
+        )
         return
 
-    app_id = int(callback.data.split(":")[1])
+    app_id = int(
+        callback.data.split(":")[1]
+    )
 
     row = await db_fetchrow("""
         SELECT *
@@ -994,7 +938,10 @@ async def app_accept(callback: CallbackQuery):
     """, app_id)
 
     if not row:
-        await callback.answer("Заявка не найдена", show_alert=True)
+        await callback.answer(
+            "Заявка не найдена",
+            show_alert=True
+        )
         return
 
     await db_execute("""
@@ -1022,10 +969,11 @@ async def app_accept(callback: CallbackQuery):
             member_limit=1,
             name=f"Анкета #{app_id}"
         )
-        invite_text += f"\n\n🔗 Ссылка для вступления: {invite.invite_link}"
+        invite_text += f"\\n\\n🔗 Ссылка для вступления: {invite.invite_link}"
     except Exception as e:
         logger.warning("Не удалось создать одноразовую ссылку: %s", e)
 
+    # Telegram позволяет задать custom title только администраторам группы.
     try:
         nickname = (row["nickname"] or "").strip()
         if nickname:
@@ -1035,33 +983,43 @@ async def app_accept(callback: CallbackQuery):
                 custom_title=nickname[:16]
             )
     except Exception as e:
-        logger.info("Custom title не установлен: %s", e)
+        logger.info("Custom title не установлен (возможно, пользователь не админ): %s", e)
 
     try:
         await bot.send_message(
             row["user_id"],
-            "✅ <b>Ваша заявка принята!</b>\n\n" + invite_text
+            "✅ <b>Ваша заявка принята!</b>\\n\\n" + invite_text
         )
     except Exception as e:
         logger.warning("Не удалось уведомить пользователя: %s", e)
 
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+    await callback.message.edit_reply_markup(
+        reply_markup=None
+    )
 
-    await callback.message.answer(f"✅ Заявка #{app_id} принята.")
+    await callback.message.answer(
+        f"✅ Заявка #{app_id} принята."
+    )
+
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("app_reject:"))
 async def app_reject(callback: CallbackQuery):
 
-    if not await check_permission(callback.from_user.id, "can_applications"):
-        await callback.answer("Нет прав", show_alert=True)
+    if not await check_permission(
+        callback.from_user.id,
+        "can_applications"
+    ):
+        await callback.answer(
+            "Нет прав",
+            show_alert=True
+        )
         return
 
-    app_id = int(callback.data.split(":")[1])
+    app_id = int(
+        callback.data.split(":")[1]
+    )
 
     row = await db_fetchrow("""
         SELECT *
@@ -1070,7 +1028,10 @@ async def app_reject(callback: CallbackQuery):
     """, app_id)
 
     if not row:
-        await callback.answer("Заявка не найдена", show_alert=True)
+        await callback.answer(
+            "Заявка не найдена",
+            show_alert=True
+        )
         return
 
     await db_execute("""
@@ -1088,12 +1049,14 @@ async def app_reject(callback: CallbackQuery):
     except Exception:
         pass
 
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+    await callback.message.edit_reply_markup(
+        reply_markup=None
+    )
 
-    await callback.message.answer(f"❌ Заявка #{app_id} отклонена.")
+    await callback.message.answer(
+        f"❌ Заявка #{app_id} отклонена."
+    )
+
     await callback.answer()
 
 
@@ -1104,8 +1067,13 @@ async def app_reject(callback: CallbackQuery):
 @dp.message(F.text == "⏳ Активные заявки")
 async def active_applications(message: Message):
 
-    if not await check_permission(message.from_user.id, "can_applications"):
-        await message.answer("❌ Нет прав.")
+    if not await check_permission(
+        message.from_user.id,
+        "can_applications"
+    ):
+        await message.answer(
+            "❌ Нет прав."
+        )
         return
 
     rows = await db_fetch("""
@@ -1116,7 +1084,9 @@ async def active_applications(message: Message):
     """)
 
     if not rows:
-        await message.answer("📭 Активных заявок нет.")
+        await message.answer(
+            "📭 Активных заявок нет."
+        )
         return
 
     text = "⏳ <b>Активные заявки:</b>\n\n"
@@ -1124,11 +1094,11 @@ async def active_applications(message: Message):
     for row in rows:
         text += (
             f"#{row['id']} — "
-            f"{escape_html(row['nickname'] or '-')} — "
-            f"{escape_html(row['username'] or '-')}\n"
+            f"{row['nickname']} — "
+            f"{row['username']}\n"
         )
 
-    await safe_answer(message, text)
+    await message.answer(text)
 
 
 # ============================================================
@@ -1141,9 +1111,9 @@ async def report_start(
     state: FSMContext
 ):
 
-    await save_user(message)
-
-    await state.set_state(ReportForm.text)
+    await state.set_state(
+        ReportForm.text
+    )
 
     await message.answer(
         "📨 <b>Report / Обращение</b>\n\n"
@@ -1184,16 +1154,20 @@ async def report_receive(
     """)
 
     for admin in admins:
+
         try:
             await bot.send_message(
                 admin["user_id"],
                 "📨 <b>Новый Report</b>\n\n"
-                f"👤 {escape_html(username)}\n"
+                f"👤 {username}\n"
                 f"🆔 {message.from_user.id}\n\n"
-                f"{escape_html(report_text)}"
+                f"{message.text}"
             )
         except Exception as e:
-            logger.warning("Report admin notification: %s", e)
+            logger.warning(
+                "Report admin notification: %s",
+                e
+            )
 
     await state.clear()
 
@@ -1213,13 +1187,22 @@ async def announcement_start(
     state: FSMContext
 ):
 
-    if not await check_permission(message.from_user.id, "can_announcements"):
-        await message.answer("❌ У вас нет права создавать объявления.")
+    if not await check_permission(
+        message.from_user.id,
+        "can_announcements"
+    ):
+        await message.answer(
+            "❌ У вас нет права создавать объявления."
+        )
         return
 
-    await state.set_state(AnnouncementForm.text)
+    await state.set_state(
+        AnnouncementForm.text
+    )
 
-    await message.answer("📢 Введите текст объявления:")
+    await message.answer(
+        "📢 Введите текст объявления:"
+    )
 
 
 @dp.message(AnnouncementForm.text)
@@ -1228,39 +1211,51 @@ async def announcement_send(
     state: FSMContext
 ):
 
-    if not await check_permission(message.from_user.id, "can_announcements"):
+    if not await check_permission(
+        message.from_user.id,
+        "can_announcements"
+    ):
         await state.clear()
-        await message.answer("❌ Нет прав.")
+        await message.answer(
+            "❌ Нет прав."
+        )
         return
 
     if not GROUP_ID:
-        await message.answer("❌ GROUP_ID не настроен.")
+        await message.answer(
+            "❌ GROUP_ID не настроен."
+        )
         return
 
     try:
+
         await bot.send_message(
             chat_id=GROUP_ID,
             message_thread_id=TOPIC_ID,
             text=(
                 "📢 <b>ОБЪЯВЛЕНИЕ</b>\n\n"
-                f"{escape_html(message.text or '')}"
+                f"{message.text}"
             )
         )
 
-        await message.answer("✅ Объявление отправлено.")
+        await message.answer(
+            "✅ Объявление отправлено."
+        )
 
         await log_action(
             message.from_user.id,
             message.from_user.username or "",
             "announcement",
-            message.text or ""
+            message.text
         )
 
     except Exception as e:
+
         logger.exception(e)
+
         await message.answer(
             "❌ Не удалось отправить объявление:\n"
-            f"<code>{escape_html(str(e))}</code>"
+            f"<code>{e}</code>"
         )
 
     await state.clear()
@@ -1270,14 +1265,23 @@ async def announcement_send(
 # GENERAL GATHER
 # ============================================================
 
-async def start_gather_from_button(message: Message):
+async def start_gather_from_button(
+    message: Message
+):
 
-    if not await check_permission(message.from_user.id, "can_gather"):
-        await message.answer("❌ У вас нет права запускать общий сбор.")
+    if not await check_permission(
+        message.from_user.id,
+        "can_gather"
+    ):
+        await message.answer(
+            "❌ У вас нет права запускать общий сбор."
+        )
         return
 
     if not GROUP_ID:
-        await message.answer("❌ GROUP_ID не настроен.")
+        await message.answer(
+            "❌ GROUP_ID не настроен."
+        )
         return
 
     try:
@@ -1289,7 +1293,8 @@ async def start_gather_from_button(message: Message):
         mentions = []
         for member in known_users[:70]:
             label = member["first_name"] or member["username"] or str(member["user_id"])
-            mentions.append(f'<a href="tg://user?id={member["user_id"]}">{escape_html(label)}</a>')
+            label = str(label).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            mentions.append(f'<a href="tg://user?id={member["user_id"]}">{label}</a>')
         mention_text = " ".join(mentions)
         gather_text = (
             "📢 <b>ОБЩИЙ СБОР</b>\n\n"
@@ -1303,7 +1308,9 @@ async def start_gather_from_button(message: Message):
             text=gather_text
         )
 
-        await message.answer("✅ Общий сбор запущен.")
+        await message.answer(
+            "✅ Общий сбор запущен."
+        )
 
         await log_action(
             message.from_user.id,
@@ -1312,15 +1319,22 @@ async def start_gather_from_button(message: Message):
         )
 
     except Exception as e:
+
         logger.exception(e)
+
         await message.answer(
             "❌ Ошибка общего сбора:\n"
-            f"<code>{escape_html(str(e))}</code>"
+            f"<code>{e}</code>"
         )
 
 
 @dp.message(F.text == "📢 Общий сбор")
 async def gather_btn(message: Message):
+
+    # ВАЖНО:
+    # этот обработчик находится ПОСЛЕ создания dp.
+    # Ошибки NameError: dp is not defined здесь больше нет.
+
     await start_gather_from_button(message)
 
 
@@ -1331,32 +1345,49 @@ async def gather_btn(message: Message):
 @dp.message(F.text == "🛑 Остановить сбор")
 async def gather_stop_btn(message: Message):
 
-    if not await check_permission(message.from_user.id, "can_gather"):
-        await message.answer("❌ Нет прав.")
-        return
-
-    if not GROUP_ID:
-        await message.answer("❌ GROUP_ID не настроен.")
+    if not await check_permission(
+        message.from_user.id,
+        "can_gather"
+    ):
+        await message.answer(
+            "❌ Нет прав."
+        )
         return
 
     try:
+
         await bot.send_message(
             chat_id=GROUP_ID,
             message_thread_id=TOPIC_ID,
             text="🛑 <b>ОБЩИЙ СБОР ОКОНЧЕН</b>"
         )
 
-        await message.answer("🛑 Сбор остановлен.")
+        await message.answer(
+            "🛑 Сбор остановлен."
+        )
 
     except Exception as e:
+
         await message.answer(
-            f"❌ Ошибка: <code>{escape_html(str(e))}</code>"
+            f"❌ Ошибка: <code>{e}</code>"
         )
 
 
 # ============================================================
 # PING
 # ============================================================
+
+async def telegram_ping():
+
+    started = time.perf_counter()
+
+    await bot.get_me()
+
+    return round(
+        (time.perf_counter() - started) * 1000,
+        2
+    )
+
 
 @dp.message(Command("ping"))
 async def ping_command(message: Message):
@@ -1373,7 +1404,9 @@ async def ping_command(message: Message):
 
         msg_started = time.perf_counter()
 
-        sent = await message.answer("🏓 Проверяю...")
+        sent = await message.answer(
+            "🏓 Проверяю..."
+        )
 
         processing = round(
             (time.perf_counter() - msg_started) * 1000,
@@ -1382,15 +1415,18 @@ async def ping_command(message: Message):
 
         await sent.edit_text(
             "🏓 <b>PING</b>\n\n"
-            f"🌐 Telegram Bot API: <b>{telegram_rtt} ms</b>\n"
-            f"📨 Обработка сообщения: <b>{processing} ms</b>\n"
+            f"🌐 Telegram Bot API: "
+            f"<b>{telegram_rtt} ms</b>\n"
+            f"📨 Обработка сообщения: "
+            f"<b>{processing} ms</b>\n"
             f"🤖 @{me.username}"
         )
 
     except Exception as e:
+
         await message.answer(
             "❌ Ошибка ping:\n"
-            f"<code>{escape_html(str(e))}</code>"
+            f"<code>{e}</code>"
         )
 
 
@@ -1400,8 +1436,6 @@ async def ping_command(message: Message):
 
 @dp.message(Command("myid"))
 async def myid_command(message: Message):
-
-    await save_user(message)
 
     await message.answer(
         f"🆔 Ваш Telegram ID:\n"
@@ -1425,7 +1459,9 @@ async def kto_command(message: Message):
     target = message.reply_to_message.from_user
 
     if not target:
-        await message.answer("❌ Не удалось определить пользователя.")
+        await message.answer(
+            "❌ Не удалось определить пользователя."
+        )
         return
 
     row = await db_fetchrow("""
@@ -1449,11 +1485,11 @@ async def kto_command(message: Message):
         "👤 <b>Информация о пользователе</b>\n\n"
         f"ID: <code>{target.id}</code>\n"
         f"Username: @{target.username or 'нет'}\n"
-        f"🎮 Ник: <b>{escape_html(row['nickname'] or '-')}</b>\n"
-        f"⭐ Ранг: {escape_html(row['family_rank'] or '-')}\n"
-        f"🏢 Организация: {escape_html(row['organization'] or '-')}\n"
-        f"🎖 Ранг: {escape_html(row['organization_rank'] or '-')}\n"
-        f"👤 Зам: {escape_html(row['inviter'] or '-')}\n"
+        f"🎮 Ник: <b>{row['nickname']}</b>\n"
+        f"⭐ Ранг: {row['family_rank']}\n"
+        f"🏢 Организация: {row['organization']}\n"
+        f"🎖 Ранг: {row['organization_rank']}\n"
+        f"👤 Зам: {row['inviter']}\n"
         f"📌 Статус: {row['status']}"
     )
 
@@ -1466,7 +1502,9 @@ async def kto_command(message: Message):
 async def admin_panel(message: Message):
 
     if not await is_owner(message.from_user.id):
-        await message.answer("❌ Этот раздел доступен только владельцу.")
+        await message.answer(
+            "❌ Этот раздел доступен только владельцу."
+        )
         return
 
     admins = await db_fetch("""
@@ -1478,15 +1516,22 @@ async def admin_panel(message: Message):
     text = "👑 <b>Администрирование</b>\n\n"
 
     for admin in admins:
+
         text += (
             f"🆔 <code>{admin['user_id']}</code>\n"
-            f"👤 {escape_html(admin['username'] or '-')}\n"
-            f"👑 Владелец: {'да' if admin['is_owner'] else 'нет'}\n"
-            f"📋 Заявки: {'✅' if admin['can_applications'] else '❌'}\n"
-            f"📢 Объявления: {'✅' if admin['can_announcements'] else '❌'}\n"
-            f"📨 Report: {'✅' if admin['can_reports'] else '❌'}\n"
-            f"⏰ Напоминания: {'✅' if admin['can_reminders'] else '❌'}\n"
-            f"📢 Сбор: {'✅' if admin['can_gather'] else '❌'}\n\n"
+            f"👤 {admin['username'] or '-'}\n"
+            f"👑 Владелец: "
+            f"{'да' if admin['is_owner'] else 'нет'}\n"
+            f"📋 Заявки: "
+            f"{'✅' if admin['can_applications'] else '❌'}\n"
+            f"📢 Объявления: "
+            f"{'✅' if admin['can_announcements'] else '❌'}\n"
+            f"📨 Report: "
+            f"{'✅' if admin['can_reports'] else '❌'}\n"
+            f"⏰ Напоминания: "
+            f"{'✅' if admin['can_reminders'] else '❌'}\n"
+            f"📢 Сбор: "
+            f"{'✅' if admin['can_gather'] else '❌'}\n\n"
         )
 
     text += (
@@ -1496,28 +1541,33 @@ async def admin_panel(message: Message):
         "Для отключения используй <code>off</code>."
     )
 
-    await safe_answer(message, text)
+    await message.answer(text)
 
 
 @dp.message(Command("add_admin"))
 async def add_admin(message: Message):
 
     if not await is_owner(message.from_user.id):
-        await message.answer("❌ Только владелец.")
+        await message.answer(
+            "❌ Только владелец."
+        )
         return
 
-    parts = (message.text or "").split()
+    parts = message.text.split()
 
     if len(parts) != 2:
         await message.answer(
-            "Использование:\n<code>/add_admin 123456789</code>"
+            "Использование:\n"
+            "<code>/add_admin 123456789</code>"
         )
         return
 
     try:
         user_id = int(parts[1])
     except ValueError:
-        await message.answer("❌ ID должен быть числом.")
+        await message.answer(
+            "❌ ID должен быть числом."
+        )
         return
 
     await db_execute("""
@@ -1531,13 +1581,23 @@ async def add_admin(message: Message):
             can_gather,
             can_admins
         )
-        VALUES ($1, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE)
+        VALUES (
+            $1,
+            FALSE,
+            TRUE,
+            TRUE,
+            TRUE,
+            TRUE,
+            TRUE,
+            FALSE
+        )
         ON CONFLICT (user_id)
         DO NOTHING
     """, user_id)
 
     await message.answer(
-        f"✅ Администратор <code>{user_id}</code> добавлен."
+        f"✅ Администратор "
+        f"<code>{user_id}</code> добавлен."
     )
 
 
@@ -1580,41 +1640,39 @@ async def set_admin_permission(message: Message):
     if result == "UPDATE 0":
         await message.answer("❌ Такой администратор не найден. Сначала используй /add_admin ID.")
         return
-    await log_action(
-        message.from_user.id,
-        message.from_user.username or "",
-        "admin_permission_changed",
-        f"{target_id}: {permission}={enabled}"
-    )
-    await message.answer(
-        f"✅ Право <code>{permission}</code> для <code>{target_id}</code>: "
-        f"{'включено' if enabled else 'выключено'}."
-    )
-
+    await log_action(message.from_user.id, message.from_user.username or "", "admin_permission_changed", f"{target_id}: {permission}={enabled}")
+    await message.answer(f"✅ Право <code>{permission}</code> для <code>{target_id}</code>: {'включено' if enabled else 'выключено'}.")
 
 @dp.message(Command("del_admin"))
 async def del_admin(message: Message):
 
     if not await is_owner(message.from_user.id):
-        await message.answer("❌ Только владелец.")
+        await message.answer(
+            "❌ Только владелец."
+        )
         return
 
-    parts = (message.text or "").split()
+    parts = message.text.split()
 
     if len(parts) != 2:
         await message.answer(
-            "Использование:\n<code>/del_admin 123456789</code>"
+            "Использование:\n"
+            "<code>/del_admin 123456789</code>"
         )
         return
 
     try:
         user_id = int(parts[1])
     except ValueError:
-        await message.answer("❌ ID должен быть числом.")
+        await message.answer(
+            "❌ ID должен быть числом."
+        )
         return
 
     if user_id == OWNER_ID:
-        await message.answer("❌ Нельзя удалить владельца.")
+        await message.answer(
+            "❌ Нельзя удалить владельца."
+        )
         return
 
     await db_execute("""
@@ -1622,7 +1680,9 @@ async def del_admin(message: Message):
         WHERE user_id = $1
     """, user_id)
 
-    await message.answer("✅ Администратор удалён.")
+    await message.answer(
+        "✅ Администратор удалён."
+    )
 
 
 # ============================================================
@@ -1633,7 +1693,9 @@ async def del_admin(message: Message):
 async def members_list(message: Message):
 
     if not await is_admin(message.from_user.id):
-        await message.answer("❌ Нет прав.")
+        await message.answer(
+            "❌ Нет прав."
+        )
         return
 
     rows = await db_fetch("""
@@ -1644,16 +1706,27 @@ async def members_list(message: Message):
     """)
 
     if not rows:
-        await message.answer("📭 Список пуст.")
+        await message.answer(
+            "📭 Список пуст."
+        )
         return
 
     text = "👥 <b>Пользователи бота:</b>\n\n"
 
     for row in rows:
-        name = row["first_name"] or row["username"] or str(row["user_id"])
-        text += f"• {escape_html(name)} — <code>{row['user_id']}</code>\n"
 
-    await safe_answer(message, text)
+        name = (
+            row["first_name"]
+            or row["username"]
+            or str(row["user_id"])
+        )
+
+        text += (
+            f"• {name} — "
+            f"<code>{row['user_id']}</code>\n"
+        )
+
+    await message.answer(text)
 
 
 # ============================================================
@@ -1664,13 +1737,21 @@ async def members_list(message: Message):
 async def bot_status(message: Message):
 
     if not await is_admin(message.from_user.id):
-        await message.answer("❌ Нет прав.")
+        await message.answer(
+            "❌ Нет прав."
+        )
         return
 
     try:
+
         started = time.perf_counter()
+
         me = await bot.get_me()
-        ping = round((time.perf_counter() - started) * 1000, 2)
+
+        ping = round(
+            (time.perf_counter() - started) * 1000,
+            2
+        )
 
         await message.answer(
             "🟢 <b>Бот работает</b>\n\n"
@@ -1684,9 +1765,10 @@ async def bot_status(message: Message):
         )
 
     except Exception as e:
+
         await message.answer(
-            "❌ Ошибка статуса:\n"
-            f"<code>{escape_html(str(e))}</code>"
+            f"❌ Ошибка статуса:\n"
+            f"<code>{e}</code>"
         )
 
 
@@ -1698,7 +1780,9 @@ async def bot_status(message: Message):
 async def logs_handler(message: Message):
 
     if not await is_owner(message.from_user.id):
-        await message.answer("❌ Только владелец.")
+        await message.answer(
+            "❌ Только владелец."
+        )
         return
 
     rows = await db_fetch("""
@@ -1709,23 +1793,30 @@ async def logs_handler(message: Message):
     """)
 
     if not rows:
-        await message.answer("📭 Журнал пуст.")
+        await message.answer(
+            "📭 Журнал пуст."
+        )
         return
 
     text = "📜 <b>Последние действия</b>\n\n"
 
     for row in rows:
+
         created = row["created_at"]
+
         text += (
-            f"#{row['id']} {created:%d.%m %H:%M}\n"
-            f"👤 {escape_html(str(row['username'] or row['user_id']))}\n"
-            f"⚙️ {escape_html(row['action'] or '')}\n"
+            f"#{row['id']} "
+            f"{created:%d.%m %H:%M}\n"
+            f"👤 {row['username'] or row['user_id']}\n"
+            f"⚙️ {row['action']}\n"
         )
+
         if row["details"]:
-            text += f"📝 {escape_html(row['details'][:150])}\n"
+            text += f"📝 {row['details'][:150]}\n"
+
         text += "\n"
 
-    await safe_answer(message, text)
+    await message.answer(text)
 
 
 # ============================================================
@@ -1733,9 +1824,7 @@ async def logs_handler(message: Message):
 # ============================================================
 
 async def get_bot_timezone():
-    row = await db_fetchrow(
-        "SELECT value FROM bot_settings WHERE key = 'timezone'"
-    )
+    row = await db_fetchrow("SELECT value FROM bot_settings WHERE key = 'timezone'")
     name = row["value"] if row else TIMEZONE
     try:
         return ZoneInfo(name)
@@ -1744,25 +1833,50 @@ async def get_bot_timezone():
 
 
 def valid_hhmm(value: str) -> bool:
-    value = (value or "").strip()
-    return bool(re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value))
+
+    value = value.strip()
+
+    return bool(
+        re.fullmatch(
+            r"(?:[01]\d|2[0-3]):[0-5]\d",
+            value
+        )
+    )
 
 
 @dp.message(F.text == "⏰ Напоминания")
 async def reminders_menu(message: Message):
 
-    if not await check_permission(message.from_user.id, "can_reminders"):
-        await message.answer("❌ Нет прав.")
+    if not await check_permission(
+        message.from_user.id,
+        "can_reminders"
+    ):
+        await message.answer(
+            "❌ Нет прав."
+        )
         return
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Создать", callback_data="rem_create")],
-            [InlineKeyboardButton(text="📋 Список", callback_data="rem_list")],
+            [
+                InlineKeyboardButton(
+                    text="➕ Создать",
+                    callback_data="rem_create"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📋 Список",
+                    callback_data="rem_list"
+                )
+            ]
         ]
     )
 
-    await message.answer("⏰ <b>Напоминания</b>", reply_markup=kb)
+    await message.answer(
+        "⏰ <b>Напоминания</b>",
+        reply_markup=kb
+    )
 
 
 @dp.callback_query(F.data == "rem_create")
@@ -1771,13 +1885,23 @@ async def reminder_create(
     state: FSMContext
 ):
 
-    if not await check_permission(callback.from_user.id, "can_reminders"):
-        await callback.answer("Нет прав", show_alert=True)
+    if not await check_permission(
+        callback.from_user.id,
+        "can_reminders"
+    ):
+        await callback.answer(
+            "Нет прав",
+            show_alert=True
+        )
         return
 
-    await state.set_state(ReminderForm.name)
+    await state.set_state(
+        ReminderForm.name
+    )
 
-    await callback.message.answer("Введите название напоминания:")
+    await callback.message.answer(
+        "Введите название напоминания:"
+    )
 
     await callback.answer()
 
@@ -1788,9 +1912,17 @@ async def reminder_name(
     state: FSMContext
 ):
 
-    await state.update_data(name=(message.text or "").strip())
-    await state.set_state(ReminderForm.message)
-    await message.answer("Введите текст напоминания:")
+    await state.update_data(
+        name=message.text.strip()
+    )
+
+    await state.set_state(
+        ReminderForm.message
+    )
+
+    await message.answer(
+        "Введите текст напоминания:"
+    )
 
 
 @dp.message(ReminderForm.message)
@@ -1799,8 +1931,14 @@ async def reminder_message(
     state: FSMContext
 ):
 
-    await state.update_data(message=(message.text or "").strip())
-    await state.set_state(ReminderForm.time)
+    await state.update_data(
+        message=message.text.strip()
+    )
+
+    await state.set_state(
+        ReminderForm.time
+    )
+
     await message.answer(
         "Введите время в формате <b>HH:MM</b>.\n\n"
         "Например: <code>15:00</code>"
@@ -1813,19 +1951,31 @@ async def reminder_time(
     state: FSMContext
 ):
 
-    value = (message.text or "").strip()
+    value = message.text.strip()
 
     if not valid_hhmm(value):
+
         await message.answer(
             "❌ Неверное время.\n\n"
-            "Пример правильного формата:\n<code>15:00</code>"
+            "Пример правильного формата:\n"
+            "<code>15:00</code>"
         )
+
         return
 
-    await state.update_data(time=value)
-    await state.set_state(ReminderForm.destination)
+    await state.update_data(
+        time=value
+    )
+
+    await state.set_state(
+        ReminderForm.destination
+    )
+
     await message.answer(
-        "Куда отправлять?\n\nНапишите:\n<b>группа</b>\n<b>личка</b>"
+        "Куда отправлять?\n\n"
+        "Напишите:\n"
+        "<b>группа</b>\n"
+        "<b>личка</b>"
     )
 
 
@@ -1835,22 +1985,39 @@ async def reminder_destination(
     state: FSMContext
 ):
 
-    value = (message.text or "").strip().lower()
+    value = message.text.strip().lower()
 
     if value not in ("группа", "личка"):
-        await message.answer("Напишите <b>группа</b> или <b>личка</b>.")
+
+        await message.answer(
+            "Напишите <b>группа</b> или <b>личка</b>."
+        )
+
         return
 
-    await state.update_data(destination=value)
-    await state.set_state(ReminderForm.topic)
+    await state.update_data(
+        destination=value
+    )
 
     if value == "группа":
+
+        await state.set_state(
+            ReminderForm.topic
+        )
+
         await message.answer(
             "Введите ID темы.\n\n"
-            "Для новостей можно написать:\n<code>126387</code>\n\n"
+            "Для новостей можно написать:\n"
+            "<code>126387</code>\n\n"
             "Если без темы — <code>0</code>."
         )
+
     else:
+
+        await state.set_state(
+            ReminderForm.topic
+        )
+
         await message.answer(
             "Введите Telegram ID пользователя,\n"
             "которому отправлять напоминание:"
@@ -1863,15 +2030,30 @@ async def reminder_topic(
     state: FSMContext
 ):
 
+    data = await state.get_data()
+
     try:
-        topic = int((message.text or "").strip())
+        topic = int(message.text.strip())
     except ValueError:
-        await message.answer("❌ Нужно указать число.")
+
+        await message.answer(
+            "❌ Нужно указать число."
+        )
+
         return
 
-    await state.update_data(topic_id=topic)
-    await state.set_state(ReminderForm.mention)
-    await message.answer("Упоминать всех?\n\nНапишите <b>да</b> или <b>нет</b>.")
+    await state.update_data(
+        topic_id=topic
+    )
+
+    await state.set_state(
+        ReminderForm.mention
+    )
+
+    await message.answer(
+        "Упоминать всех?\n\n"
+        "Напишите <b>да</b> или <b>нет</b>."
+    )
 
 
 @dp.message(ReminderForm.mention)
@@ -1880,13 +2062,18 @@ async def reminder_mention(
     state: FSMContext
 ):
 
-    value = (message.text or "").strip().lower()
+    value = message.text.strip().lower()
 
     if value not in ("да", "нет"):
-        await message.answer("Напишите <b>да</b> или <b>нет</b>.")
+
+        await message.answer(
+            "Напишите <b>да</b> или <b>нет</b>."
+        )
+
         return
 
     data = await state.get_data()
+
     mention_all = value == "да"
 
     if data.get("edit_id"):
@@ -1916,18 +2103,27 @@ async def reminder_mention(
 
     await message.answer(
         f"✅ <b>Напоминание {result_word}!</b>\n\n"
-        f"Название: {escape_html(data['name'])}\n"
+        f"Название: {data['name']}\n"
         f"Время: {data['time']}\n"
         f"Куда: {data['destination']}\n"
-        f"Упоминать всех: {'да' if mention_all else 'нет'}"
+        f"Упоминать всех: "
+        f"{'да' if mention_all else 'нет'}"
     )
 
 
 @dp.callback_query(F.data == "rem_list")
-async def reminder_list(callback: CallbackQuery):
+async def reminder_list(
+    callback: CallbackQuery
+):
 
-    if not await check_permission(callback.from_user.id, "can_reminders"):
-        await callback.answer("Нет прав", show_alert=True)
+    if not await check_permission(
+        callback.from_user.id,
+        "can_reminders"
+    ):
+        await callback.answer(
+            "Нет прав",
+            show_alert=True
+        )
         return
 
     rows = await db_fetch("""
@@ -1937,29 +2133,44 @@ async def reminder_list(callback: CallbackQuery):
     """)
 
     if not rows:
-        await callback.message.answer("📭 Напоминаний нет.")
+
+        await callback.message.answer(
+            "📭 Напоминаний нет."
+        )
+
         await callback.answer()
         return
 
     for row in rows:
+
         status = "🟢" if row["enabled"] else "🔴"
 
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="✏️ Изменить", callback_data=f"rem_edit:{row['id']}"),
-                    InlineKeyboardButton(text="🔄 Вкл/выкл", callback_data=f"rem_toggle:{row['id']}"),
-                    InlineKeyboardButton(text="🗑 Удалить", callback_data=f"rem_delete:{row['id']}"),
+                    InlineKeyboardButton(
+                        text="✏️ Изменить",
+                        callback_data=f"rem_edit:{row['id']}"
+                    ),
+                    InlineKeyboardButton(
+                        text="🔄 Вкл/выкл",
+                        callback_data=f"rem_toggle:{row['id']}"
+                    ),
+                    InlineKeyboardButton(
+                        text="🗑 Удалить",
+                        callback_data=f"rem_delete:{row['id']}"
+                    )
                 ]
             ]
         )
 
         await callback.message.answer(
-            f"{status} <b>{escape_html(row['name'] or '')}</b>\n\n"
+            f"{status} <b>{row['name']}</b>\n\n"
             f"⏰ {row['time']}\n"
-            f"📝 {escape_html(row['message'] or '')}\n"
+            f"📝 {row['message']}\n"
             f"📍 {row['destination']}\n"
-            f"👥 Упоминать всех: {'да' if row['mention_all'] else 'нет'}",
+            f"👥 Упоминать всех: "
+            f"{'да' if row['mention_all'] else 'нет'}",
             reply_markup=kb
         )
 
@@ -1985,15 +2196,24 @@ async def reminder_edit(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-
 @dp.callback_query(F.data.startswith("rem_toggle:"))
-async def reminder_toggle(callback: CallbackQuery):
+async def reminder_toggle(
+    callback: CallbackQuery
+):
 
-    if not await check_permission(callback.from_user.id, "can_reminders"):
-        await callback.answer("Нет прав", show_alert=True)
+    if not await check_permission(
+        callback.from_user.id,
+        "can_reminders"
+    ):
+        await callback.answer(
+            "Нет прав",
+            show_alert=True
+        )
         return
 
-    reminder_id = int(callback.data.split(":")[1])
+    reminder_id = int(
+        callback.data.split(":")[1]
+    )
 
     await db_execute("""
         UPDATE reminders
@@ -2001,29 +2221,42 @@ async def reminder_toggle(callback: CallbackQuery):
         WHERE id = $1
     """, reminder_id)
 
-    await callback.answer("Статус изменён.")
+    await callback.answer(
+        "Статус изменён."
+    )
 
 
 @dp.callback_query(F.data.startswith("rem_delete:"))
-async def reminder_delete(callback: CallbackQuery):
+async def reminder_delete(
+    callback: CallbackQuery
+):
 
-    if not await check_permission(callback.from_user.id, "can_reminders"):
-        await callback.answer("Нет прав", show_alert=True)
+    if not await check_permission(
+        callback.from_user.id,
+        "can_reminders"
+    ):
+        await callback.answer(
+            "Нет прав",
+            show_alert=True
+        )
         return
 
-    reminder_id = int(callback.data.split(":")[1])
+    reminder_id = int(
+        callback.data.split(":")[1]
+    )
 
     await db_execute("""
         DELETE FROM reminders
         WHERE id = $1
     """, reminder_id)
 
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+    await callback.message.edit_reply_markup(
+        reply_markup=None
+    )
 
-    await callback.answer("Напоминание удалено.")
+    await callback.answer(
+        "Напоминание удалено."
+    )
 
 
 # ============================================================
@@ -2038,8 +2271,8 @@ async def send_reminder(row):
     destination = row["destination"]
 
     text = (
-        f"⏰ <b>{escape_html(row['name'] or '')}</b>\n\n"
-        f"{escape_html(row['message'] or '')}"
+        f"⏰ <b>{row['name']}</b>\n\n"
+        f"{row['message']}"
     )
 
     if row["mention_all"]:
@@ -2051,22 +2284,39 @@ async def send_reminder(row):
         mention_links = []
         for member in known_users[:70]:
             label = member["first_name"] or member["username"] or str(member["user_id"])
-            mention_links.append(f'<a href="tg://user?id={member["user_id"]}">{escape_html(label)}</a>')
+            label = str(label).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            mention_links.append(f'<a href="tg://user?id={member["user_id"]}">{label}</a>')
         people = " ".join(mention_links)
         text = "📢 <b>ВНИМАНИЕ ВСЕМ</b>\n" + (people + "\n\n" if people else "\n") + text
 
     try:
+
         if destination == "группа":
-            kwargs = {"chat_id": GROUP_ID, "text": text}
+
+            kwargs = {
+                "chat_id": GROUP_ID,
+                "text": text
+            }
+
             if row["topic_id"]:
                 kwargs["message_thread_id"] = row["topic_id"]
+
             await bot.send_message(**kwargs)
 
         elif destination == "личка":
-            await bot.send_message(chat_id=row["topic_id"], text=text)
+
+            await bot.send_message(
+                chat_id=row["topic_id"],
+                text=text
+            )
 
     except Exception as e:
-        logger.exception("Ошибка отправки reminder #%s: %s", row["id"], e)
+
+        logger.exception(
+            "Ошибка отправки reminder #%s: %s",
+            row["id"],
+            e
+        )
 
 
 async def reminder_worker():
@@ -2074,12 +2324,15 @@ async def reminder_worker():
     global _last_reminder_minute
 
     while True:
+
         try:
+
             bot_tz = await get_bot_timezone()
             now = datetime.now(bot_tz)
             current_hm = now.strftime("%H:%M")
 
             if current_hm != _last_reminder_minute:
+
                 rows = await db_fetch("""
                     SELECT *
                     FROM reminders
@@ -2093,7 +2346,11 @@ async def reminder_worker():
                 _last_reminder_minute = current_hm
 
         except Exception as e:
-            logger.exception("reminder_worker: %s", e)
+
+            logger.exception(
+                "reminder_worker: %s",
+                e
+            )
 
         await asyncio.sleep(20)
 
@@ -2111,7 +2368,10 @@ def google_client():
         return None
 
     try:
-        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+
+        info = json.loads(
+            GOOGLE_SERVICE_ACCOUNT_JSON
+        )
 
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
@@ -2126,7 +2386,12 @@ def google_client():
         return gspread.authorize(credentials)
 
     except Exception as e:
-        logger.error("Google credentials error: %s", e)
+
+        logger.error(
+            "Google credentials error: %s",
+            e
+        )
+
         return None
 
 
@@ -2136,24 +2401,48 @@ def sync_google_sheets_sync(applications, reports, reminders, admins, logs, bank
         return
 
     client = google_client()
+
     if not client:
         return
 
     try:
-        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
 
-        # ---------------- APPLICATIONS ----------------
+        spreadsheet = client.open_by_key(
+            GOOGLE_SHEET_ID
+        )
+
+        # ------------------------------------------------
+        # APPLICATIONS
+        # ------------------------------------------------
+
         try:
-            ws = spreadsheet.worksheet("Заявки")
+            ws = spreadsheet.worksheet(
+                "Заявки"
+            )
         except Exception:
-            ws = spreadsheet.add_worksheet(title="Заявки", rows=1000, cols=15)
+            ws = spreadsheet.add_worksheet(
+                title="Заявки",
+                rows=1000,
+                cols=15
+            )
 
-        rows = [[
-            "ID", "User ID", "Username", "Ник", "Ранг", "Организация",
-            "Ранг организации", "Зам", "Статус", "Создано"
-        ]]
+        rows = [
+            [
+                "ID",
+                "User ID",
+                "Username",
+                "Ник",
+                "Ранг",
+                "Организация",
+                "Ранг организации",
+                "Зам",
+                "Статус",
+                "Создано"
+            ]
+        ]
 
         for row in applications:
+
             rows.append([
                 str(row["id"]),
                 str(row["user_id"]),
@@ -2168,16 +2457,39 @@ def sync_google_sheets_sync(applications, reports, reminders, admins, logs, bank
             ])
 
         ws.clear()
-        ws.update(range_name="A1", values=rows)
 
-        # ---------------- REPORTS ----------------
+        # Новый синтаксис gspread
+        ws.update(
+            range_name="A1",
+            values=rows
+        )
+
+        # ------------------------------------------------
+        # REPORTS
+        # ------------------------------------------------
+
         try:
-            report_ws = spreadsheet.worksheet("Report")
+            report_ws = spreadsheet.worksheet(
+                "Report"
+            )
         except Exception:
-            report_ws = spreadsheet.add_worksheet(title="Report", rows=1000, cols=8)
+            report_ws = spreadsheet.add_worksheet(
+                title="Report",
+                rows=1000,
+                cols=8
+            )
 
-        report_rows = [["ID", "User ID", "Username", "Текст", "Статус", "Дата"]]
+        report_rows = [[
+            "ID",
+            "User ID",
+            "Username",
+            "Текст",
+            "Статус",
+            "Дата"
+        ]]
+
         for row in reports:
+
             report_rows.append([
                 str(row["id"]),
                 str(row["user_id"]),
@@ -2188,9 +2500,12 @@ def sync_google_sheets_sync(applications, reports, reminders, admins, logs, bank
             ])
 
         report_ws.clear()
-        report_ws.update(range_name="A1", values=report_rows)
 
-        # ---------------- EXTRA SHEETS ----------------
+        report_ws.update(
+            range_name="A1",
+            values=report_rows
+        )
+
         extra_sheets = {
             "Напоминания": (
                 ["ID", "Название", "Текст", "Время", "Куда", "Тема/ID", "Упоминать", "Включено", "Создано"],
@@ -2220,7 +2535,6 @@ def sync_google_sheets_sync(applications, reports, reminders, admins, logs, bank
                   str(r["last_name"] or ""), str(r["created_at"]), str(r["updated_at"])] for r in users]
             ),
         }
-
         for title, (headers, body) in extra_sheets.items():
             try:
                 extra_ws = spreadsheet.worksheet(title)
@@ -2229,27 +2543,32 @@ def sync_google_sheets_sync(applications, reports, reminders, admins, logs, bank
             extra_ws.clear()
             extra_ws.update(range_name="A1", values=[headers] + body)
 
-        logger.info("Google Sheets synchronized")
+        logger.info(
+            "Google Sheets synchronized"
+        )
 
     except Exception as e:
-        logger.exception("Google Sheets sync error: %s", e)
+
+        logger.exception(
+            "Google Sheets sync error: %s",
+            e
+        )
 
 
 async def sync_google_sheets():
     if not GOOGLE_SHEET_ID or not GOOGLE_AVAILABLE:
         return
     try:
-        applications = await db_fetch("SELECT * FROM applications ORDER BY id DESC")
+        applications = await db_fetch("""
+            SELECT * FROM applications ORDER BY id DESC
+        """)
         reports = await db_fetch("SELECT * FROM reports ORDER BY id DESC")
         reminders = await db_fetch("SELECT * FROM reminders ORDER BY id DESC")
         admins = await db_fetch("SELECT * FROM admins ORDER BY is_owner DESC, user_id")
         logs = await db_fetch("SELECT * FROM bot_logs ORDER BY id DESC LIMIT 2000")
         bank = await db_fetch("SELECT * FROM zam_bank ORDER BY id DESC")
         users = await db_fetch("SELECT * FROM bot_users ORDER BY user_id")
-        await asyncio.to_thread(
-            sync_google_sheets_sync,
-            applications, reports, reminders, admins, logs, bank, users
-        )
+        await asyncio.to_thread(sync_google_sheets_sync, applications, reports, reminders, admins, logs, bank, users)
     except Exception as e:
         logger.exception("Google Sheets async sync error: %s", e)
 
@@ -2271,7 +2590,6 @@ async def timezone_menu(message: Message):
         "Пример другого пояса: <code>Europe/Amsterdam</code>."
     )
 
-
 @dp.message(Command("timezone"))
 async def timezone_set(message: Message):
     if not await is_owner(message.from_user.id):
@@ -2281,10 +2599,7 @@ async def timezone_set(message: Message):
     if len(parts) != 2:
         row = await db_fetchrow("SELECT value FROM bot_settings WHERE key = 'timezone'")
         current = row["value"] if row else TIMEZONE
-        await message.answer(
-            f"Использование: <code>/timezone Europe/Moscow</code>\n"
-            f"Текущий: <code>{current}</code>"
-        )
+        await message.answer(f"Использование: <code>/timezone Europe/Moscow</code>\nТекущий: <code>{current}</code>")
         return
     name = parts[1].strip()
     try:
@@ -2297,14 +2612,8 @@ async def timezone_set(message: Message):
            ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value""",
         name
     )
-    await log_action(
-        message.from_user.id,
-        message.from_user.username or "",
-        "timezone_changed",
-        name
-    )
+    await log_action(message.from_user.id, message.from_user.username or "", "timezone_changed", name)
     await message.answer(f"✅ Часовой пояс установлен: <code>{name}</code>")
-
 
 # ============================================================
 # ZAM BANK
@@ -2315,28 +2624,20 @@ async def zam_bank_menu(message: Message):
     if not await is_owner(message.from_user.id):
         await message.answer("❌ Раздел доступен только владельцу.")
         return
-
     rows = await db_fetch("""
-        SELECT inviter,
-               COUNT(*) FILTER (WHERE action = 'credited') AS entries,
+        SELECT inviter, COUNT(*) FILTER (WHERE action = 'credited') AS entries,
                COALESCE(SUM(amount), 0) AS total
         FROM zam_bank
         GROUP BY inviter
         ORDER BY total DESC, inviter
     """)
-
     text = "🏦 <b>Банк замов</b>\n\n"
     if not rows:
         text += "Начислений пока нет."
     else:
         for row in rows:
-            text += (
-                f"👤 {escape_html(row['inviter'])}: "
-                f"{row['entries']} начисл. — {row['total']:,}\n"
-            )
-
-    await safe_answer(message, text)
-
+            text += f"👤 {row['inviter']}: {row['entries']} начисл. — {row['total']:,}\n"
+    await message.answer(text)
 
 # ============================================================
 # /AHELP
@@ -2346,7 +2647,9 @@ async def zam_bank_menu(message: Message):
 async def ahelp(message: Message):
 
     if message.from_user.id != OWNER_ID:
-        await message.answer("❌ Эта команда доступна только владельцу.")
+        await message.answer(
+            "❌ Эта команда доступна только владельцу."
+        )
         return
 
     await message.answer(
@@ -2356,7 +2659,8 @@ async def ahelp(message: Message):
         "/start — главное меню\n"
         "/myid — узнать свой Telegram ID\n"
         "/ping — реальный ping Telegram API\n"
-        "/кто — информация о пользователе ответом на его сообщение\n"
+        "/кто — информация о пользователе "
+        "ответом на его сообщение\n"
         "/kto — то же самое\n\n"
 
         "<b>Администрирование:</b>\n"
@@ -2394,26 +2698,56 @@ async def set_commands():
     )
 
     commands = [
-        BotCommand(command="start", description="Главное меню"),
-        BotCommand(command="myid", description="Мой Telegram ID"),
-        BotCommand(command="ping", description="Проверить ping"),
-        BotCommand(command="кто", description="Информация о пользователе"),
+        BotCommand(
+            command="start",
+            description="Главное меню"
+        ),
+        BotCommand(
+            command="myid",
+            description="Мой Telegram ID"
+        ),
+        BotCommand(
+            command="ping",
+            description="Проверить ping"
+        ),
+        BotCommand(
+            command="кто",
+            description="Информация о пользователе"
+        ),
     ]
 
     try:
-        await bot.set_my_commands(commands)
+
+        await bot.set_my_commands(
+            commands
+        )
 
         await bot.set_my_commands(
             commands + [
-                BotCommand(command="ahelp", description="Полная справка"),
-                BotCommand(command="add_admin", description="Добавить администратора"),
-                BotCommand(command="del_admin", description="Удалить администратора"),
+                BotCommand(
+                    command="ahelp",
+                    description="Полная справка"
+                ),
+                BotCommand(
+                    command="add_admin",
+                    description="Добавить администратора"
+                ),
+                BotCommand(
+                    command="del_admin",
+                    description="Удалить администратора"
+                ),
             ],
-            scope=BotCommandScopeChat(chat_id=OWNER_ID)
+            scope=BotCommandScopeChat(
+                chat_id=OWNER_ID
+            )
         )
 
     except Exception as e:
-        logger.warning("set_commands: %s", e)
+
+        logger.warning(
+            "set_commands: %s",
+            e
+        )
 
 
 # ============================================================
@@ -2422,7 +2756,11 @@ async def set_commands():
 
 @dp.errors()
 async def global_error(event):
-    logger.exception("Unhandled bot error: %s", event.exception)
+
+    logger.exception(
+        "Unhandled bot error: %s",
+        event.exception
+    )
 
 
 # ============================================================
@@ -2431,9 +2769,20 @@ async def global_error(event):
 
 async def main():
 
-    logger.info("Starting %s", BOT_NAME)
-    logger.info("GROUP_ID = %s", GROUP_ID)
-    logger.info("TOPIC_ID = %s", TOPIC_ID)
+    logger.info(
+        "Starting %s",
+        BOT_NAME
+    )
+
+    logger.info(
+        "GROUP_ID = %s",
+        GROUP_ID
+    )
+
+    logger.info(
+        "TOPIC_ID = %s",
+        TOPIC_ID
+    )
 
     await db_init()
 
@@ -2442,25 +2791,51 @@ async def main():
 
     await set_commands()
 
+    # Удаляем webhook перед polling
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.delete_webhook(
+            drop_pending_updates=True
+        )
     except Exception as e:
-        logger.warning("delete_webhook: %s", e)
+        logger.warning(
+            "delete_webhook: %s",
+            e
+        )
 
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    # Flask запускается отдельным потоком
+    flask_thread = threading.Thread(
+        target=run_flask,
+        daemon=True
+    )
+
     flask_thread.start()
 
-    logger.info("Flask health server started on port %s", PORT)
+    logger.info(
+        "Flask health server started on port %s",
+        PORT
+    )
 
-    asyncio.create_task(reminder_worker())
+    # Worker напоминаний
+    asyncio.create_task(
+        reminder_worker()
+    )
 
+    # Проверка Google
     if GOOGLE_SHEET_ID:
-        logger.info("Google Sheets configured")
+        logger.info(
+            "Google Sheets configured"
+        )
     else:
-        logger.warning("GOOGLE_SHEET_ID is not configured")
+        logger.warning(
+            "GOOGLE_SHEET_ID is not configured"
+        )
 
     me = await bot.get_me()
-    logger.info("Bot @%s started", me.username)
+
+    logger.info(
+        "Bot @%s started",
+        me.username
+    )
 
     await dp.start_polling(
         bot,
@@ -2473,9 +2848,19 @@ async def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     try:
         asyncio.run(main())
+
     except KeyboardInterrupt:
-        logger.info("Bot stopped manually")
+
+        logger.info(
+            "Bot stopped manually"
+        )
+
     except Exception as e:
-        logger.exception("FATAL ERROR: %s", e)
+
+        logger.exception(
+            "FATAL ERROR: %s",
+            e
+        )
