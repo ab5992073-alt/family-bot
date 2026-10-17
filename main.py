@@ -2,10 +2,11 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 import pytz
-from dotenv import load_dotenv
 import os
-import uuid
-import json
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import gspread
+from google.oauth2.service_account import Credentials
 from flask import Flask, request
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -16,19 +17,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram import Router
-import psycopg2
-from psycopg2.extras import RealDictCursor
-import gspread
-from google.oauth2.service_account import Credentials
-import threading
-import time
 from telethon import TelegramClient
+import aiohttp
+import aioschedule
 import random
 import re
 from urllib.parse import urlparse, parse_qs
-import aiohttp
-import aioschedule
-import atexit
 
 load_dotenv()
 
@@ -37,15 +31,13 @@ SUPER_ADMIN = 6166697485
 TG_API_ID = int(os.getenv("TG_API_ID"))
 TG_API_HASH = os.getenv("TG_API_HASH")
 TG_SESSION_STRING = os.getenv("TG_SESSION_STRING")
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 # ====================== ЛОГГИНГ ======================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-# ====================== БАЗА ДАННЫХ ======================
+# ====================== БАЗА ======================
 DB_CONFIG = {
     "dbname": os.getenv("DB_NAME"),
     "user": os.getenv("DB_USER"),
@@ -59,13 +51,11 @@ def get_db_connection():
     conn.autocommit = True
     return conn
 
-# ====================== TELEGRAM CLINET ======================
+# ====================== TELEGRAM ======================
 client = TelegramClient("session", TG_API_ID, TG_API_HASH, session_string=TG_SESSION_STRING) if TG_SESSION_STRING else None
 
 # ====================== GOOGLE SHEETS ======================
 SHEET_NAME = "FamilyBot"
-SHEET_ID = "1J5V9vQe8vK0rL9pL2mN7kX9pL2mN7kX"  # вставь свой
-
 creds = Credentials.from_service_account_file("creds.json", scopes=["https://www.googleapis.com/auth/spreadsheets"])
 gc = gspread.authorize(creds)
 sheet = gc.open(SHEET_NAME).sheet1
@@ -80,114 +70,67 @@ dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# ====================== СЛОВАРИ ======================
+# ====================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ======================
 users = {}
 admins = {}
 apps = {}
 zams = {}
 announcements = []
 reminders = []
-notify_status = {}
 gathering_active = False
 gathering_users = []
-gathering_timer = None
-gathering_task = None
+tech_works = False
+uptime_start = datetime.now()
+ping = 0
+last_ping = datetime.now()
 
-# ====================== ПРАВА ДОСТУПА ======================
+# ====================== ПРАВА ======================
 rights = {
     "applications": False, "users": False, "stats": False, "announcements": False,
     "gathering": False, "reminders": False, "zams": False, "audit": False,
     "admins": False, "settings": False, "sheets": False, "status": False
 }
 
-# ====================== СОСТОЯНИЯ FSM ======================
-class FSM(StatesGroup):
-    fill_survey = State()
-    edit_survey = State()
-    set_time = State()
-    set_text = State()
-
-# ====================== КОМАНДЫ ======================
-@dp.message(Command("start"))
-async def start_cmd(message: Message):
+# ====================== КОМАНДА /STATUS ======================
+@dp.message(Command("status"))
+async def status_cmd(message: Message):
     user_id = message.from_user.id
-    username = message.from_user.username or "unknown"
-    nickname = users.get(user_id, {}).get("nickname", "Без имени")
+
+    if user_id != SUPER_ADMIN and user_id not in admins:
+        await message.answer("❌ Нет прав на просмотр статуса.")
+        return
+
+    uptime = datetime.now() - uptime_start
+    uptime_str = str(uptime).split(".")[0]
+
+    global ping, last_ping
+    ping = int((datetime.now() - last_ping).total_seconds() * 1000)
+
+    rights_text = "\n".join([f"✅ {k}" for k, v in rights.items() if v])
 
     await message.answer(
-        f"👋 Привет, {nickname}!\n\n"
-        f"Твой Telegram: @{username}\n"
-        f"ID: {user_id}\n\n"
-        f"Добро пожаловать в @Staff_Grand_Bot",
-        reply_markup=admin_keyboard(user_id)
+        f"<b>📊 СТАТУС БОТА</b>\n\n"
+        f"• <b>Версия:</b> 1.0.0\n"
+        f"• <b>Пинг:</b> {ping} мс\n"
+        f"• <b>Работает:</b> {uptime_str}\n"
+        f"• <b>Последний деплои:</b> {uptime_start.strftime('%H:%M:%S')}\n"
+        f"• <b>Тех. работы:</b> {'🟢 ВКЛ' if tech_works else '🔴 ВЫКЛ'}\n\n"
+        f"<b>Права:</b>\n{rights_text}",
+        parse_mode=ParseMode.HTML
     )
 
-# ====================== АДМИНЫ ======================
-@dp.message(Command("add_admin"))
-async def add_admin_cmd(message: Message):
-    if message.from_user.id != SUPER_ADMIN:
-        await message.answer("❌ Только владелец может добавлять админов.")
-        return
-
-    text = message.text.replace("/add_admin ", "").strip()
-
-    if text.startswith("@"):
-        async for dialog in client.iter_dialogs():
-            if dialog.name.lower() == text[1:].lower() or dialog.entity.username == text[1:]:
-                user_id = dialog.entity.id
-                admins[user_id] = True
-                await message.answer(f"✅ Добавлен админ: @{text[1:]} (ID {user_id})")
-                return
-    elif text.isdigit():
-        user_id = int(text)
-        admins[user_id] = True
-        await message.answer(f"✅ Добавлен админ: ID {user_id}")
-    else:
-        await message.answer("Использование: /add_admin @username или /add_admin 1234567890")
-
-# ====================== БАН ======================
-@dp.message(Command("ban"))
-async def ban_cmd(message: Message):
-    if message.from_user.id not in admins and message.from_user.id != SUPER_ADMIN:
-        await message.answer("❌ Нет прав.")
-        return
-
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("Укажи ID или @username: /ban 1234567890 или /ban @user")
-        return
-
-    target = args[1]
-
-    if target.startswith("@"):
-        for uid, data in users.items():
-            if data.get("username") == target[1:]:
-                await block_user(uid)
-                await message.answer(f"✅ Забанен: @{target[1:]}")
-                return
-    elif target.isdigit():
-        await block_user(int(target))
-        await message.answer(f"✅ Забанен: ID {target}")
-    else:
-        await message.answer("Ошибка")
-
-# ====================== БЛОКировка ======================
-async def block_user(user_id):
-    if user_id in apps:
-        apps[user_id]["blocked"] = True
-    for u in users:
-        if u == user_id:
-            users[u]["blocked"] = True
-    # Бан в группе (через Telethon)
-    try:
-        await client.edit_permissions(
-            channel=MAIN_GROUP_ID,
-            user=user_id,
-            until_date=datetime.now() + timedelta(days=365),
-            send_messages=False
-        )
-    except:
-        pass
+# ====================== ПИНГ ======================
+async def update_ping():
+    global ping, last_ping
+    while True:
+        try:
+            start = time.time()
+            await bot.get_me()
+            ping = int((time.time() - start) * 1000)
+            last_ping = datetime.now()
+        except:
+            ping = 999
+        await asyncio.sleep(5)
 
 # ====================== ТЕХ.РАБОТЫ ======================
 @dp.message(Command("tech"))
@@ -198,43 +141,22 @@ async def tech_cmd(message: Message):
 
     global tech_works
     tech_works = not tech_works
-    status = "ВКЛ" if tech_works else "ВЫКЛ"
-    await message.answer(f"🛠 Тех. работы: {status}")
+    await message.answer(f"🛠 Тех. работы: {'ВКЛ' if tech_works else 'ВЫКЛ'}")
 
-# ====================== ТЕХ.РАБОТЫ ======================
-tech_works = False
-
+# ====================== ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ======================
 @dp.message()
-async def global_tech_handler(message: Message):
+async def global_handler(message: Message):
     if tech_works:
         await message.answer(
             "🛠 Ведутся технические работы\n"
-            "Бот может лагать или тормозить.\n\n"
-            "Спасибо за понимание."
+            "Бот может отвечать с задержкой."
         )
     else:
-        await message.answer("🛠 Тех. работы включены. Бот может отвечать с задержкой.")
-
-# ====================== МЕНЮ ======================
-def admin_keyboard(user_id):
-    b = ReplyKeyboardBuilder()
-    rows = []
-
-    if user_id in admins or user_id == SUPER_ADMIN:
-        rows.append([KeyboardButton(text="📋 Заявки"), KeyboardButton(text="👥 Участники")])
-        if user_id == SUPER_ADMIN:
-            rows.append([KeyboardButton(text="🛠 Тех. работы")])
-
-    if user_id == SUPER_ADMIN:
-        rows.append([KeyboardButton(text="🏠 Панель управления")])
-
-    for row in rows:
-        b.row(*row)
-
-    return b.as_markup(resize_keyboard=True)
+        await message.answer("🛠 Тех. работы включены. Бот может лагать.")
 
 # ====================== ЗАПУСК ======================
 async def main():
+    asyncio.create_task(update_ping())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
