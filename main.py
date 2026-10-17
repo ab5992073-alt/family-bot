@@ -353,9 +353,8 @@ class AuditCallbackMiddleware(BaseMiddleware):
 
 class AdminPermissionMiddleware(BaseMiddleware):
     MESSAGE_PERMS = {
-        "📋 Управление заявками": "applications",
-        "⏳ Активные заявки": "applications",
-        "👥 Список участников": "users",
+        "📋 Заявки": "applications",
+        "👥 Участники": "users",
         "🟢 Статус бота": "status",
         "📢 Объявление": "announcements",
         "📢 Общий сбор": "gathering",
@@ -366,6 +365,7 @@ class AdminPermissionMiddleware(BaseMiddleware):
         "☁️ Google Таблица": "sheets",
         "⚙️ Настройки": "settings",
         "🔔 Напоминания": "reminders",
+        "🏠 Панель управления": "settings",
     }
 
     def callback_permission(self, cd):
@@ -1292,32 +1292,47 @@ def main_keyboard(has_survey=False):
 
 
 def admin_keyboard(user_id, has_survey=False):
-    """Удобное компактное меню администратора: основные действия сверху,
-    расширенные разделы — в панели управления."""
+    """Удобное компактное меню администратора."""
     b = ReplyKeyboardBuilder()
     rows = []
+
     if admin_can(user_id, "applications"):
-        rows.append([KeyboardButton(text="📋 Заявки"), KeyboardButton(text="⏳ Активные заявки")])
+        # Убрали "Активные заявки" по просьбе владельца
+        rows.append([KeyboardButton(text="📋 Заявки")])
+
     if admin_can(user_id, "users"):
-        rows.append([KeyboardButton(text="👥 Участники"), KeyboardButton(text="📊 Статистика")]) if admin_can(user_id, "stats") else rows.append([KeyboardButton(text="👥 Участники")])
+        if admin_can(user_id, "stats"):
+            rows.append([KeyboardButton(text="👥 Участники"), KeyboardButton(text="📊 Статистика")])
+        else:
+            rows.append([KeyboardButton(text="👥 Участники")])
     elif admin_can(user_id, "stats"):
         rows.append([KeyboardButton(text="📊 Статистика")])
+
     if admin_can(user_id, "announcements"):
         rows.append([KeyboardButton(text="📢 Объявление")])
+
     if admin_can(user_id, "gathering"):
         rows.append([KeyboardButton(text="📢 Общий сбор")])
+
     if admin_can(user_id, "reminders"):
         rows.append([KeyboardButton(text="🔔 Напоминания")])
+
     if admin_can(user_id, "zams"):
         rows.append([KeyboardButton(text="👑 Замы")])
-    if has_survey:
+
+    # Кнопку перезаполнения анкеты не показываем владельцу
+    if has_survey and user_id != SUPER_ADMIN:
         rows.append([KeyboardButton(text="🔄 Перезаполнить анкету")])
-    if any(admin_can(user_id, p) for p in ("audit","admins","settings","sheets","status")):
+
+    if any(admin_can(user_id, p) for p in ("audit", "admins", "settings", "sheets", "status")):
         rows.append([KeyboardButton(text="🏠 Панель управления")])
+
     if admin_can(user_id, "status"):
         rows.append([KeyboardButton(text="🟢 Статус бота")])
+
     for row in rows:
         b.row(*row)
+
     return b.as_markup(resize_keyboard=True)
 
 
@@ -1654,7 +1669,7 @@ async def rank_selected(cb: CallbackQuery):
     )
 
     await cb.message.answer(
-        "🏢 Ваша организация:",
+        "🏢 Ваша организация:\n\n<i>При изменении организации позже — нужно будет перезаполнить анкету</i>",
         reply_markup=kb,
     )
 
@@ -2070,18 +2085,10 @@ async def send_apps_page(message, status="pending", page=0, query=""):
     ]))
 
 
-@dp.message(F.text == "📋 Управление заявками")
+@dp.message(F.text == "📋 Заявки")
 async def all_apps(message: Message):
     if not admin_can(message.from_user.id, "applications"):
-        await message.answer("❌")
-        return
-    await send_apps_page(message, "pending", 0)
-
-
-@dp.message(F.text == "⏳ Активные заявки")
-async def active_apps(message: Message):
-    if not admin_can(message.from_user.id, "applications"):
-        await message.answer("❌")
+        await message.answer("❌ Нет прав")
         return
     await send_apps_page(message, "pending", 0)
 
@@ -2188,10 +2195,10 @@ async def send_users_page(message, users=None, page=0, flt="all", query=""):
     await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows+base))
 
 
-@dp.message(F.text == "👥 Список участников")
+@dp.message(F.text == "👥 Участники")
 async def list_users(message: Message):
-    if not admin_can(message.from_user.id, "users"): 
-        await message.answer("❌")
+    if not admin_can(message.from_user.id, "users"):
+        await message.answer("❌ Нет прав")
         return
     await send_users_page(message)
 
@@ -3449,6 +3456,35 @@ async def help_cmd(message: Message):
         text = "📋 <b>Панель администратора</b>\n\nВсе основные действия доступны через кнопки меню.\n\n📝 Заявки • 👥 Участники • 📢 Объявления • 📢 Общий сбор"
     else:
         text = "📋 <b>Меню</b>\n\nЗаполнение анкеты и просмотр профиля доступны через кнопки ниже."
+    await message.answer(text)
+
+
+@dp.message(Command("ahelp"))
+async def ahelp_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    text = (
+        "🛠 <b>Команды администратора</b>\n\n"
+        "<b>Основные:</b>\n"
+        "/start — открыть меню\n"
+        "/help — краткая справка\n"
+        "/ahelp — этот список команд\n"
+        "/kto — анкета участника (ответом на сообщение)\n"
+        "/myid — узнать свой Telegram ID\n"
+        "/cancel — отменить текущее действие\n\n"
+        "<b>Только владелец:</b>\n"
+        "/timezone — установить часовой пояс бота\n"
+        "Управление правами админов — через «Панель управления» → Админы → Права\n\n"
+        "<b>Кнопки меню:</b>\n"
+        "📋 Заявки — управление заявками\n"
+        "👥 Участники — список и редактирование\n"
+        "📢 Объявление — отправить объявление\n"
+        "📢 Общий сбор — созвать участников\n"
+        "🔔 Напоминания — создать/редактировать напоминания\n"
+        "👑 Замы — управление замами\n"
+        "🏠 Панель управления — расширенные настройки\n"
+        "🟢 Статус бота — информация о работе бота"
+    )
     await message.answer(text)
 
 
