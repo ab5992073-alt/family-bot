@@ -26,6 +26,8 @@ from aiogram.types import (
     BotCommandScopeChat,
     ReplyKeyboardRemove,
     ChatMemberUpdated,
+    ErrorEvent,
+    ChatPermissions,
 )
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from flask import Flask
@@ -154,6 +156,48 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode="HTML"),
 )
 dp = Dispatcher()
+
+
+# =========================================================
+# ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК → только владельцу
+# =========================================================
+
+@dp.errors()
+async def global_error_handler(event: ErrorEvent):
+    """Ловит любые необработанные ошибки и присылает только владельцу."""
+    exception = event.exception
+    update = event.update
+
+    # Краткое описание на русском
+    error_name = type(exception).__name__
+    error_text = str(exception)[:800]
+
+    # Откуда пришла ошибка
+    source = "неизвестно"
+    try:
+        if update.message:
+            source = f"сообщение от {update.message.from_user.id}"
+        elif update.callback_query:
+            source = f"кнопка от {update.callback_query.from_user.id} (data={update.callback_query.data})"
+        elif update.my_chat_member:
+            source = "изменение статуса бота в чате"
+    except Exception:
+        pass
+
+    text = (
+        f"🚨 <b>Ошибка в боте</b>\n\n"
+        f"<b>Тип:</b> <code>{escape(error_name)}</code>\n"
+        f"<b>Откуда:</b> {escape(source)}\n\n"
+        f"<b>Текст ошибки:</b>\n<code>{escape(error_text)}</code>"
+    )
+
+    try:
+        await bot.send_message(SUPER_ADMIN, text)
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить ошибку владельцу: {e}")
+
+    # Печатаем в логи Render тоже
+    print(f"❌ ERROR [{error_name}]: {error_text}")
 
 
 # =========================================================
@@ -1506,6 +1550,14 @@ async def who_command(message: Message):
 
 @dp.message(F.text == "🔄 Перезаполнить анкету")
 async def reset_survey(message: Message):
+    # В группе анкету заполнять нельзя
+    if message.chat.id == GROUP_ID or (message.chat.type and message.chat.type != "private"):
+        await message.answer(
+            "📝 Заполнять и перезаполнять анкету можно <b>только в личных сообщениях</b> с ботом.\n\n"
+            f"Перейди сюда 👉 {BOT_NAME}"
+        )
+        return
+
     uid = str(message.from_user.id)
 
     if uid not in data["users"]:
@@ -1837,6 +1889,14 @@ async def survey_skip_cb(cb: CallbackQuery):
 
 @dp.message(F.text == "📝 Заполнить анкету")
 async def survey_button(message: Message):
+    # В группе анкету заполнять нельзя
+    if message.chat.id == GROUP_ID or (message.chat.type and message.chat.type != "private"):
+        await message.answer(
+            "📝 Заполнять и перезаполнять анкету можно <b>только в личных сообщениях</b> с ботом.\n\n"
+            f"Перейди сюда 👉 {BOT_NAME}"
+        )
+        return
+
     uid = message.from_user.id
 
     if str(uid) in data["users"]:
@@ -2599,27 +2659,134 @@ async def cached_owner_dialog_users():
     owner_dialog_cache["users"] = users
     return users
 
+# Режим ручного добавления админа (когда Telethon недоступен)
+admin_add_mode = {}
+
 @dp.callback_query(F.data == "adm:add")
 async def admin_add_button_cb(cb: CallbackQuery):
     if not admin_can(cb.from_user.id, "admins"):
         await cb.answer(permission_denied_text("admins"), show_alert=True)
         return
     await cb.answer()
+
     users = await cached_owner_dialog_users()
-    if not users:
-        await cb.message.answer(
-            "📭 Не удалось получить список личных диалогов.\n\n"
-            "Проверь TG_API_ID, TG_API_HASH и TG_SESSION_STRING в Render."
-        )
-        return
-    admins = get_admins()
-    users = [u for u in users if int(u["id"]) not in admins and int(u["id"]) != SUPER_ADMIN]
-    if not users:
-        await cb.message.answer("📭 В доступных диалогах нет пользователей без админки.")
-        return
+    if users:
+        admins = get_admins()
+        users = [u for u in users if int(u["id"]) not in admins and int(u["id"]) != SUPER_ADMIN]
+        if users:
+            await cb.message.answer(
+                "👑 <b>Выберите пользователя для выдачи админки</b>\n\n"
+                "Или нажмите кнопку ниже, чтобы ввести @username / ID вручную.",
+                reply_markup=owner_dialog_page_keyboard(users, 0, prefix="select_admin")
+            )
+            # Добавляем кнопку ручного ввода
+            await cb.message.answer(
+                "Если нужного человека нет в списке:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✏️ Ввести @username или ID", callback_data="adm:add_manual")],
+                ])
+            )
+            return
+
+    # Telethon не работает или список пуст — сразу предлагаем ручной ввод
     await cb.message.answer(
-        "👑 <b>Выберите пользователя для выдачи админки</b>",
-        reply_markup=owner_dialog_page_keyboard(users, 0, prefix="select_admin")
+        "📭 Не удалось получить список личных диалогов через Telethon.\n\n"
+        "Можно добавить админа вручную:\n"
+        "• Отправь <b>@username</b> человека\n"
+        "• Или его <b>Telegram ID</b> (число)\n"
+        "• Или <b>перешли любое сообщение</b> от этого человека\n\n"
+        "Для отмены напиши /cancel",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Ввести вручную", callback_data="adm:add_manual")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="owner_select_cancel")],
+        ])
+    )
+
+
+@dp.callback_query(F.data == "adm:add_manual")
+async def admin_add_manual_cb(cb: CallbackQuery):
+    if not admin_can(cb.from_user.id, "admins"):
+        await cb.answer("❌", show_alert=True)
+        return
+    admin_add_mode[cb.from_user.id] = True
+    await cb.answer()
+    await cb.message.answer(
+        "✏️ <b>Добавление админа вручную</b>\n\n"
+        "Отправь одним сообщением:\n"
+        "• <code>@username</code>\n"
+        "• или числовой <code>Telegram ID</code>\n"
+        "• или просто <b>перешли сообщение</b> от нужного человека\n\n"
+        "Для отмены: /cancel"
+    )
+
+
+@dp.message(lambda m: m.from_user.id in admin_add_mode)
+async def admin_add_manual_handler(message: Message):
+    if not admin_can(message.from_user.id, "admins"):
+        admin_add_mode.pop(message.from_user.id, None)
+        return
+
+    admin_add_mode.pop(message.from_user.id, None)
+
+    uid = None
+    display = None
+
+    # 1. Пересланное сообщение
+    if message.forward_from:
+        uid = message.forward_from.id
+        display = message.forward_from.full_name or str(uid)
+        if message.forward_from.username:
+            display += f" (@{message.forward_from.username})"
+    # 2. Текст — username или ID
+    elif message.text:
+        text = message.text.strip()
+        if text.startswith("@"):
+            username = text.lstrip("@").lower()
+            # Ищем среди известных пользователей бота
+            found_id = find_user_id_by_username(username)
+            if found_id:
+                uid = found_id
+                display = f"@{username}"
+            else:
+                # Пробуем через Telethon, если доступен
+                if telegram_user_is_ready():
+                    try:
+                        entity = await telegram_user_client.get_entity(username)
+                        if hasattr(entity, "id"):
+                            uid = int(entity.id)
+                            display = f"@{username}"
+                    except Exception:
+                        pass
+                if not uid:
+                    await message.answer(
+                        f"❌ Не удалось найти пользователя <b>@{escape(username)}</b>.\n"
+                        "Попроси его написать боту /start, либо перешли его сообщение, либо укажи числовой ID."
+                    )
+                    return
+        elif text.isdigit():
+            uid = int(text)
+            display = str(uid)
+        else:
+            await message.answer("❌ Пришли @username, числовой ID или перешли сообщение от пользователя.")
+            return
+    else:
+        await message.answer("❌ Пришли @username, числовой ID или перешли сообщение от пользователя.")
+        return
+
+    if uid == SUPER_ADMIN:
+        await message.answer("❌ Это и так владелец бота.")
+        return
+    if uid in get_admins():
+        await message.answer("ℹ️ Этот пользователь уже является администратором.")
+        return
+
+    # Подтверждение
+    await message.answer(
+        f"⚠️ Выдать админку пользователю:\n\n👤 <b>{escape(display)}</b>\n🆔 <code>{uid}</code>?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, выдать", callback_data=f"admin_grant_confirm:{uid}")],
+            [InlineKeyboardButton(text="↩️ Отмена", callback_data="owner_select_cancel")],
+        ])
     )
 
 @dp.callback_query(F.data.startswith("select_admin_page:"))
@@ -3472,20 +3639,242 @@ async def ahelp_cmd(message: Message):
         "/kto — анкета участника (ответом на сообщение)\n"
         "/myid — узнать свой Telegram ID\n"
         "/cancel — отменить текущее действие\n\n"
+        "<b>В группе (ответом на сообщение):</b>\n"
+        "/add_admin — выдать админку бота (только владелец)\n"
+        "/off_add_admin — снять админку бота (только владелец)\n"
+        "/mute 30 — замутить на 30 минут\n"
+        "/unmute — снять мут\n"
+        "/ban — забанить\n"
+        "/unban — разбанить\n\n"
         "<b>Только владелец:</b>\n"
-        "/timezone — установить часовой пояс бота\n"
-        "Управление правами админов — через «Панель управления» → Админы → Права\n\n"
-        "<b>Кнопки меню:</b>\n"
-        "📋 Заявки — управление заявками\n"
-        "👥 Участники — список и редактирование\n"
-        "📢 Объявление — отправить объявление\n"
-        "📢 Общий сбор — созвать участников\n"
-        "🔔 Напоминания — создать/редактировать напоминания\n"
-        "👑 Замы — управление замами\n"
-        "🏠 Панель управления — расширенные настройки\n"
-        "🟢 Статус бота — информация о работе бота"
+        "/timezone — установить часовой пояс бота\n\n"
+        "<b>Кнопки меню (в ЛС):</b>\n"
+        "📋 Заявки • 👥 Участники • 📢 Объявление\n"
+        "📢 Общий сбор • 🔔 Напоминания • 👑 Замы\n"
+        "🏠 Панель управления • 🟢 Статус бота"
     )
     await message.answer(text)
+
+
+# =========================================================
+# КОМАНДЫ В ГРУППЕ: АДМИНКА + МУТЫ
+# =========================================================
+
+def _is_group_chat(message: Message) -> bool:
+    return message.chat.id == GROUP_ID or (message.chat.type in ("group", "supergroup"))
+
+
+@dp.message(Command("add_admin"))
+async def cmd_add_admin(message: Message):
+    """Ответом на сообщение в группе: /add_admin — выдать админку бота."""
+    if not is_super_admin(message.from_user.id):
+        return
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("❌ Ответь на сообщение человека, которому хочешь выдать админку.")
+        return
+
+    target = message.reply_to_message.from_user
+    if target.is_bot:
+        await message.reply("❌ Нельзя выдать админку боту.")
+        return
+    if target.id == SUPER_ADMIN:
+        await message.reply("❌ Это и так владелец.")
+        return
+    if target.id in get_admins():
+        await message.reply("ℹ️ Этот пользователь уже администратор.")
+        return
+
+    admins = get_admins()
+    admins.add(target.id)
+    save_admins(admins)
+
+    data.setdefault("admin_usernames", {})[str(target.id)] = {
+        "username": target.username,
+        "full_name": target.full_name or str(target.id),
+    }
+    save_data()
+    try:
+        await set_command_scopes()
+    except Exception:
+        pass
+
+    audit_record(message.from_user.id, "admins", "выдал админку", f"{target.full_name} / {target.id}", command="/add_admin")
+    await message.reply(f"✅ Админка выдана: <b>{escape(target.full_name)}</b>\n🆔 <code>{target.id}</code>")
+
+    try:
+        await bot.send_message(target.id, "👑 Вам выданы права администратора бота!\nНапишите /start")
+    except Exception:
+        pass
+
+
+@dp.message(Command("off_add_admin"))
+@dp.message(Command("del_admin"))
+@dp.message(Command("remove_admin"))
+async def cmd_remove_admin(message: Message):
+    """Ответом на сообщение: /off_add_admin — снять админку бота."""
+    if not is_super_admin(message.from_user.id):
+        return
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("❌ Ответь на сообщение человека, у которого хочешь снять админку.")
+        return
+
+    target = message.reply_to_message.from_user
+    if target.id == SUPER_ADMIN:
+        await message.reply("❌ Нельзя снять права с владельца.")
+        return
+    if target.id not in get_admins():
+        await message.reply("ℹ️ У этого пользователя нет админки.")
+        return
+
+    admins = get_admins()
+    admins.discard(target.id)
+    save_admins(admins)
+    data.get("admin_usernames", {}).pop(str(target.id), None)
+    data.get("admin_permissions", {}).pop(str(target.id), None)
+    save_data()
+    try:
+        await set_command_scopes()
+    except Exception:
+        pass
+
+    audit_record(message.from_user.id, "admins", "снял админку", f"{target.full_name} / {target.id}", command="/off_add_admin")
+    await message.reply(f"✅ Админка снята: <b>{escape(target.full_name)}</b>")
+
+
+@dp.message(Command("mute"))
+async def cmd_mute(message: Message):
+    """Ответом на сообщение: /mute [минуты] — замутить в группе."""
+    if not is_admin(message.from_user.id):
+        return
+    if not _is_group_chat(message):
+        await message.answer("Эту команду нужно использовать в группе.")
+        return
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("❌ Ответь на сообщение человека, которого хочешь замутить.\nПример: <code>/mute 30</code> (на 30 минут)")
+        return
+
+    target = message.reply_to_message.from_user
+    if target.id == SUPER_ADMIN or target.id in get_admins():
+        await message.reply("❌ Нельзя мутить администраторов.")
+        return
+
+    # Длительность в минутах (по умолчанию 60)
+    minutes = 60
+    parts = (message.text or "").split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        minutes = max(1, min(int(parts[1]), 60 * 24 * 7))  # максимум неделя
+
+    from datetime import timedelta
+    until = datetime.now() + timedelta(minutes=minutes)
+
+    try:
+        await bot.restrict_chat_member(
+            chat_id=message.chat.id,
+            user_id=target.id,
+            permissions=ChatPermissions(
+                can_send_messages=False,
+                can_send_media_messages=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+            ),
+            until_date=until,
+        )
+        await message.reply(
+            f"🔇 <b>{escape(target.full_name)}</b> замучен на <b>{minutes}</b> мин.\n"
+            f"До: {until.strftime('%d.%m.%Y %H:%M')}"
+        )
+        audit_record(message.from_user.id, "admins", "мут", f"{target.full_name} / {minutes} мин", command="/mute")
+    except Exception as e:
+        await message.reply(f"❌ Не удалось замутить: {escape(str(e)[:200])}")
+
+
+@dp.message(Command("unmute"))
+async def cmd_unmute(message: Message):
+    """Ответом на сообщение: /unmute — снять мут."""
+    if not is_admin(message.from_user.id):
+        return
+    if not _is_group_chat(message):
+        await message.answer("Эту команду нужно использовать в группе.")
+        return
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("❌ Ответь на сообщение человека, с которого хочешь снять мут.")
+        return
+
+    target = message.reply_to_message.from_user
+    try:
+        await bot.restrict_chat_member(
+            chat_id=message.chat.id,
+            user_id=target.id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_send_polls=True,
+                can_invite_users=True,
+            ),
+        )
+        await message.reply(f"🔊 Мут снят с <b>{escape(target.full_name)}</b>")
+        audit_record(message.from_user.id, "admins", "размут", target.full_name, command="/unmute")
+    except Exception as e:
+        await message.reply(f"❌ Не удалось снять мут: {escape(str(e)[:200])}")
+
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message):
+    """Ответом на сообщение: /ban — забанить в группе."""
+    if not is_super_admin(message.from_user.id) and not admin_can(message.from_user.id, "admins"):
+        return
+    if not _is_group_chat(message):
+        await message.answer("Эту команду нужно использовать в группе.")
+        return
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("❌ Ответь на сообщение человека, которого хочешь забанить.")
+        return
+
+    target = message.reply_to_message.from_user
+    if target.id == SUPER_ADMIN or target.id in get_admins():
+        await message.reply("❌ Нельзя банить администраторов.")
+        return
+
+    try:
+        await bot.ban_chat_member(message.chat.id, target.id)
+        await message.reply(f"🚫 <b>{escape(target.full_name)}</b> забанен.")
+        audit_record(message.from_user.id, "admins", "бан", f"{target.full_name} / {target.id}", command="/ban")
+    except Exception as e:
+        await message.reply(f"❌ Не удалось забанить: {escape(str(e)[:200])}")
+
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message):
+    """ /unban ID  или ответом на сообщение """
+    if not is_super_admin(message.from_user.id) and not admin_can(message.from_user.id, "admins"):
+        return
+    if not _is_group_chat(message):
+        await message.answer("Эту команду нужно использовать в группе.")
+        return
+
+    uid = None
+    name = None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        uid = message.reply_to_message.from_user.id
+        name = message.reply_to_message.from_user.full_name
+    else:
+        parts = (message.text or "").split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            uid = int(parts[1])
+            name = str(uid)
+
+    if not uid:
+        await message.reply("❌ Ответь на сообщение или укажи ID: <code>/unban 123456789</code>")
+        return
+
+    try:
+        await bot.unban_chat_member(message.chat.id, uid)
+        await message.reply(f"✅ Разбанен: <b>{escape(name or str(uid))}</b>")
+        audit_record(message.from_user.id, "admins", "разбан", f"{name} / {uid}", command="/unban")
+    except Exception as e:
+        await message.reply(f"❌ Не удалось разбанить: {escape(str(e)[:200])}")
 
 
 # =========================================================
@@ -3990,9 +4379,20 @@ async def reminder_mention_set_cb(cb: CallbackQuery):
 
 @dp.message(Command("cancel"))
 async def reminder_cancel_cmd(message: Message):
+    cancelled = False
     if message.from_user.id in reminder_mode:
-        reminder_mode.pop(message.from_user.id,None)
-        await message.answer("❌ Действие отменено.", reply_markup=reminders_keyboard() if admin_can(message.from_user.id,"reminders") else None)
+        reminder_mode.pop(message.from_user.id, None)
+        cancelled = True
+    if message.from_user.id in admin_add_mode:
+        admin_add_mode.pop(message.from_user.id, None)
+        cancelled = True
+    if message.from_user.id in announcement_mode:
+        announcement_mode.pop(message.from_user.id, None)
+        cancelled = True
+    if cancelled:
+        await message.answer("❌ Действие отменено.")
+    else:
+        await message.answer("Нечего отменять.")
 
 
 @dp.message(lambda m: m.from_user.id in reminder_mode and bool(m.text) and not m.text.startswith("/"))
