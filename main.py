@@ -1486,6 +1486,31 @@ async def set_user_nickname(user_id, nickname):
 # МЕНЮ
 # =========================================================
 
+def is_bot_banned(user_id) -> bool:
+    """Заблокирован ли пользователь в боте (после /ban)."""
+    return str(user_id) in data.get("bot_banned", {})
+
+
+def ban_in_bot(user_id, reason=""):
+    data.setdefault("bot_banned", {})[str(user_id)] = {
+        "reason": reason or "без указания причины",
+        "time": datetime.now().isoformat(),
+    }
+    save_data()
+
+
+def unban_in_bot(user_id):
+    data.get("bot_banned", {}).pop(str(user_id), None)
+    save_data()
+
+
+BANNED_TEXT = (
+    "🚫 <b>Вы заблокированы.</b>\n\n"
+    "Доступ к боту и заполнению анкеты закрыт.\n"
+    "Если считаете, что это ошибка — напишите в репорт администрации."
+)
+
+
 @dp.message(CommandStart())
 async def start_command(message: Message):
     await log_action(
@@ -1498,7 +1523,25 @@ async def start_command(message: Message):
 
 async def show_main_menu(message: Message):
     user_id = message.from_user.id
-    has_survey = str(user_id) in data["users"]
+
+    # В группе — никаких кнопок меню
+    if message.chat.id == GROUP_ID or (message.chat.type and message.chat.type != "private"):
+        if is_bot_banned(user_id):
+            await message.answer(BANNED_TEXT, reply_markup=ReplyKeyboardRemove())
+            return
+        await message.answer(
+            f"👋 Бот работает.\n"
+            f"Меню и анкета доступны только в личных сообщениях 👉 {BOT_NAME}",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    # Заблокированные
+    if is_bot_banned(user_id) and user_id != SUPER_ADMIN:
+        await message.answer(BANNED_TEXT, reply_markup=ReplyKeyboardRemove())
+        return
+
+    has_survey = str(user_id) in data.get("users", {})
 
     if is_admin(user_id):
         await message.answer(
@@ -1555,6 +1598,10 @@ async def who_command(message: Message):
 
 @dp.message(F.text == "🔄 Перезаполнить анкету")
 async def reset_survey(message: Message):
+    if is_bot_banned(message.from_user.id):
+        await message.answer(BANNED_TEXT, reply_markup=ReplyKeyboardRemove())
+        return
+
     # В группе анкету заполнять нельзя
     if message.chat.id == GROUP_ID or (message.chat.type and message.chat.type != "private"):
         await message.answer(
@@ -1565,7 +1612,7 @@ async def reset_survey(message: Message):
 
     uid = str(message.from_user.id)
 
-    if uid not in data["users"]:
+    if uid not in data.get("users", {}):
         await message.answer("❌ У вас нет анкеты.")
         return
 
@@ -1609,6 +1656,10 @@ pending_zam_users = {}
 
 async def start_survey(message: Message, user_id=None):
     uid = user_id if user_id is not None else message.from_user.id
+
+    if is_bot_banned(uid):
+        await message.answer(BANNED_TEXT, reply_markup=ReplyKeyboardRemove())
+        return
 
     user_surveys[uid] = {
         "step": 0,
@@ -1894,6 +1945,12 @@ async def survey_skip_cb(cb: CallbackQuery):
 
 @dp.message(F.text == "📝 Заполнить анкету")
 async def survey_button(message: Message):
+    uid = message.from_user.id
+
+    if is_bot_banned(uid):
+        await message.answer(BANNED_TEXT, reply_markup=ReplyKeyboardRemove())
+        return
+
     # В группе анкету заполнять нельзя
     if message.chat.id == GROUP_ID or (message.chat.type and message.chat.type != "private"):
         await message.answer(
@@ -1902,9 +1959,7 @@ async def survey_button(message: Message):
         )
         return
 
-    uid = message.from_user.id
-
-    if str(uid) in data["users"]:
+    if str(uid) in data.get("users", {}):
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="🔄 Перезаполнить", callback_data="survey_refill"),
             InlineKeyboardButton(text="⏭ Пропустить", callback_data="survey_skip"),
@@ -3845,16 +3900,15 @@ async def cmd_ban(message: Message):
 
     try:
         await bot.ban_chat_member(message.chat.id, target.id)
+        # Блокируем и в боте — нельзя заполнять анкету
+        ban_in_bot(target.id, reason)
         await message.reply(
-            f"🚫 <b>{escape(target.full_name)}</b> забанен.\n"
+            f"🚫 <b>{escape(target.full_name)}</b> забанен в группе и заблокирован в боте.\n"
             f"Причина: <i>{escape(reason)}</i>"
         )
         audit_record(message.from_user.id, "admins", "бан", f"{target.full_name} / {target.id} | {reason}", command="/ban")
         try:
-            await bot.send_message(
-                target.id,
-                f"🚫 Вы были забанены в группе.\nПричина: {escape(reason)}"
-            )
+            await bot.send_message(target.id, BANNED_TEXT)
         except Exception:
             pass
     except Exception as e:
@@ -3887,8 +3941,13 @@ async def cmd_unban(message: Message):
 
     try:
         await bot.unban_chat_member(message.chat.id, uid)
-        await message.reply(f"✅ Разбанен: <b>{escape(name or str(uid))}</b>")
+        unban_in_bot(uid)
+        await message.reply(f"✅ Разбанен в группе и разблокирован в боте: <b>{escape(name or str(uid))}</b>")
         audit_record(message.from_user.id, "admins", "разбан", f"{name} / {uid}", command="/unban")
+        try:
+            await bot.send_message(uid, "✅ Вы разблокированы. Можете снова пользоваться ботом — /start")
+        except Exception:
+            pass
     except Exception as e:
         await message.reply(f"❌ Не удалось разбанить: {escape(str(e)[:200])}")
 
