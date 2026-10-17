@@ -1374,6 +1374,11 @@ def admin_keyboard(user_id, has_survey=False):
     if admin_can(user_id, "status"):
         rows.append([KeyboardButton(text="🟢 Статус бота")])
 
+    # Кнопка техработ — только владельцу
+    if user_id == SUPER_ADMIN:
+        status = "🔴 Выкл" if not is_maintenance() else "🟢 Вкл"
+        rows.append([KeyboardButton(text=f"🛠 Тех.работы ({status})")])
+
     for row in rows:
         b.row(*row)
 
@@ -3642,9 +3647,7 @@ async def ahelp_cmd(message: Message):
         "<b>В группе (ответом на сообщение):</b>\n"
         "/add_admin — выдать админку бота (только владелец)\n"
         "/off_add_admin — снять админку бота (только владелец)\n"
-        "/mute 30 — замутить на 30 минут\n"
-        "/unmute — снять мут\n"
-        "/ban — забанить\n"
+        "/ban причина — забанить\n"
         "/unban — разбанить\n\n"
         "<b>Только владелец:</b>\n"
         "/timezone — установить часовой пояс бота\n\n"
@@ -3657,11 +3660,89 @@ async def ahelp_cmd(message: Message):
 
 
 # =========================================================
-# КОМАНДЫ В ГРУППЕ: АДМИНКА + МУТЫ
+# РЕЖИМ ТЕХНИЧЕСКИХ РАБОТ
+# =========================================================
+
+def is_maintenance() -> bool:
+    return bool(data.get("maintenance_mode", False))
+
+
+def set_maintenance(value: bool):
+    data["maintenance_mode"] = bool(value)
+    save_data()
+
+
+MAINTENANCE_TEXT = (
+    "🛠 <b>Ведутся технические работы</b>\n"
+    "Бот может лагать, тормозить или отвечать с задержкой.\n"
+    "Приносим извинения за неудобства."
+)
+
+
+class MaintenanceMiddleware(BaseMiddleware):
+    """Если техработы включены — сначала предупреждение, потом обычный ответ."""
+
+    async def __call__(self, handler, event, data_ctx):
+        # Владелец всегда проходит без предупреждения
+        user = None
+        if isinstance(event, Message) and event.from_user:
+            user = event.from_user
+        elif isinstance(event, CallbackQuery) and event.from_user:
+            user = event.from_user
+
+        if user and user.id == SUPER_ADMIN:
+            return await handler(event, data_ctx)
+
+        if not is_maintenance():
+            return await handler(event, data_ctx)
+
+        # Отправляем предупреждение
+        try:
+            if isinstance(event, Message):
+                await event.answer(MAINTENANCE_TEXT)
+            elif isinstance(event, CallbackQuery) and event.message:
+                await event.message.answer(MAINTENANCE_TEXT)
+        except Exception:
+            pass
+
+        # Дальше обычная обработка
+        return await handler(event, data_ctx)
+
+
+# Подключаем middleware
+dp.message.outer_middleware(MaintenanceMiddleware())
+dp.callback_query.outer_middleware(MaintenanceMiddleware())
+
+
+# =========================================================
+# КОМАНДЫ В ГРУППЕ: АДМИНКА + БАН
 # =========================================================
 
 def _is_group_chat(message: Message) -> bool:
     return message.chat.id == GROUP_ID or (message.chat.type in ("group", "supergroup"))
+
+
+@dp.message(F.text.startswith("🛠 Тех.работы"))
+async def tech_works_btn(message: Message):
+    if message.from_user.id != SUPER_ADMIN:
+        return
+    current = is_maintenance()
+    set_maintenance(not current)
+    new_state = is_maintenance()
+    if new_state:
+        await message.answer(
+            "🛠 <b>Технические работы ВКЛЮЧЕНЫ</b>\n\n"
+            "Теперь на каждое сообщение бот сначала предупредит о техработах, "
+            "а потом ответит на запрос.\n\n"
+            "Нажми кнопку ещё раз, чтобы выключить.",
+            reply_markup=admin_keyboard(SUPER_ADMIN, str(SUPER_ADMIN) in data.get("users", {}))
+        )
+    else:
+        await message.answer(
+            "✅ <b>Технические работы ВЫКЛЮЧЕНЫ</b>\n\n"
+            "Бот снова работает в обычном режиме.",
+            reply_markup=admin_keyboard(SUPER_ADMIN, str(SUPER_ADMIN) in data.get("users", {}))
+        )
 
 
 @dp.message(Command("add_admin"))
@@ -3741,95 +3822,16 @@ async def cmd_remove_admin(message: Message):
     await message.reply(f"✅ Админка снята: <b>{escape(target.full_name)}</b>")
 
 
-@dp.message(Command("mute"))
-async def cmd_mute(message: Message):
-    """Ответом на сообщение: /mute [минуты] — замутить в группе."""
-    if not is_admin(message.from_user.id):
-        return
-    if not _is_group_chat(message):
-        await message.answer("Эту команду нужно использовать в группе.")
-        return
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.reply("❌ Ответь на сообщение человека, которого хочешь замутить.\nПример: <code>/mute 30</code> (на 30 минут)")
-        return
-
-    target = message.reply_to_message.from_user
-    if target.id == SUPER_ADMIN or target.id in get_admins():
-        await message.reply("❌ Нельзя мутить администраторов.")
-        return
-
-    # Длительность в минутах (по умолчанию 60)
-    minutes = 60
-    parts = (message.text or "").split()
-    if len(parts) >= 2 and parts[1].isdigit():
-        minutes = max(1, min(int(parts[1]), 60 * 24 * 7))  # максимум неделя
-
-    from datetime import timedelta
-    until = datetime.now() + timedelta(minutes=minutes)
-
-    try:
-        await bot.restrict_chat_member(
-            chat_id=message.chat.id,
-            user_id=target.id,
-            permissions=ChatPermissions(
-                can_send_messages=False,
-                can_send_media_messages=False,
-                can_send_other_messages=False,
-                can_add_web_page_previews=False,
-            ),
-            until_date=until,
-        )
-        await message.reply(
-            f"🔇 <b>{escape(target.full_name)}</b> замучен на <b>{minutes}</b> мин.\n"
-            f"До: {until.strftime('%d.%m.%Y %H:%M')}"
-        )
-        audit_record(message.from_user.id, "admins", "мут", f"{target.full_name} / {minutes} мин", command="/mute")
-    except Exception as e:
-        await message.reply(f"❌ Не удалось замутить: {escape(str(e)[:200])}")
-
-
-@dp.message(Command("unmute"))
-async def cmd_unmute(message: Message):
-    """Ответом на сообщение: /unmute — снять мут."""
-    if not is_admin(message.from_user.id):
-        return
-    if not _is_group_chat(message):
-        await message.answer("Эту команду нужно использовать в группе.")
-        return
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.reply("❌ Ответь на сообщение человека, с которого хочешь снять мут.")
-        return
-
-    target = message.reply_to_message.from_user
-    try:
-        await bot.restrict_chat_member(
-            chat_id=message.chat.id,
-            user_id=target.id,
-            permissions=ChatPermissions(
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True,
-                can_send_polls=True,
-                can_invite_users=True,
-            ),
-        )
-        await message.reply(f"🔊 Мут снят с <b>{escape(target.full_name)}</b>")
-        audit_record(message.from_user.id, "admins", "размут", target.full_name, command="/unmute")
-    except Exception as e:
-        await message.reply(f"❌ Не удалось снять мут: {escape(str(e)[:200])}")
-
-
 @dp.message(Command("ban"))
 async def cmd_ban(message: Message):
-    """Ответом на сообщение: /ban — забанить в группе."""
+    """Ответом на сообщение: /ban [причина] — забанить в группе."""
     if not is_super_admin(message.from_user.id) and not admin_can(message.from_user.id, "admins"):
         return
     if not _is_group_chat(message):
         await message.answer("Эту команду нужно использовать в группе.")
         return
     if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.reply("❌ Ответь на сообщение человека, которого хочешь забанить.")
+        await message.reply("❌ Ответь на сообщение человека, которого хочешь забанить.\nПример: <code>/ban спам</code>")
         return
 
     target = message.reply_to_message.from_user
@@ -3837,10 +3839,24 @@ async def cmd_ban(message: Message):
         await message.reply("❌ Нельзя банить администраторов.")
         return
 
+    # Причина (всё после команды)
+    parts = (message.text or "").split(maxsplit=1)
+    reason = parts[1].strip() if len(parts) > 1 else "без указания причины"
+
     try:
         await bot.ban_chat_member(message.chat.id, target.id)
-        await message.reply(f"🚫 <b>{escape(target.full_name)}</b> забанен.")
-        audit_record(message.from_user.id, "admins", "бан", f"{target.full_name} / {target.id}", command="/ban")
+        await message.reply(
+            f"🚫 <b>{escape(target.full_name)}</b> забанен.\n"
+            f"Причина: <i>{escape(reason)}</i>"
+        )
+        audit_record(message.from_user.id, "admins", "бан", f"{target.full_name} / {target.id} | {reason}", command="/ban")
+        try:
+            await bot.send_message(
+                target.id,
+                f"🚫 Вы были забанены в группе.\nПричина: {escape(reason)}"
+            )
+        except Exception:
+            pass
     except Exception as e:
         await message.reply(f"❌ Не удалось забанить: {escape(str(e)[:200])}")
 
