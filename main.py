@@ -3,6 +3,10 @@ import logging
 from datetime import datetime, timedelta
 import pytz
 import os
+import uuid
+import json
+import time
+import threading
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import gspread
@@ -91,7 +95,7 @@ rights = {
     "admins": False, "settings": False, "sheets": False, "status": False
 }
 
-# ====================== КОМАНДА /STATUS ======================
+# ====================== КОМАНДЯ /STATUS ======================
 @dp.message(Command("status"))
 async def status_cmd(message: Message):
     user_id = message.from_user.id
@@ -106,7 +110,7 @@ async def status_cmd(message: Message):
     global ping, last_ping
     ping = int((datetime.now() - last_ping).total_seconds() * 1000)
 
-    rights_text = "\n".join([f"✅ {k}" for k, v in rights.items() if v])
+    rights_text = "\n".join([f"✅ {k}" if v else f"❌ {k}" for k, v in rights.items()])
 
     await message.answer(
         f"<b>📊 СТАТУС БОТА</b>\n\n"
