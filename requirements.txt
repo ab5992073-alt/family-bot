@@ -4,6 +4,6 @@ gspread==6.1.2
 telethon==1.39.0
 flask==3.0.3
 aiohttp==3.10.10
-aioschedule==0.5.8
+aioschedule==0.6.2
 pytz==2024.2
 requests==2.32.3
