@@ -1100,7 +1100,7 @@ async def cb_close_report(callback: CallbackQuery):
 
 
 # =========================================================
-# ОСНОВНЫЕ КОМАНДЫ И ОБРАБОТЧИКИ
+# ОСНОВНЫЕ КОМАНДЫ И ОБРАБОТЧИКИ МЕНЮ
 # =========================================================
 
 @dp.message(CommandStart())
@@ -1196,6 +1196,98 @@ async def cmd_google_sheets(message: Message):
         )
     else:
         await msg.edit_text(f"❌ <b>Ошибка синхронизации:</b>\n<code>{escape(url_or_err)}</code>")
+
+
+# =========================================================
+# ДОПОЛНИТЕЛЬНЫЕ ОБРАБОТЧИКИ КНОПОК МЕНЮ
+# =========================================================
+
+@dp.message(F.text == "📋 Заявки")
+async def menu_applications(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("📋 <b>Раздел заявок:</b>\nЗдесь вы можете управлять входящими заявками в семью.")
+
+@dp.message(F.text == "👥 Участники")
+async def menu_users(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(f"👥 <b>Список участников:</b>\nВсего зарегистрировано в базе: {len(data.get('users', {}))}")
+
+@dp.message(F.text == "📢 Объявление")
+async def menu_announcement(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("📢 <b>Создание объявления:</b>\nВведите текст объявления или отправьте его в нужный топик.")
+
+@dp.message(F.text == "📢 Общий сбор")
+async def menu_gathering(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("📢 <b>Общий сбор:</b>\nФункция рассылки уведомлений о сборе семьи.")
+
+@dp.message(F.text == "📊 Статистика")
+async def menu_stats(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(
+        f"📊 <b>Общая статистика семьи:</b>\n\n"
+        f"• Участников в базе: {len(data.get('users', {}))}\n"
+        f"• Заявок: {len(data.get('applications', {}))}\n"
+        f"• Участников в чате: {len(data.get('group_members', {}))}"
+    )
+
+@dp.message(F.text == "👑 Замы")
+async def menu_zams(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("👑 <b>Управление заместителями:</b>\nРаздел статистики и активности замов.")
+
+@dp.message(F.text == "📜 Журнал действий")
+async def menu_audit(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    events = data.get("audit_events", [])
+    last_events = "\n".join([f"• [{e['time']}] ID {e['actor_id']}: {e['action']} ({e['details']})" for e in events[-10:]])
+    if not last_events:
+        last_events = "Журнал пока пуст."
+    await message.answer(f"📜 <b>Последние действия в системе:</b>\n\n{last_events}")
+
+@dp.message(F.text == "🛠 Админка")
+async def menu_admin_panel(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("🛠 <b>Панель администратора:</b>\nВыберите нужную настройку или раздел управления.")
+
+@dp.message(F.text == "⚙️ Настройки")
+async def menu_settings(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("⚙️ <b>Настройки бота:</b>\nЗдесь вы можете управлять параметрами уведомлений и работы системы.")
+
+@dp.message(F.text == "🔔 Напоминания")
+async def menu_reminders(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("🔔 <b>Система напоминаний:</b>\nУправление автоматическими оповещениями семьи.")
+
+@dp.message(F.text == "📝 Подать заявку")
+async def menu_apply_user(message: Message):
+    await message.answer("📝 Чтобы подать заявку в семью, заполните анкету или обратитесь к администрации.")
+
+@dp.message(F.text == "📊 Мой статус")
+async def menu_my_status(message: Message):
+    user_id = str(message.from_user.id)
+    u_info = data.get("users", {}).get(user_id)
+    if u_info:
+        await message.answer(
+            f"📊 <b>Ваш статус в семье:</b>\n\n"
+            f"• Ник: {u_info.get('nickname')}\n"
+            f"• Ранг: {u_info.get('rank_fam')}\n"
+            f"• Организация: {u_info.get('organization')}"
+        )
+    else:
+        await message.answer("📊 Вы еще не зарегистрированы в базе семьи или ваша заявка на рассмотрении.")
 
 
 # =========================================================
