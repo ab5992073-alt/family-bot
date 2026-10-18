@@ -744,7 +744,6 @@ async def _flush_db_save():
 
 
 def trigger_sheets_sync():
-    """Запуск авто-синхронизации с Google Таблицей при изменениях."""
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(asyncio.to_thread(sync_google_sheets))
@@ -753,7 +752,6 @@ def trigger_sheets_sync():
 
 
 def save_data():
-    """Сохраняет данные локально, отправляет в PostgreSQL и запускает автосинхронизацию с Гугл Таблицами."""
     global _db_save_task, _db_save_pending
     _write_local_json(DATA_FILE, data)
     
@@ -965,10 +963,11 @@ def sync_google_sheets():
 
 
 # =========================================================
-# КЛАВИАТУРЫ
+# КЛАВИАТУРЫ (СТРОГО РАЗДЕЛЕНЫ)
 # =========================================================
 
-def get_main_keyboard(user_id: int):
+def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    """Только нижнее меню (ReplyKeyboard)"""
     builder = ReplyKeyboardBuilder()
     if is_admin(user_id):
         builder.row(KeyboardButton(text="📋 Заявки"), KeyboardButton(text="👥 Участники"))
@@ -1116,7 +1115,6 @@ async def cb_close_report(callback: CallbackQuery):
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    # Принудительно сбрасываем любые зависшие состояния при запуске
     await state.clear()
     
     user = message.from_user
@@ -1172,7 +1170,26 @@ async def cb_toggle_maintenance(callback: CallbackQuery):
 
     status_str = "ВКЛЮЧЕН 🛠" if data["maintenance_mode"] else "ВЫКЛЮЧЕН 🟢"
     await callback.answer(f"Режим тех. работ: {status_str}", show_alert=True)
-    await cmd_status(callback.message)
+    
+    uptime = str(datetime.now() - BOT_START_TIME).split('.')[0]
+    maint = "Включен 🛠" if data.get("maintenance_mode") else "Выключен 🟢"
+
+    text = (
+        f"📊 <b>Статус бота</b>\n\n"
+        f"<b>Время работы:</b> {uptime}\n"
+        f"<b>Режим тех. работ:</b> {maint}\n"
+        f"<b>Всего участников:</b> {len(data.get('users', {}))}\n"
+        f"<b>Всего заявок:</b> {len(data.get('applications', {}))}"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🛠 Переключить тех. работы",
+            callback_query_data="toggle_maintenance"
+        )]
+    ])
+
+    await callback.message.edit_text(text, reply_markup=kb)
 
 
 @dp.message(F.text == "☁️ Google Таблица")
