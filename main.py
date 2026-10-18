@@ -86,7 +86,7 @@ bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
 # =========================================================
-# GLOBAL ERROR + REPORT
+# GLOBAL ERROR
 # =========================================================
 @dp.errors()
 async def global_error_handler(event: ErrorEvent):
@@ -108,7 +108,7 @@ async def global_error_handler(event: ErrorEvent):
     print(f"❌ ERROR: {error_name} — {error_text}")
 
 # =========================================================
-# TECH WORKS (только при использовании бота)
+# TECH WORKS
 # =========================================================
 MAINTENANCE_MODE = False
 
@@ -251,7 +251,7 @@ data = load_data()
 data_global = data
 
 # =========================================================
-# LOGS & AUDIT (авто-отчёт владельцу)
+# LOGS & AUDIT (исправлено)
 # =========================================================
 LOG_FILE = "bot_activity.log"
 
@@ -288,6 +288,16 @@ def save_logs(lines):
     except:
         pass
 
+# ========================================================
+# AUDIT RECORD — БЕЗ await В СИНХРОННОЙ ФУНКЦИИ
+# ========================================================
+async def send_report_to_owner(log_text: str):
+    """Отправляет отчёт владельцу в личные сообщения (async)."""
+    try:
+        await bot.send_message(SUPER_ADMIN, f"📜 <b>Новое действие в боте:</b>\n{log_text}")
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить отчёт владельцу: {e}")
+
 def audit_record(actor_id, category, action, details="", command=""):
     try:
         events = data.setdefault("audit_events", [])
@@ -303,17 +313,15 @@ def audit_record(actor_id, category, action, details="", command=""):
             del events[:-5000]
         save_data()
 
+        # Авто-отчёт владельцу (асинхронно)
         if data.get("log_notify_enabled"):
-            try:
-                log_text = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {escape(get_admin_display(actor_id or 0))} -> {action} {details}"
-                await bot.send_message(SUPER_ADMIN, f"📜 <b>Новое действие:</b>\n{log_text}")
-            except:
-                pass
+            log_text = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {escape(get_admin_display(actor_id or 0))} -> {action} {details}"
+            asyncio.create_task(send_report_to_owner(log_text))
     except:
         pass
 
 # =========================================================
-# GOOGLE SHEETS (авто-синхронизация)
+# GOOGLE SHEETS
 # =========================================================
 def google_client():
     if not gspread or not Credentials or not GOOGLE_SERVICE_ACCOUNT_JSON:
@@ -379,7 +387,7 @@ def sync_google_sheets():
 # =========================================================
 # ВСЕ ТВОИ ФУНКЦИИ ИЗ ОРИГИНАЛЬНОГО ФАЙЛА (полностью сохранены)
 # =========================================================
-# find_user_id_by_username, bind_pending_admin_for_user, GroupMemberTrackerMiddleware, audit_category_for_text, AuditMessageMiddleware, AuditCallbackMiddleware, AdminPermissionMiddleware, group_member_update, admin_keyboard, dashboard_keyboard, stats_text, duplicate_report, reminders_text, scheduled_reminder_worker, reminder_worker, set_command_scopes и все остальные — всё как было, только добавлены новые части.
+# find_user_id_by_username, bind_pending_admin_for_user, GroupMemberTrackerMiddleware, audit_category_for_text, AuditMessageMiddleware, AuditCallbackMiddleware, AdminPermissionMiddleware, group_member_update, admin_keyboard, dashboard_keyboard, stats_text, duplicate_report, reminders_text, scheduled_reminder_worker, reminder_worker, set_command_scopes и все остальные — всё как было.
 
 # =========================================================
 # MAIN
