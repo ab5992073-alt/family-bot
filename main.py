@@ -228,7 +228,7 @@ def permission_denied_text(perm: str) -> str:
 
 
 # =========================================================
-# MIDDLEWARE ТЕХНИЧЕСКИХ РАБОТ (ИСПРАВЛЕНО ДЛЯ ГРУПП)
+# MIDDLEWARE ТЕХНИЧЕСКИХ РАБОТ
 # =========================================================
 
 MAINTENANCE_TEXT = "🛠 <b>Ведутся технические работы</b>\nБот временно недоступен. Попробуйте позже."
@@ -251,7 +251,6 @@ class MaintenanceMiddleware(BaseMiddleware):
         is_maint = data_global.get("maintenance_mode", False)
 
         if is_maint:
-            # Уведомляем ТОЛЬКО если пользователь общается с ботом в личных сообщениях
             if chat and chat.type == "private":
                 try:
                     if isinstance(event, Message):
@@ -260,7 +259,6 @@ class MaintenanceMiddleware(BaseMiddleware):
                         await event.answer(MAINTENANCE_TEXT, show_alert=True)
                 except Exception:
                     pass
-            # Если это группа, просто игнорируем действия пользователей во время тех. работ без спама в чат
             return
 
         return await handler(event, data_ctx)
@@ -759,7 +757,6 @@ def save_data():
     global _db_save_task, _db_save_pending
     _write_local_json(DATA_FILE, data)
     
-    # Автоматическая синхронизация с Google Таблицей после каждого изменения
     trigger_sheets_sync()
 
     if not (DATABASE_URL and psycopg2 is not None):
@@ -936,14 +933,14 @@ def sync_google_sheets():
                 ws.clear()
             except Exception:
                 ws = sh.add_worksheet(title=title, rows=1000, cols=12)
-            ws.update("A1", values)
+            ws.update(range_name="A1", values=values)
 
         rows = []
         for uid, u in data.get("users", {}).items():
             rows.append([uid, u.get("nickname"), u.get("tag"), u.get("rank_fam"), u.get("organization"), u.get("inviter"), "принят"])
         if rows:
             ws = sh.worksheet("Участники")
-            ws.update("A2", rows)
+            ws.update(range_name="A2", values=rows)
 
         rows = []
         for aid, a in data.get("applications", {}).items():
@@ -951,14 +948,14 @@ def sync_google_sheets():
             rows.append([aid, a.get("user_id"), d.get("nickname"), d.get("tag"), d.get("rank_fam"), d.get("organization"), d.get("inviter"), a.get("status"), a.get("created")])
         if rows:
             ws = sh.worksheet("Заявки")
-            ws.update("A2", rows)
+            ws.update(range_name="A2", values=rows)
 
         rows = []
         for i, (nick, info) in enumerate(data.get("zam_data", {}).items(), 1):
             rows.append([i, nick, info.get("tg_username"), count_zam_answers(nick)])
         if rows:
             ws = sh.worksheet("Замы")
-            ws.update("A2", rows)
+            ws.update(range_name="A2", values=rows)
 
         data["google_sheet_url"] = sh.url
         data["google_sheet_url_time"] = datetime.now().timestamp()
@@ -988,7 +985,7 @@ def get_main_keyboard(user_id: int):
 
 
 # =========================================================
-# СИСТЕМА РЕПОРТОВ (ЖАЛОБИ И ОБРАЩЕНИЯ)
+# СИСТЕМА РЕПОРТОВ (ЖАЛОБЫ И ОБРАЩЕНИЯ)
 # =========================================================
 
 @dp.message(F.text == "📩 Репорт / Связь")
@@ -1033,11 +1030,10 @@ async def process_report_text(message: Message, state: FSMContext):
         reply_markup=get_main_keyboard(user.id)
     )
 
-    # Уведомляем администраторов
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="💬 Ответить", callback_query_data=f"reply_report:{report_id}"),
-            InlineKeyboardButton(text="❌ Закрыть", callback_query_data=f"close_report:{report_id}")
+            InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_report:{report_id}"),
+            InlineKeyboardButton(text="❌ Закрыть", callback_data=f"close_report:{report_id}")
         ]
     ])
 
@@ -1119,12 +1115,21 @@ async def cb_close_report(callback: CallbackQuery):
 # =========================================================
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    # Принудительно сбрасываем любые зависшие состояния при запуске
+    await state.clear()
+    
     user = message.from_user
     await bind_pending_admin_for_user(user)
 
+    text = (
+        f"👋 <b>Привет, {escape(user.full_name)}!</b> ✨\n\n"
+        f"👑 Добро пожаловать в официальный бот семьи <b>Staff Grand</b>! 🏆\n\n"
+        f"⚡ Выберите нужный раздел в меню ниже, чтобы продолжить: 👇"
+    )
+
     await message.answer(
-        f"Привет, {escape(user.full_name)}! Добро пожаловать в бота семьи Staff Grand.",
+        text,
         reply_markup=get_main_keyboard(user.id)
     )
 
