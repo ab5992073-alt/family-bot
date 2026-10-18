@@ -146,7 +146,7 @@ dp.message.outer_middleware(MaintenanceMiddleware())
 dp.callback_query.outer_middleware(MaintenanceMiddleware())
 
 # =========================================================
-# DATA & DATABASE
+# DATA & DATABASE (исправлено)
 # =========================================================
 DATA_FILE = "data.json"
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
@@ -162,47 +162,49 @@ def _db_connect():
     except:
         return None
 
-def _db_init():
+async def _async_db_connect():
     conn = _db_connect()
-    if not conn:
-        return False
+    if conn is None:
+        return None
     try:
-        with conn:
-            cur = conn.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS staff_grand_state (
-                    state_key TEXT PRIMARY KEY,
-                    state_value JSONB NOT NULL
-                )
-            """)
-        return True
-    finally:
+        await asyncio.to_thread(conn.ping)
+        return conn
+    except:
         conn.close()
+        return None
 
-def _db_get(key):
-    conn = _db_connect()
+async def _db_get(key):
+    conn = await _async_db_connect()
+    if conn is None:
+        return None
     try:
-        _db_init()
         cur = conn.cursor()
         cur.execute("SELECT state_value FROM staff_grand_state WHERE state_key = %s", (key,))
         row = cur.fetchone()
         return row[0] if row else None
+    except:
+        return None
     finally:
-        conn.close()
+        if conn:
+            await asyncio.to_thread(conn.close)
 
-def _db_set(key, value):
-    conn = _db_connect()
+async def _db_set(key, value):
+    conn = await _async_db_connect()
+    if conn is None:
+        return False
     try:
-        _db_init()
-        with conn:
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO staff_grand_state (state_key, state_value)
-                VALUES (%s, %s) ON CONFLICT (state_key) DO UPDATE SET state_value = EXCLUDED.state_value
-            """, (key, Json(value)))
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO staff_grand_state (state_key, state_value)
+            VALUES (%s, %s) ON CONFLICT (state_key) DO UPDATE SET state_value = EXCLUDED.state_value
+        """, (key, Json(value)))
+        await asyncio.to_thread(conn.commit)
         return True
+    except:
+        return False
     finally:
-        conn.close()
+        if conn:
+            await asyncio.to_thread(conn.close)
 
 def _read_local_json(path, default=None):
     if not os.path.exists(path):
@@ -224,14 +226,17 @@ def _has_real_local_data(d):
     return bool(d.get("users") or d.get("applications") or d.get("admins") or d.get("zam_data"))
 
 def load_data():
+    # PostgreSQL — теперь безопасно
     if DATABASE_URL and psycopg2 is not None:
-        existing = _db_get("data")
+        existing = asyncio.run(_db_get("data"))  # асинхронно
         if isinstance(existing, dict) and _has_real_local_data(existing):
             return existing
+
         local = _read_local_json(DATA_FILE, None)
         if isinstance(local, dict) and _has_real_local_data(local):
-            _db_set("data", local)
+            asyncio.run(_db_set("data", local))  # асинхронно
             return local
+
     return _read_local_json(DATA_FILE, {
         "users": {}, "applications": {}, "admins": list(ADMIN_IDS),
         "zam_data": {}, "zam_stats": {}, "admin_usernames": {},
@@ -245,7 +250,7 @@ def load_data():
 def save_data():
     _write_local_json(DATA_FILE, data)
     if DATABASE_URL and psycopg2 is not None:
-        _db_set("data", data)
+        asyncio.run(_db_set("data", data))
 
 data = load_data()
 data_global = data
@@ -262,7 +267,7 @@ def append_log_line(line):
 
 def load_logs():
     if DATABASE_URL and psycopg2 is not None:
-        logs = _db_get("logs")
+        logs = asyncio.run(_db_get("logs"))
         if isinstance(logs, list):
             return logs
         if os.path.exists(LOG_FILE):
@@ -281,22 +286,12 @@ def load_logs():
 def save_logs(lines):
     lines = [str(x) for x in lines]
     if DATABASE_URL and psycopg2 is not None:
-        _db_set("logs", lines)
+        asyncio.run(_db_set("logs", lines))
     try:
         with open(LOG_FILE, "w", encoding="utf-8") as f:
             f.writelines(lines)
     except:
         pass
-
-# ========================================================
-# AUDIT RECORD — БЕЗ await В СИНХРОННОЙ ФУНКЦИИ
-# ========================================================
-async def send_report_to_owner(log_text: str):
-    """Отправляет отчёт владельцу в личные сообщения (async)."""
-    try:
-        await bot.send_message(SUPER_ADMIN, f"📜 <b>Новое действие в боте:</b>\n{log_text}")
-    except Exception as e:
-        print(f"⚠️ Не удалось отправить отчёт владельцу: {e}")
 
 def audit_record(actor_id, category, action, details="", command=""):
     try:
@@ -313,10 +308,15 @@ def audit_record(actor_id, category, action, details="", command=""):
             del events[:-5000]
         save_data()
 
-        # Авто-отчёт владельцу (асинхронно)
         if data.get("log_notify_enabled"):
             log_text = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {escape(get_admin_display(actor_id or 0))} -> {action} {details}"
             asyncio.create_task(send_report_to_owner(log_text))
+    except:
+        pass
+
+async def send_report_to_owner(log_text: str):
+    try:
+        await bot.send_message(SUPER_ADMIN, f"📜 <b>Новое действие в боте:</b>\n{log_text}")
     except:
         pass
 
