@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 from html import escape
 import threading
+import re
 
 try:
     import psycopg2
@@ -14,7 +15,10 @@ except ImportError:
 
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -24,12 +28,13 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeDefault,
     BotCommandScopeChat,
+    ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     ChatMemberUpdated,
     ErrorEvent,
     ChatPermissions,
 )
-from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from flask import Flask
 
 try:
@@ -149,11 +154,20 @@ bot = Bot(
     token=TOKEN,
     default=DefaultBotProperties(parse_mode="HTML"),
 )
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
 
 # =========================================================
-# ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК → только владельцу
+# FSM STATES (СОСТОЯНИЯ)
+# =========================================================
+
+class ReportStates(StatesGroup):
+    waiting_for_report = State()
+    waiting_for_reply = State()
+
+
+# =========================================================
+# ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК
 # =========================================================
 
 @dp.errors()
@@ -188,6 +202,70 @@ async def global_error_handler(event: ErrorEvent):
         print(f"⚠️ Не удалось отправить ошибку владельцу: {e}")
 
     print(f"❌ ERROR [{error_name}]: {error_text}")
+
+
+# =========================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И АДМИНКА
+# =========================================================
+
+def is_super_admin(user_id: int) -> bool:
+    return user_id == SUPER_ADMIN
+
+def get_admins() -> list:
+    return data_global.get("admins", list(ADMIN_IDS))
+
+def is_admin(user_id: int) -> bool:
+    return user_id in get_admins()
+
+def admin_can(user_id: int, perm: str) -> bool:
+    if is_super_admin(user_id):
+        return True
+    perms = data_global.get("admin_permissions", {}).get(str(user_id), {})
+    return perms.get(perm, True)
+
+def permission_denied_text(perm: str) -> str:
+    return f"⛔ У вас нет доступа к функции '{perm}'."
+
+
+# =========================================================
+# MIDDLEWARE ТЕХНИЧЕСКИХ РАБОТ
+# =========================================================
+
+MAINTENANCE_TEXT = "🛠 <b>Ведутся технические работы</b>\nБот временно недоступен. Попробуйте позже."
+
+class MaintenanceMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data_ctx):
+        user = None
+        chat = None
+
+        if isinstance(event, Message):
+            user = event.from_user
+            chat = event.chat
+        elif isinstance(event, CallbackQuery):
+            user = event.from_user
+            chat = event.message.chat if event.message else None
+
+        if user and is_super_admin(user.id):
+            return await handler(event, data_ctx)
+
+        is_maint = data_global.get("maintenance_mode", False)
+
+        if is_maint:
+            if chat and chat.type == "private":
+                try:
+                    if isinstance(event, Message):
+                        await event.answer(MAINTENANCE_TEXT)
+                    elif isinstance(event, CallbackQuery):
+                        await event.answer(MAINTENANCE_TEXT, show_alert=True)
+                except Exception:
+                    pass
+            return
+
+        return await handler(event, data_ctx)
+
+
+dp.message.outer_middleware(MaintenanceMiddleware())
+dp.callback_query.outer_middleware(MaintenanceMiddleware())
 
 
 # =========================================================
@@ -259,10 +337,6 @@ async def bind_pending_admin_for_user(user):
     }
     pending.pop(username, None)
     save_data()
-    try:
-        await set_command_scopes()
-    except Exception:
-        pass
 
     try:
         if getattr(user, "id", None):
@@ -510,10 +584,8 @@ _db_warned = False
 
 
 def _db_connect():
-    if psycopg2 is None:
-        raise RuntimeError("Не установлен psycopg2-binary. Добавь его в requirements.txt.")
-    if not DATABASE_URL:
-        raise RuntimeError("Не задан DATABASE_URL. Бот остановлен, чтобы не потерять данные.")
+    if psycopg2 is None or not DATABASE_URL:
+        return None
 
     conninfo = DATABASE_URL
     if "sslmode=" not in conninfo.lower():
@@ -618,21 +690,7 @@ def _write_local_json(path, value):
 def _has_real_local_data(local):
     if not isinstance(local, dict):
         return False
-    if local.get("users"):
-        return True
-    if local.get("applications"):
-        return True
-    if local.get("admins") and set(local.get("admins", [])) - set(ADMIN_IDS):
-        return True
-    if local.get("zam_data"):
-        return True
-    if local.get("zam_stats"):
-        return True
-    if local.get("admin_usernames"):
-        return True
-    if local.get("group_members"):
-        return True
-    if local.get("pending_admin_usernames"):
+    if local.get("users") or local.get("applications") or local.get("zam_data"):
         return True
     return False
 
@@ -645,7 +703,7 @@ def load_data():
 
         local = _read_local_json(DATA_FILE, None)
         if isinstance(local, dict) and _has_real_local_data(local):
-            print("🔄 Найден локальный data.json — выполняю однократный импорт в PostgreSQL...")
+            print("🔄 Найден локальный data.json — выполняю импорт в PostgreSQL...")
             if _db_set("data", local):
                 return local
 
@@ -684,9 +742,11 @@ async def _flush_db_save():
     finally:
         _db_save_task = None
 
+
 def save_data():
     global _db_save_task, _db_save_pending
     _write_local_json(DATA_FILE, data)
+
     if not (DATABASE_URL and psycopg2 is not None):
         return
     _db_save_pending = True
@@ -703,7 +763,6 @@ def load_logs():
         logs = _db_get("logs")
         if isinstance(logs, list):
             return [str(x) for x in logs]
-
         if os.path.exists(LOG_FILE):
             try:
                 with open(LOG_FILE, "r", encoding="utf-8") as f:
@@ -743,7 +802,6 @@ def append_log_line(line):
 data = load_data()
 data_global = data
 
-
 defaults = {
     "users": {},
     "applications": {},
@@ -761,110 +819,431 @@ defaults = {
     "last_reminders": {},
     "reminders": [],
     "admin_permissions": {},
+    "maintenance_mode": False,
+    "reports": {},
 }
 
 changed = False
-
 for key, default in defaults.items():
     if key not in data:
         data[key] = default
         changed = True
 
-if not isinstance(data.get("group_members"), dict):
-    data["group_members"] = {}
-    changed = True
-
-if not isinstance(data.get("pending_admin_usernames"), dict):
-    data["pending_admin_usernames"] = {}
-    changed = True
-
-if not isinstance(data.get("notify_settings"), dict):
-    data["notify_settings"] = {}
-    changed = True
-if not isinstance(data.get("bot_settings"), dict):
-    data["bot_settings"] = {"reminders_enabled": False, "pin_announcements": False}
-    changed = True
-if not isinstance(data.get("last_reminders"), dict):
-    data["last_reminders"] = {}
-    changed = True
-if not isinstance(data.get("reminders"), list):
-    data["reminders"] = []
-if not data.setdefault("bot_settings", {}).get("timezone"):
-    data["bot_settings"]["timezone"] = "Europe/Moscow"
-    changed = True
-
-if not data.get("admins"):
-    data["admins"] = list(ADMIN_IDS)
-    changed = True
-
 if SUPER_ADMIN not in data["admins"]:
     data["admins"].append(SUPER_ADMIN)
     changed = True
 
-for nick, info in list(data.get("zam_data", {}).items()):
-    if not isinstance(info, dict):
-        data["zam_data"][nick] = {
-            "tg_user_id": None,
-            "tg_username": None,
-        }
-        changed = True
-        continue
-
-    if "tg_user_id" not in info:
-        info["tg_user_id"] = None
-        changed = True
-
-    if "tg_username" not in info:
-        info["tg_username"] = None
-        changed = True
-
-for nick in data.get("zam_data", {}):
-    stat = data["zam_stats"].setdefault(
-        nick,
-        {"count": 0, "withdrawn": 0, "history": []},
-    )
-
-    if "count" not in stat:
-        stat["count"] = 0
-        changed = True
-
-    if "withdrawn" not in stat:
-        stat["withdrawn"] = 0
-        changed = True
-
-    if "history" not in stat:
-        stat["history"] = []
-        changed = True
-
-INITIAL_ZAM_NICKS = [
-    "Vusal_Cantrell",
-    "_Sinax_Agressor_",
-    "K1LLER",
-    "Milena_Guenot",
-    "Meglenes_Stemmust",
-    "Sergey_Darknes",
-    "Gleb_Maestro",
-    "Ganka_Gankovich",
-    "Gosha_Pinkman",
-    "Nikita_Pandemic",
-    "Egor_Vendetta",
-    "Victoria_Sergeevna",
-]
-
-if not data.get("initial_zams_installed", False):
-    for initial_nick in INITIAL_ZAM_NICKS:
-        if initial_nick not in data["zam_data"]:
-            data["zam_data"][initial_nick] = {
-                "tg_user_id": None,
-                "tg_username": None,
-            }
-            data["zam_stats"].setdefault(
-                initial_nick,
-                {"count": 0, "withdrawn": 0, "history": []},
-            )
-            changed = True
-    data["initial_zams_installed"] = True
-    changed = True
-
 if changed:
     save_data()
+
+
+# =========================================================
+# TELEGRAM-АККАУНТ ВЛАДЕЛЬЦА
+# =========================================================
+
+async def init_telegram_user_client():
+    global telegram_user_client, telegram_user_ready
+
+    if TelegramClient is None or not (TG_API_ID and TG_API_HASH and TG_SESSION_STRING):
+        return False
+
+    try:
+        telegram_user_client = TelegramClient(
+            StringSession(TG_SESSION_STRING),
+            TG_API_ID,
+            TG_API_HASH,
+        )
+        await telegram_user_client.connect()
+
+        if not await telegram_user_client.is_user_authorized():
+            await telegram_user_client.disconnect()
+            telegram_user_client = None
+            return False
+
+        me = await telegram_user_client.get_me()
+        print(f"✅ Telegram user-session подключена: {getattr(me, 'username', None) or me.id}")
+        telegram_user_ready = True
+        return True
+    except Exception as e:
+        print(f"⚠️ Не удалось подключить Telegram user-session: {e}")
+        telegram_user_client = None
+        telegram_user_ready = False
+        return False
+
+
+def count_zam_answers(nick):
+    return data.get("zam_stats", {}).get(nick, {}).get("count", 0)
+
+
+# =========================================================
+# GOOGLE SHEETS
+# =========================================================
+
+def google_client():
+    if not gspread or not Credentials or not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return None
+    try:
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        creds = Credentials.from_service_account_info(
+            info,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
+        return gspread.authorize(creds)
+    except Exception as e:
+        print(f"⚠️ Ошибка авторизации Google: {e}")
+        return None
+
+
+def sync_google_sheets():
+    client = google_client()
+    if not client:
+        return False, "Google Sheets не настроен"
+    try:
+        if GOOGLE_SHEET_ID:
+            sh = client.open_by_key(GOOGLE_SHEET_ID)
+        else:
+            sh = client.create(GOOGLE_SHEET_TITLE)
+
+        sheets = {
+            "Участники": [["ID", "Nickname", "@username", "Ранг", "Орг", "Пригласил", "Статус"]],
+            "Заявки": [["ID", "TG ID", "Nickname", "@username", "Ранг", "Орг", "Пригласил", "Статус", "Создано"]],
+            "Замы": [["№", "Nickname", "@username", "Приглашений"]],
+            "Статистика": [["Показатель", "Значение"]],
+            "Журнал": [["Время", "Кто", "Действие", "Подробности"]],
+        }
+
+        for title, values in sheets.items():
+            try:
+                ws = sh.worksheet(title)
+                ws.clear()
+            except Exception:
+                ws = sh.add_worksheet(title=title, rows=1000, cols=12)
+            ws.update(range_name="A1", values=values)
+
+        rows = []
+        for uid, u in data.get("users", {}).items():
+            rows.append([uid, u.get("nickname"), u.get("tag"), u.get("rank_fam"), u.get("organization"), u.get("inviter"), "принят"])
+        if rows:
+            ws = sh.worksheet("Участники")
+            ws.update(range_name="A2", values=rows)
+
+        rows = []
+        for aid, a in data.get("applications", {}).items():
+            d = a.get("data", {})
+            rows.append([aid, a.get("user_id"), d.get("nickname"), d.get("tag"), d.get("rank_fam"), d.get("organization"), d.get("inviter"), a.get("status"), a.get("created")])
+        if rows:
+            ws = sh.worksheet("Заявки")
+            ws.update(range_name="A2", values=rows)
+
+        rows = []
+        for i, (nick, info) in enumerate(data.get("zam_data", {}).items(), 1):
+            rows.append([i, nick, info.get("tg_username"), count_zam_answers(nick)])
+        if rows:
+            ws = sh.worksheet("Замы")
+            ws.update(range_name="A2", values=rows)
+
+        data["google_sheet_url"] = sh.url
+        data["google_sheet_url_time"] = datetime.now().timestamp()
+        return True, sh.url
+    except Exception as e:
+        return False, str(e)[:500]
+
+
+# =========================================================
+# КЛАВИАТУРЫ
+# =========================================================
+
+def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    builder = ReplyKeyboardBuilder()
+    if is_admin(user_id):
+        builder.row(KeyboardButton(text="📋 Заявки"), KeyboardButton(text="👥 Участники"))
+        builder.row(KeyboardButton(text="🟢 Статус бота"), KeyboardButton(text="📢 Объявление"))
+        builder.row(KeyboardButton(text="📢 Общий сбор"), KeyboardButton(text="📊 Статистика"))
+        builder.row(KeyboardButton(text="👑 Замы"), KeyboardButton(text="📜 Журнал действий"))
+        builder.row(KeyboardButton(text="🛠 Админка"), KeyboardButton(text="☁️ Google Таблица"))
+        builder.row(KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="🔔 Напоминания"))
+    else:
+        builder.row(KeyboardButton(text="📝 Подать заявку"))
+        builder.row(KeyboardButton(text="📩 Репорт / Связь"))
+        builder.row(KeyboardButton(text="📊 Мой статус"))
+    return builder.as_markup(resize_keyboard=True)
+
+
+# =========================================================
+# СИСТЕМА РЕПОРТОВ (ЖАЛОБЫ И ОБРАЩЕНИЯ)
+# =========================================================
+
+@dp.message(F.text == "📩 Репорт / Связь")
+async def cmd_report_start(message: Message, state: FSMContext):
+    await state.set_state(ReportStates.waiting_for_report)
+    await message.answer(
+        "✍️ <b>Напишите ваше сообщение или жалобу для администрации:</b>\n\n"
+        "Опишите суть вопроса максимально подробно. Для отмены введите /cancel.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+
+@dp.message(Command("cancel"), StateFilter(ReportStates))
+async def cmd_report_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Действие отменено.", reply_markup=get_main_keyboard(message.from_user.id))
+
+
+@dp.message(ReportStates.waiting_for_report)
+async def process_report_text(message: Message, state: FSMContext):
+    user = message.from_user
+    text = message.text or message.caption or ""
+
+    if not text:
+        await message.answer("⚠️ Пожалуйста, отправьте текстовое сообщение.")
+        return
+
+    report_id = str(int(datetime.now().timestamp()))
+    data.setdefault("reports", {})[report_id] = {
+        "user_id": user.id,
+        "username": user.username,
+        "full_name": user.full_name,
+        "text": text,
+        "status": "open",
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    save_data()
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Ваше обращение отправлено администрации!</b>\n"
+        "Вам ответят в ближайшее время.",
+        reply_markup=get_main_keyboard(user.id)
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_report:{report_id}"),
+            InlineKeyboardButton(text="❌ Закрыть", callback_data=f"close_report:{report_id}")
+        ]
+    ])
+
+    user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
+    admin_msg = (
+        f"📩 <b>Новое обращение #{report_id}</b>\n\n"
+        f"<b>От кого:</b> {escape(user.full_name)} ({user_info})\n"
+        f"<b>Текст:</b>\n{escape(text)}"
+    )
+
+    for admin_id in get_admins():
+        try:
+            await bot.send_message(admin_id, admin_msg, reply_markup=kb)
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data.startswith("reply_report:"))
+async def cb_reply_report(callback: CallbackQuery, state: FSMContext):
+    report_id = callback.data.split(":")[1]
+    rep = data.get("reports", {}).get(report_id)
+
+    if not rep:
+        await callback.answer("Репорт не найден.", show_alert=True)
+        return
+
+    await state.update_data(reply_report_id=report_id)
+    await state.set_state(ReportStates.waiting_for_reply)
+
+    await callback.message.answer(
+        f"✍️ <b>Введите ответ на обращение #{report_id} для {escape(rep['full_name'])}:</b>"
+    )
+    await callback.answer()
+
+
+@dp.message(ReportStates.waiting_for_reply)
+async def process_report_reply(message: Message, state: FSMContext):
+    state_data = await state.get_data()
+    report_id = state_data.get("reply_report_id")
+    rep = data.get("reports", {}).get(report_id)
+
+    if not rep:
+        await message.answer("⚠️ Обращение не найдено.")
+        await state.clear()
+        return
+
+    reply_text = message.text or ""
+    try:
+        await bot.send_message(
+            rep["user_id"],
+            f"📩 <b>Ответ администрации на ваше обращение:</b>\n\n{escape(reply_text)}"
+        )
+        await message.answer(f"✅ Ответ успешно отправлен пользователю.")
+        rep["status"] = "answered"
+        save_data()
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить ответ пользователю: {e}")
+
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("close_report:"))
+async def cb_close_report(callback: CallbackQuery):
+    report_id = callback.data.split(":")[1]
+    rep = data.get("reports", {}).get(report_id)
+
+    if rep:
+        rep["status"] = "closed"
+        save_data()
+
+    await callback.message.edit_text(
+        f"{callback.message.text}\n\n🔒 <b>Обращение закрыто ({escape(callback.from_user.full_name)})</b>"
+    )
+    await callback.answer("Обращение закрыто.")
+
+
+# =========================================================
+# ОСНОВНЫЕ КОМАНДЫ И ОБРАБОТЧИКИ
+# =========================================================
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    
+    user = message.from_user
+    await bind_pending_admin_for_user(user)
+
+    text = (
+        f"👋 <b>Привет, {escape(user.full_name)}!</b> ✨\n\n"
+        f"👑 Добро пожаловать в официальный бот семьи <b>Staff Grand</b>! 🏆\n\n"
+        f"⚡ Выберите нужный раздел в меню ниже, чтобы продолжить: 👇"
+    )
+
+    await message.answer(
+        text,
+        reply_markup=get_main_keyboard(user.id)
+    )
+
+
+@dp.message(F.text == "🟢 Статус бота")
+async def cmd_status(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    uptime = str(datetime.now() - BOT_START_TIME).split('.')[0]
+    maint = "Включен 🛠" if data.get("maintenance_mode") else "Выключен 🟢"
+
+    text = (
+        f"📊 <b>Статус бота</b>\n\n"
+        f"<b>Время работы:</b> {uptime}\n"
+        f"<b>Режим тех. работ:</b> {maint}\n"
+        f"<b>Всего участников:</b> {len(data.get('users', {}))}\n"
+        f"<b>Всего заявок:</b> {len(data.get('applications', {}))}"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🛠 Переключить тех. работы",
+            callback_data="toggle_maintenance"
+        )]
+    ])
+
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "toggle_maintenance")
+async def cb_toggle_maintenance(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Только владелец может переключать тех. работы!", show_alert=True)
+        return
+
+    current = data.get("maintenance_mode", False)
+    data["maintenance_mode"] = not current
+    save_data()
+
+    status_str = "ВКЛЮЧЕН 🛠" if data["maintenance_mode"] else "ВЫКЛЮЧЕН 🟢"
+    await callback.answer(f"Режим тех. работ: {status_str}", show_alert=True)
+    
+    uptime = str(datetime.now() - BOT_START_TIME).split('.')[0]
+    maint = "Включен 🛠" if data.get("maintenance_mode") else "Выключен 🟢"
+
+    text = (
+        f"📊 <b>Статус бота</b>\n\n"
+        f"<b>Время работы:</b> {uptime}\n"
+        f"<b>Режим тех. работ:</b> {maint}\n"
+        f"<b>Всего участников:</b> {len(data.get('users', {}))}\n"
+        f"<b>Всего заявок:</b> {len(data.get('applications', {}))}"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🛠 Переключить тех. работы",
+            callback_data="toggle_maintenance"
+        )]
+    ])
+
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@dp.message(F.text == "☁️ Google Таблица")
+async def cmd_google_sheets(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    msg = await message.answer("🔄 Выполняю синхронизацию с Google Таблицей...")
+    ok, url_or_err = sync_google_sheets()
+
+    if ok:
+        await msg.edit_text(
+            f"✅ <b>Google Таблица успешно обновлена!</b>\n\n🔗 <a href='{url_or_err}'>Открыть таблицу</a>"
+        )
+    else:
+        await msg.edit_text(f"❌ <b>Ошибка синхронизации:</b>\n<code>{escape(url_or_err)}</code>")
+
+
+# =========================================================
+# ИНИЦИАЛИЗАЦИЯ И ЗАПУСК
+# =========================================================
+
+async def set_command_scopes():
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Запустить бота"),
+            BotCommand(command="cancel", description="Отмена действия"),
+        ], scope=BotCommandScopeDefault())
+    except Exception as e:
+        print(f"Ошибка установки команд: {e}")
+
+
+async def scheduled_reminder_worker():
+    while True:
+        await asyncio.sleep(3600)
+
+
+async def reminder_worker():
+    while True:
+        await asyncio.sleep(60)
+
+
+async def main():
+    print("🤖 Бот запускается...")
+
+    if DATABASE_URL and psycopg2:
+        if _db_init():
+            print("✅ Подключение к PostgreSQL выполнено.")
+        else:
+            print("⚠️ Ошибка инициализации PostgreSQL.")
+    else:
+        print("ℹ️ Работаем в режиме локального сохранения.")
+
+    await init_telegram_user_client()
+    await set_command_scopes()
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("✅ Бот запущен и готов к работе!")
+
+    asyncio.create_task(scheduled_reminder_worker())
+    asyncio.create_task(reminder_worker())
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
