@@ -743,19 +743,12 @@ async def _flush_db_save():
         _db_save_task = None
 
 
-def trigger_sheets_sync():
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(asyncio.to_thread(sync_google_sheets))
-    except RuntimeError:
-        pass
-
-
 def save_data():
     global _db_save_task, _db_save_pending
     _write_local_json(DATA_FILE, data)
     
-    trigger_sheets_sync()
+    # Автоматическая синхронизация убрана, чтобы не превышать лимиты Google API.
+    # Таблица обновляется вручную через кнопку «☁️ Google Таблица».
 
     if not (DATABASE_URL and psycopg2 is not None):
         return
@@ -963,11 +956,10 @@ def sync_google_sheets():
 
 
 # =========================================================
-# КЛАВИАТУРЫ (СТРОГО РАЗДЕЛЕНЫ)
+# КЛАВИАТУРЫ
 # =========================================================
 
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-    """Только нижнее меню (ReplyKeyboard)"""
     builder = ReplyKeyboardBuilder()
     if is_admin(user_id):
         builder.row(KeyboardButton(text="📋 Заявки"), KeyboardButton(text="👥 Участники"))
