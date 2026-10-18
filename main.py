@@ -746,9 +746,6 @@ async def _flush_db_save():
 def save_data():
     global _db_save_task, _db_save_pending
     _write_local_json(DATA_FILE, data)
-    
-    # Автоматическая синхронизация убрана, чтобы не превышать лимиты Google API.
-    # Таблица обновляется вручную через кнопку «☁️ Google Таблица».
 
     if not (DATABASE_URL and psycopg2 is not None):
         return
@@ -984,7 +981,8 @@ async def cmd_report_start(message: Message, state: FSMContext):
     await state.set_state(ReportStates.waiting_for_report)
     await message.answer(
         "✍️ <b>Напишите ваше сообщение или жалобу для администрации:</b>\n\n"
-        "Опишите суть вопроса максимально подробно. Для отмены введите /cancel."
+        "Опишите суть вопроса максимально подробно. Для отмены введите /cancel.",
+        reply_markup=ReplyKeyboardRemove()
     )
 
 
